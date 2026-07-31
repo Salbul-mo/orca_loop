@@ -1,0 +1,263 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from orca_loop.escalation import (
+    GateProtocolError,
+    build_user_decision_report,
+    create_gate,
+    destructive_gate,
+    route_gate,
+    wait_gate_resolution,
+)
+from orca_loop.ledger import empty_ledger
+from orca_loop.models import (
+    AffectedFile,
+    AffectedFileOperation,
+    ConsensusLedger,
+    CoordinatorState,
+    DecisionValue,
+    FindingDecision,
+    FindingRecord,
+    FindingStatus,
+    GateKind,
+    HumanDecision,
+    HumanDecisionKind,
+    LoopCounters,
+    LoopState,
+    PlanDocument,
+    Role,
+    RunStatus,
+    ScopeManifest,
+    SignalKind,
+    SnapshotIdentity,
+    Side,
+    StepStage,
+    TestContract,
+)
+from tests.fakes import FakeOrcaClient
+from tests.test_ledger import DIGEST_A, decision, finding
+
+
+def state() -> CoordinatorState:
+    return CoordinatorState(
+        schema_version=1,
+        generation=0,
+        run_id="run-1",
+        state=LoopState.USER_DECISION_REQUIRED,
+        step_stage=StepStage.TRANSITION_COMMITTED,
+        status=RunStatus.BLOCKED,
+        worktree_selector="path:C:\\fixture",
+        coordinator_handle="term-coordinator",
+        worker_handles=(),
+        active=None,
+        plan_version=1,
+        counters=LoopCounters(0, 0),
+        base_head="abc",
+        snapshot_digest=DIGEST_A,
+        test_gate_status=None,
+        test_policy_digest=None,
+        permission_report_digest=DIGEST_A,
+        history=(),
+    )
+
+
+def ledger_with_unresolved(evidence_path: str) -> ConsensusLedger:
+    item = finding()
+    item = type(item)(
+        **{
+            **item.__dict__,
+            "evidence_refs": (evidence_path,),
+        }
+    )
+    record = FindingRecord(
+        finding=item,
+        status=FindingStatus.CHANGE_REQUIRED,
+        opened_round=1,
+        resolved_round=None,
+        max_status_reached=FindingStatus.CHANGE_REQUIRED,
+        unresolved_signature_history=(),
+        resolved_snapshot_digest=None,
+        decisions=tuple(
+            decision("F-1", side, value, 1)
+            for side, value in (
+                (Side.CLAUDE, DecisionValue.APPROVE),
+                (Side.CODEX, DecisionValue.CHANGE_REQUIRED),
+            )
+        ),
+        resolution=None,
+    )
+    return type(empty_ledger("run-1"))(
+        **{
+            **empty_ledger("run-1").__dict__,
+            "findings": (record,),
+            "plan_round": 2,
+        }
+    )
+
+
+class DecisionReportTest(unittest.TestCase):
+    def test_report_contains_all_twelve_sections_and_unresolved_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "evidence.json").write_text("{}", encoding="utf-8")
+            report = build_user_decision_report(
+                output_path=root / "user-decision.md",
+                request_text="Implement the requested workflow.",
+                ledger=ledger_with_unresolved("evidence.json"),
+                triggers=(),
+                state=state(),
+                worktree_path=root,
+                test_status=None,
+            )
+            text = report.path.read_text(encoding="utf-8")
+            for number in range(1, 13):
+                self.assertIn(f"## {number}.", text)
+            self.assertEqual(("F-1",), report.finding_ids)
+            self.assertIn("CLAUDE=APPROVE,CODEX=CHANGE_REQUIRED", text)
+
+
+class GateLifecycleTest(unittest.TestCase):
+    def test_create_wait_and_route_gate(self) -> None:
+        digest = "sha256:" + "d" * 64
+
+        def handler(argv: tuple[str, ...], _: int) -> dict[str, object]:
+            if argv[1] == "gate-create":
+                return {"id": "gate-1", "taskId": "task-1"}
+            return {
+                "gates": [
+                    {
+                        "id": "gate-1",
+                        "resolution": {
+                            "decision": "merge",
+                            "decision_note": None,
+                            "affected_acceptance_criteria": [],
+                            "affected_finding_ids": [],
+                            "report_digest": digest,
+                        },
+                    }
+                ]
+            }
+
+        client = FakeOrcaClient(handler)
+        report = type("Report", (), {
+            "path": Path("user-decision.md"),
+            "digest": digest,
+            "finding_ids": (),
+        })()
+        binding = create_gate(
+            client,
+            task_id="task-1",
+            report=report,
+            gate_kind=GateKind.FINAL,
+            question="Choose the final disposition.",
+            options=("merge", "reject", "revise_code", "revise_design"),
+            timeout_ms=1000,
+        )
+        decision_value = wait_gate_resolution(
+            client,
+            binding=binding,
+            timeout_ms=1000,
+        )
+        self.assertEqual(
+            SignalKind.MERGE,
+            route_gate(decision_value, gate_kind=GateKind.FINAL).kind,
+        )
+
+    def test_stale_report_digest_is_rejected(self) -> None:
+        client = FakeOrcaClient(
+            lambda _argv, _timeout: {
+                "gates": [
+                    {
+                        "id": "gate-1",
+                        "resolution": json.dumps(
+                            {
+                                "decision": "reject",
+                                "decision_note": None,
+                                "affected_acceptance_criteria": [],
+                                "affected_finding_ids": [],
+                                "report_digest": "sha256:" + "e" * 64,
+                            }
+                        ),
+                    }
+                ]
+            }
+        )
+        binding = create_binding(
+            "sha256:" + "d" * 64,
+        )
+        with self.assertRaisesRegex(GateProtocolError, "stale"):
+            wait_gate_resolution(
+                client,
+                binding=binding,
+                timeout_ms=1000,
+            )
+
+
+def create_binding(report_digest: str):
+    from orca_loop.models import GateBinding
+
+    return GateBinding(
+        gate_id="gate-1",
+        task_id="task-1",
+        report_digest=report_digest,
+        gate_kind=GateKind.FINAL,
+    )
+
+
+class DestructiveGateTest(unittest.TestCase):
+    def test_no_destructive_operation_needs_no_gate(self) -> None:
+        plan = PlanDocument(
+            schema_version=1,
+            plan_version=1,
+            request_digest=DIGEST_A,
+            source_instruction="request",
+            interpretation="interpretation",
+            rationale="rationale",
+            current_state_evidence=("evidence",),
+            affected_files=(
+                AffectedFile(
+                    "src/a.py",
+                    AffectedFileOperation.MODIFY,
+                    None,
+                ),
+            ),
+            implementation_steps=("change",),
+            data_api_schema_changes="없음",
+            error_handling=("raise",),
+            test_contract=TestContract((), ()),
+            test_policy_digest=DIGEST_A,
+            acceptance_criteria=(),
+            risks=("risk",),
+            out_of_scope=("other",),
+            reviewed_finding_ids=(),
+            finding_decisions=(),
+        )
+        snapshot = SnapshotIdentity("head", DIGEST_A, DIGEST_A, (), DIGEST_A)
+        manifest = ScopeManifest(DIGEST_A, plan.affected_files, None)
+        approval, signal = destructive_gate(
+            run_id="run-1",
+            plan=plan,
+            manifest=manifest,
+            snapshot=snapshot,
+            binding=None,
+            decision=None,
+        )
+        self.assertIsNone(approval)
+        self.assertEqual(SignalKind.OK, signal.kind)
+
+    def test_revision_decision_requires_scope_in_contract_parser(self) -> None:
+        decision_value = HumanDecision(
+            HumanDecisionKind.REVISE_CODE,
+            "Change the response contract.",
+            ("AC-1",),
+            (),
+            DIGEST_A,
+        )
+        self.assertEqual(
+            SignalKind.REVISE_CODE,
+            route_gate(decision_value, gate_kind=GateKind.FINAL).kind,
+        )
