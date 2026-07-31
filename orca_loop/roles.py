@@ -13,6 +13,7 @@ MAX_RENDERED_CONTRACT_BYTES = 256 * 1024
 PLACEHOLDER_PATTERN = re.compile(r"\{\{([A-Z0-9_]+)\}\}")
 BASE_PLACEHOLDERS = {
     "ROLE",
+    "PROVIDER",
     "RUN_ID",
     "CONSENSUS_ROUND",
     "WORKTREE_PATH",
@@ -78,6 +79,7 @@ def _mapping(context: RoleContext) -> dict[str, str]:
     policy = context.test_policy
     mapping = {
         "ROLE": context.role.value,
+        "PROVIDER": context.provider.value,
         "RUN_ID": context.run_id,
         "CONSENSUS_ROUND": str(context.consensus_round),
         "WORKTREE_PATH": str(context.worktree_path.resolve()),

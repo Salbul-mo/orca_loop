@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
-from .contracts import parse_permission_report
+from .contracts import default_agent_provider, parse_permission_report
 from .models import (
+    AgentProvider,
+    AgentRuntimeOptions,
     LaunchProfile,
     PermissionFeasibilityReport,
     PermissionStrategy,
     Role,
     ValidationStatus,
+    WorkerKey,
 )
 
 
@@ -22,11 +26,12 @@ READ_ONLY_ROLES = {
     Role.CODE_REVIEWER,
     Role.CROSS_CONFIRMER,
 }
-CLAUDE_ROLES = {Role.PLANNER, Role.CODE_REVIEWER}
-CODEX_ROLES = {
-    Role.PLAN_REVIEWER,
-    Role.IMPLEMENTER,
-    Role.CROSS_CONFIRMER,
+ROLE_RUNTIME_WORKERS = {
+    Role.PLANNER: WorkerKey.CLAUDE_PLANNER,
+    Role.PLAN_REVIEWER: WorkerKey.CODEX_REVIEW,
+    Role.IMPLEMENTER: WorkerKey.CODEX_IMPLEMENTER,
+    Role.CODE_REVIEWER: WorkerKey.CLAUDE_CODE_REVIEW,
+    Role.CROSS_CONFIRMER: WorkerKey.CODEX_REVIEW,
 }
 
 
@@ -75,6 +80,7 @@ def build_launch_profile(
     permission_report: PermissionFeasibilityReport,
     *,
     expected_orca_version: str,
+    runtime_options: AgentRuntimeOptions | None = None,
 ) -> LaunchProfile:
     root = _validate_path(worktree, "worktree")
     input_dir = _validate_path(step_input, "step_input")
@@ -85,11 +91,30 @@ def build_launch_profile(
     )
     if role not in READ_ONLY_ROLES | {Role.IMPLEMENTER}:
         raise LaunchProfileError(f"unsupported role: {role.value}")
+    if (
+        runtime_options is not None
+        and runtime_options.worker_key is not ROLE_RUNTIME_WORKERS[role]
+    ):
+        raise LaunchProfileError(
+            "runtime options worker does not match role"
+        )
+    provider = (
+        default_agent_provider(ROLE_RUNTIME_WORKERS[role])
+        if runtime_options is None
+        else runtime_options.provider
+    )
 
-    if role in CLAUDE_ROLES:
+    if provider is AgentProvider.CLAUDE:
+        runtime_command: tuple[str, ...] = ()
+        if runtime_options is not None:
+            if runtime_options.model is not None:
+                runtime_command += ("--model", runtime_options.model)
+            if runtime_options.effort is not None:
+                runtime_command += ("--effort", runtime_options.effort)
         command = (
             "claude",
             "-p",
+            *runtime_command,
             "--permission-mode",
             "bypassPermissions",
             "--allowedTools",
@@ -99,10 +124,24 @@ def build_launch_profile(
             "--output-format",
             "json",
         )
-    elif role in CODEX_ROLES:
+    elif provider is AgentProvider.CODEX:
+        runtime_command = ()
+        if runtime_options is not None:
+            if runtime_options.model is not None:
+                runtime_command += ("--model", runtime_options.model)
+            if runtime_options.effort is not None:
+                effort_value = json.dumps(
+                    runtime_options.effort,
+                    ensure_ascii=True,
+                )
+                runtime_command += (
+                    "--config",
+                    f"model_reasoning_effort={effort_value}",
+                )
         command = (
             "codex",
             "exec",
+            *runtime_command,
             "--dangerously-bypass-approvals-and-sandbox",
             "-C",
             str(root),

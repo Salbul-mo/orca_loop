@@ -78,6 +78,18 @@ def _valid_permission_skeleton(root: Path, run_id: str) -> bool:
     return _sha256(_canonical_json_bytes(digest_input)) == report_digest
 
 
+def agent_runtime_snapshot_path(harness_root: Path, run_id: str) -> Path:
+    _validate_id(run_id, "run_id")
+    root = harness_root.resolve()
+    if not root.is_dir():
+        raise PathBoundaryError(f"harness_root does not exist: {root}")
+    runs_root = (root / "runs").resolve()
+    run_root = (runs_root / run_id).resolve()
+    if not _within(run_root, runs_root):
+        raise PathBoundaryError("run path escaped harness_root/runs")
+    return run_root / "control" / "agent-runtime.json"
+
+
 def create_run_workspace(
     harness_root: Path,
     run_id: str,

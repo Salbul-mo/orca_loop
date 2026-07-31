@@ -6,6 +6,7 @@ for `task_id` and `dispatch_id`.
 ## Runtime contract
 
 - Role: `{{ROLE}}`
+- Provider: `{{PROVIDER}}`
 - Run: `{{RUN_ID}}`
 - Consensus round: `{{CONSENSUS_ROUND}}`
 - Read-only repository: `{{WORKTREE_PATH}}`
@@ -92,6 +93,9 @@ escalation_signals:
   {code, reason, evidence_refs, deduplication_key}[]
 agrees_with_reviewer=null
 ```
+
+`side="CODEX"` is the secondary consensus-lane wire value; it does not
+identify the runtime provider.
 
 Use `P0|P1|P2`, `B1|B2|B3|B4|B5`, and the documented `impact_class`.
 Set `reviewed_artifact_digest` to the SHA-256 digest of staged `plan.json`.

@@ -6,6 +6,8 @@ import unittest
 from pathlib import Path
 
 from permission_spike import (
+    CLAUDE_IMPLEMENTATION_EXPECTED,
+    CLAUDE_IMPLEMENTATION_TARGET_NAME,
     IMPLEMENTATION_EXPECTED,
     PermissionSpikeError,
     PermissionStrategy,
@@ -109,6 +111,34 @@ class PermissionFeasibilityTest(unittest.TestCase):
             sha256_bytes(canonical_json_bytes(digest_input)),
             report.report_digest,
         )
+        self.assertEqual(5, len(report.checks))
+
+    def test_claude_implementer_adds_writable_capability_check(self) -> None:
+        self.prepare_passing_fixture()
+        self.write_result(
+            "claude_implementer",
+            implementation_write_succeeded=True,
+        )
+        (
+            self.harness_root
+            / "runs"
+            / self.run_id
+            / "permission-fixture"
+            / CLAUDE_IMPLEMENTATION_TARGET_NAME
+        ).write_text(
+            CLAUDE_IMPLEMENTATION_EXPECTED,
+            encoding="utf-8",
+            newline="\n",
+        )
+        report = build_report(
+            self.harness_root,
+            self.run_id,
+            PermissionStrategy.READONLY_REPOSITORY,
+            "1.4.159",
+        )
+        self.assertEqual(ValidationStatus.PASS, report.status)
+        self.assertEqual("V-PERM-06", report.checks[-1].check_id)
+        self.assertEqual(ValidationStatus.PASS, report.checks[-1].status)
 
     def test_missing_worker_result_blocks_report(self) -> None:
         create_fixture(self.harness_root, self.run_id)

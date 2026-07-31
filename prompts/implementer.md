@@ -6,6 +6,7 @@ is the authority for `task_id` and `dispatch_id`.
 ## Runtime contract
 
 - Role: `{{ROLE}}`
+- Provider: `{{PROVIDER}}`
 - Run: `{{RUN_ID}}`
 - Consensus round: `{{CONSENSUS_ROUND}}`
 - Writable worktree: `{{WORKTREE_PATH}}`

@@ -8,16 +8,23 @@ from pathlib import Path
 
 from orca_loop.contracts import (
     ContractViolationError,
+    build_agent_runtime_snapshot,
     canonical_json_bytes,
     digest_value,
+    parse_agent_runtime_config,
+    parse_agent_runtime_snapshot,
     parse_human_decision,
     parse_permission_report,
     parse_plan_document,
     parse_review_artifact,
     parse_worker_done,
+    serialize_agent_runtime_config,
+    serialize_agent_runtime_snapshot,
     serialize_json,
 )
 from orca_loop.models import (
+    AgentProvider,
+    AgentRuntimeConfig,
     ArtifactKind,
     DispatchHandle,
     ExpectedProvenance,
@@ -46,6 +53,19 @@ from orca_loop.config import empty_test_policy
 
 DIGEST_A = "sha256:" + "a" * 64
 DIGEST_B = "sha256:" + "b" * 64
+
+
+def agent_runtime_value() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "agents": {
+            worker.value: {
+                "model": f"model-{worker.value}",
+                "effort": "high",
+            }
+            for worker in WorkerKey
+        },
+    }
 
 
 def plan_value() -> dict[str, object]:
@@ -143,6 +163,110 @@ class ModelContractTest(unittest.TestCase):
         counters = LoopCounters(0, 0)
         with self.assertRaises(dataclasses.FrozenInstanceError):
             counters.test_fix_attempts = 1  # type: ignore[misc]
+
+    def test_agent_runtime_config_and_snapshot_roundtrip(self) -> None:
+        config = parse_agent_runtime_config(json.dumps(agent_runtime_value()))
+        self.assertIsInstance(config, AgentRuntimeConfig)
+        self.assertEqual(2, config.schema_version)
+        self.assertEqual(tuple(WorkerKey), tuple(
+            item.worker_key for item in config.agents
+        ))
+        providers = {
+            item.worker_key: item.provider for item in config.agents
+        }
+        self.assertEqual(
+            AgentProvider.CLAUDE,
+            providers[WorkerKey.CLAUDE_PLANNER],
+        )
+        self.assertEqual(
+            AgentProvider.CODEX,
+            providers[WorkerKey.CODEX_IMPLEMENTER],
+        )
+        reparsed = parse_agent_runtime_config(
+            serialize_agent_runtime_config(config)
+        )
+        self.assertEqual(config, reparsed)
+        snapshot = build_agent_runtime_snapshot(
+            "run-1",
+            config,
+            str(Path.cwd().resolve() / "agent-runtime.json"),
+        )
+        parsed_snapshot = parse_agent_runtime_snapshot(
+            serialize_agent_runtime_snapshot(snapshot),
+            "run-1",
+        )
+        self.assertEqual(snapshot, parsed_snapshot)
+
+        legacy_snapshot = agent_runtime_value()
+        legacy_snapshot.update(
+            {
+                "run_id": "run-1",
+                "configuration_digest": digest_value(
+                    agent_runtime_value()
+                ),
+                "source_config_path": None,
+            }
+        )
+        migrated = parse_agent_runtime_snapshot(
+            json.dumps(legacy_snapshot),
+            "run-1",
+        )
+        self.assertEqual(2, migrated.schema_version)
+        self.assertEqual(
+            config.configuration_digest,
+            migrated.configuration_digest,
+        )
+
+    def test_agent_runtime_contract_rejects_shape_and_digest_drift(
+        self,
+    ) -> None:
+        missing = agent_runtime_value()
+        agents = missing["agents"]
+        assert isinstance(agents, dict)
+        agents.pop(WorkerKey.CODEX_REVIEW.value)
+        with self.assertRaisesRegex(ContractViolationError, "fields mismatch"):
+            parse_agent_runtime_config(json.dumps(missing))
+
+        whitespace = agent_runtime_value()
+        agents = whitespace["agents"]
+        assert isinstance(agents, dict)
+        entry = agents[WorkerKey.CLAUDE_PLANNER.value]
+        assert isinstance(entry, dict)
+        entry["model"] = " padded "
+        with self.assertRaisesRegex(
+            ContractViolationError,
+            "leading or trailing",
+        ):
+            parse_agent_runtime_config(json.dumps(whitespace))
+
+        control = agent_runtime_value()
+        agents = control["agents"]
+        assert isinstance(agents, dict)
+        entry = agents[WorkerKey.CLAUDE_PLANNER.value]
+        assert isinstance(entry, dict)
+        entry["effort"] = "high\ninvalid"
+        with self.assertRaisesRegex(
+            ContractViolationError,
+            "control characters",
+        ):
+            parse_agent_runtime_config(json.dumps(control))
+
+        config = parse_agent_runtime_config(json.dumps(agent_runtime_value()))
+        snapshot = json.loads(
+            serialize_agent_runtime_snapshot(
+                build_agent_runtime_snapshot("run-1", config, None)
+            )
+        )
+        snapshot["configuration_digest"] = DIGEST_A
+        with self.assertRaisesRegex(ContractViolationError, "digest mismatch"):
+            parse_agent_runtime_snapshot(json.dumps(snapshot), "run-1")
+        with self.assertRaisesRegex(ContractViolationError, "run_id mismatch"):
+            parse_agent_runtime_snapshot(
+                serialize_agent_runtime_snapshot(
+                    build_agent_runtime_snapshot("run-1", config, None)
+                ),
+                "run-2",
+            )
 
 
 class ArtifactContractTest(unittest.TestCase):
@@ -276,6 +400,7 @@ class RoleTemplateTest(unittest.TestCase):
         (step / "out").mkdir(parents=True, exist_ok=True)
         return RoleContext(
             role=role,
+            provider=AgentProvider.CLAUDE,
             run_id="run-1",
             consensus_round=1,
             worktree_path=root,

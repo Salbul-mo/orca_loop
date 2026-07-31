@@ -9,9 +9,13 @@ from pathlib import Path
 from typing import Sequence
 
 from orca_loop.config import (
+    ConfigurationError,
     PreflightError,
     PreflightResult,
+    default_agent_runtime_config,
     parse_run_arguments,
+    persist_agent_runtime_snapshot,
+    prepare_agent_runtime,
     run_preflight,
 )
 from orca_loop.contracts import (
@@ -31,7 +35,7 @@ from orca_loop.coordinator import (
     operational_retry_result,
     role_for_state,
 )
-from orca_loop.dispatcher import provision_workers
+from orca_loop.dispatcher import provision_workers, worker_for_role
 from orca_loop.escalation import (
     GateProtocolError,
     approve_escalation_keys,
@@ -166,6 +170,18 @@ def _initialize(
     state = _initial_state(preflight)
     ledger = empty_ledger(arguments.run_id)
     commit_generation(workspace.control_dir, state, ledger)
+    runtime = preflight.agent_runtime or default_agent_runtime_config()
+    source_path = (
+        None
+        if arguments.agent_runtime_request is None
+        else arguments.agent_runtime_request.source_path
+    )
+    persist_agent_runtime_snapshot(
+        workspace.control_dir,
+        arguments.run_id,
+        runtime,
+        source_path,
+    )
     controller = GenerationController(workspace, state, ledger)
     pool = provision_workers(
         client,
@@ -228,6 +244,20 @@ def _resume(
     if snapshot.snapshot_digest != state.snapshot_digest:
         raise OrcaLoopError(
             "resume worktree snapshot does not match committed state"
+        )
+    runtime_path = workspace.control_dir / "agent-runtime.json"
+    if not runtime_path.exists():
+        runtime = preflight.agent_runtime or default_agent_runtime_config()
+        source_path = (
+            None
+            if arguments.agent_runtime_request is None
+            else arguments.agent_runtime_request.source_path
+        )
+        persist_agent_runtime_snapshot(
+            workspace.control_dir,
+            arguments.run_id,
+            runtime,
+            source_path,
         )
     pool = WorkerPool(state.worker_handles)
     if len(pool.workers) != 4:
@@ -374,6 +404,18 @@ def _execute_worker(
         preflight,
         role,
     )
+    worker = worker_for_role(pool, role)
+    runtime_config = (
+        preflight.agent_runtime or default_agent_runtime_config()
+    )
+    runtime_by_worker = {
+        item.worker_key: item for item in runtime_config.agents
+    }
+    runtime_options = runtime_by_worker.get(worker.worker_key)
+    if runtime_options is None:
+        raise OrcaLoopError(
+            f"agent runtime is missing worker {worker.worker_key.value}"
+        )
     profile = build_launch_profile(
         role,
         profile_root,
@@ -381,9 +423,11 @@ def _execute_worker(
         step.output_dir,
         preflight.permission_report,
         expected_orca_version=preflight.orca_version,
+        runtime_options=runtime_options,
     )
     context = RoleContext(
         role=role,
+        provider=runtime_options.provider,
         run_id=controller.state.run_id,
         consensus_round=consensus_round(
             controller.state.state,
@@ -928,6 +972,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             client,
             expected_orca_version=EXPECTED_ORCA_VERSION,
         )
+        preflight = prepare_agent_runtime(preflight)
         if arguments.dry_run:
             print(
                 json.dumps(
@@ -963,7 +1008,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         )
         return exit_code(final)
-    except (PreflightError, RunWorkspaceExistsError) as exc:
+    except (
+        ConfigurationError,
+        PreflightError,
+        RunWorkspaceExistsError,
+    ) as exc:
         print(
             json.dumps(
                 {"status": "BLOCKED", "error": str(exc)},

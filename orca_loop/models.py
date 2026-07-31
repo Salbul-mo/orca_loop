@@ -80,13 +80,27 @@ class Role(StrEnum):
 
 
 class WorkerKey(StrEnum):
+    """Stable worker-slot IDs whose names do not select a provider."""
+
     CLAUDE_PLANNER = "claude_planner"
     CLAUDE_CODE_REVIEW = "claude_code_review"
     CODEX_IMPLEMENTER = "codex_implementer"
     CODEX_REVIEW = "codex_review"
 
 
+class AgentProvider(StrEnum):
+    CLAUDE = "claude"
+    CODEX = "codex"
+
+
+class AgentAccessMode(StrEnum):
+    READ_ONLY = "read_only"
+    WRITABLE = "writable"
+
+
 class Side(StrEnum):
+    """Legacy wire values for consensus lanes, not runtime providers."""
+
     CLAUDE = "CLAUDE"
     CODEX = "CODEX"
     USER = "USER"
@@ -291,6 +305,36 @@ class WorkerDonePayload:
     dispatch_id: str
     report_path: str
     artifact_digest: str
+
+
+@dataclass(frozen=True)
+class AgentRuntimeOptions:
+    worker_key: WorkerKey
+    provider: AgentProvider
+    model: str | None
+    effort: str | None
+
+
+@dataclass(frozen=True)
+class AgentRuntimeConfig:
+    schema_version: int
+    agents: tuple[AgentRuntimeOptions, ...]
+    configuration_digest: str
+
+
+@dataclass(frozen=True)
+class AgentRuntimeSnapshot:
+    schema_version: int
+    run_id: str
+    agents: tuple[AgentRuntimeOptions, ...]
+    configuration_digest: str
+    source_config_path: str | None
+
+
+@dataclass(frozen=True)
+class ProviderCapability:
+    provider: AgentProvider
+    access_mode: AgentAccessMode
 
 
 @dataclass(frozen=True)
@@ -583,6 +627,7 @@ class ScopePackage:
 @dataclass(frozen=True)
 class RoleContext:
     role: Role
+    provider: AgentProvider
     run_id: str
     consensus_round: int
     worktree_path: Path

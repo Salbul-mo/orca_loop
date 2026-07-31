@@ -11,6 +11,11 @@ from typing import Any, Callable, Mapping, TypeVar
 from .models import (
     AcceptanceCriterion,
     AddressedFinding,
+    AgentAccessMode,
+    AgentProvider,
+    AgentRuntimeConfig,
+    AgentRuntimeOptions,
+    AgentRuntimeSnapshot,
     AffectedFile,
     AffectedFileOperation,
     ArtifactKind,
@@ -33,6 +38,7 @@ from .models import (
     PermissionStrategy,
     PlanDocument,
     PlanReviewVerdict,
+    ProviderCapability,
     ReviewArtifact,
     Role,
     Severity,
@@ -43,12 +49,19 @@ from .models import (
     TestFailureAttribution,
     TestKind,
     ValidationStatus,
+    WorkerKey,
     WorkerDonePayload,
 )
 
 
 MAX_ARTIFACT_BYTES = 1_048_576
 SCHEMA_VERSION = 1
+AGENT_RUNTIME_SCHEMA_VERSION = 2
+LEGACY_AGENT_RUNTIME_SCHEMA_VERSION = 1
+MANDATORY_PERMISSION_CHECK_IDS = tuple(
+    f"V-PERM-0{index}" for index in range(1, 6)
+)
+OPTIONAL_PERMISSION_CHECK_IDS = ("V-PERM-06",)
 DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 ID_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,160}$")
 FENCED_JSON_PATTERN = re.compile(
@@ -239,6 +252,327 @@ def _identifier(value: object, context: str) -> str:
     return identifier
 
 
+def _strict_json_object(raw_text: str, context: str) -> dict[str, object]:
+    if not isinstance(raw_text, str):
+        raise ContractViolationError(f"{context} must be text")
+    size = len(raw_text.encode("utf-8"))
+    if size < 1 or size > MAX_ARTIFACT_BYTES:
+        raise ContractViolationError(
+            f"{context} size must be 1..{MAX_ARTIFACT_BYTES} bytes"
+        )
+    try:
+        value = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise ContractViolationError(f"malformed JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ContractViolationError(f"{context} root must be an object")
+    return value
+
+
+def _runtime_string(value: object, context: str) -> str | None:
+    if value is None:
+        return None
+    parsed = _string(value, context)
+    if parsed != parsed.strip():
+        raise ContractViolationError(
+            f"{context} must not have leading or trailing whitespace"
+        )
+    if any(ord(character) < 32 or ord(character) == 127 for character in parsed):
+        raise ContractViolationError(
+            f"{context} must not contain control characters"
+        )
+    return parsed
+
+
+def default_agent_provider(worker: WorkerKey) -> AgentProvider:
+    if worker in {
+        WorkerKey.CLAUDE_PLANNER,
+        WorkerKey.CLAUDE_CODE_REVIEW,
+    }:
+        return AgentProvider.CLAUDE
+    return AgentProvider.CODEX
+
+
+def _agent_runtime_schema(value: object, context: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ContractViolationError(f"{context}.schema_version must be int")
+    if value not in {
+        LEGACY_AGENT_RUNTIME_SCHEMA_VERSION,
+        AGENT_RUNTIME_SCHEMA_VERSION,
+    }:
+        raise ContractViolationError(
+            f"{context}.schema_version must be "
+            f"{LEGACY_AGENT_RUNTIME_SCHEMA_VERSION} or "
+            f"{AGENT_RUNTIME_SCHEMA_VERSION}"
+        )
+    return value
+
+
+def _parse_agent_runtime_agents(
+    value: object,
+    context: str,
+    schema_version: int,
+) -> tuple[AgentRuntimeOptions, ...]:
+    if not isinstance(value, dict):
+        raise ContractViolationError(f"{context} must be an object")
+    expected = {worker.value for worker in WorkerKey}
+    if set(value) != expected:
+        raise ContractViolationError(
+            f"{context} fields mismatch: expected {sorted(expected)}, "
+            f"got {sorted(value)}"
+        )
+    agents: list[AgentRuntimeOptions] = []
+    for worker in WorkerKey:
+        item = value[worker.value]
+        if not isinstance(item, dict):
+            raise ContractViolationError(
+                f"{context}.{worker.value} must be an object"
+            )
+        expected_fields = (
+            {"model", "effort"}
+            if schema_version == LEGACY_AGENT_RUNTIME_SCHEMA_VERSION
+            else {"provider", "model", "effort"}
+        )
+        raw = _exact(item, expected_fields, context=f"{context}.{worker.value}")
+        provider = (
+            default_agent_provider(worker)
+            if schema_version == LEGACY_AGENT_RUNTIME_SCHEMA_VERSION
+            else _enum(
+                AgentProvider,
+                raw["provider"],
+                f"{context}.{worker.value}.provider",
+            )
+        )
+        agents.append(
+            AgentRuntimeOptions(
+                worker_key=worker,
+                provider=provider,
+                model=_runtime_string(
+                    raw["model"],
+                    f"{context}.{worker.value}.model",
+                ),
+                effort=_runtime_string(
+                    raw["effort"],
+                    f"{context}.{worker.value}.effort",
+                ),
+            )
+        )
+    return tuple(agents)
+
+
+def _agent_runtime_value(
+    agents: tuple[AgentRuntimeOptions, ...],
+) -> dict[str, object]:
+    if len(agents) != len(WorkerKey):
+        raise ContractViolationError(
+            "agent runtime must contain exactly four workers"
+        )
+    mapping = {item.worker_key: item for item in agents}
+    if set(mapping) != set(WorkerKey) or len(mapping) != len(agents):
+        raise ContractViolationError(
+            "agent runtime workers must be unique and complete"
+        )
+    return {
+        "schema_version": AGENT_RUNTIME_SCHEMA_VERSION,
+        "agents": {
+            worker.value: {
+                "provider": mapping[worker].provider.value,
+                "model": mapping[worker].model,
+                "effort": mapping[worker].effort,
+            }
+            for worker in WorkerKey
+        },
+    }
+
+
+def _legacy_agent_runtime_value(
+    agents: tuple[AgentRuntimeOptions, ...],
+) -> dict[str, object]:
+    mapping = {item.worker_key: item for item in agents}
+    if set(mapping) != set(WorkerKey) or len(mapping) != len(agents):
+        raise ContractViolationError(
+            "agent runtime workers must be unique and complete"
+        )
+    if any(
+        mapping[worker].provider is not default_agent_provider(worker)
+        for worker in WorkerKey
+    ):
+        raise ContractViolationError(
+            "legacy agent runtime cannot encode provider overrides"
+        )
+    return {
+        "schema_version": LEGACY_AGENT_RUNTIME_SCHEMA_VERSION,
+        "agents": {
+            worker.value: {
+                "model": mapping[worker].model,
+                "effort": mapping[worker].effort,
+            }
+            for worker in WorkerKey
+        },
+    }
+
+
+def build_agent_runtime_config(
+    agents: tuple[AgentRuntimeOptions, ...],
+) -> AgentRuntimeConfig:
+    value = _agent_runtime_value(agents)
+    parsed_agents = _parse_agent_runtime_agents(
+        value["agents"],
+        "agent_runtime.agents",
+        AGENT_RUNTIME_SCHEMA_VERSION,
+    )
+    return AgentRuntimeConfig(
+        schema_version=AGENT_RUNTIME_SCHEMA_VERSION,
+        agents=parsed_agents,
+        configuration_digest=digest_value(value),
+    )
+
+
+def parse_agent_runtime_config(raw_text: str) -> AgentRuntimeConfig:
+    raw = _exact(
+        _strict_json_object(raw_text, "agent_runtime"),
+        {"schema_version", "agents"},
+        context="agent_runtime",
+    )
+    schema_version = _agent_runtime_schema(
+        raw["schema_version"],
+        "agent_runtime",
+    )
+    agents = _parse_agent_runtime_agents(
+        raw["agents"],
+        "agent_runtime.agents",
+        schema_version,
+    )
+    return build_agent_runtime_config(agents)
+
+
+def serialize_agent_runtime_config(config: AgentRuntimeConfig) -> str:
+    if config.schema_version != AGENT_RUNTIME_SCHEMA_VERSION:
+        raise ContractViolationError(
+            "agent_runtime.schema_version must be "
+            f"{AGENT_RUNTIME_SCHEMA_VERSION}"
+        )
+    verified = build_agent_runtime_config(config.agents)
+    if config.configuration_digest != verified.configuration_digest:
+        raise ContractViolationError(
+            "agent runtime configuration digest mismatch"
+        )
+    value = _agent_runtime_value(verified.agents)
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def build_agent_runtime_snapshot(
+    run_id: str,
+    config: AgentRuntimeConfig,
+    source_config_path: str | None,
+) -> AgentRuntimeSnapshot:
+    _identifier(run_id, "agent_runtime_snapshot.run_id")
+    validated_source_path = _runtime_string(
+        source_config_path,
+        "agent_runtime_snapshot.source_config_path",
+    )
+    if validated_source_path is not None and not Path(
+        validated_source_path
+    ).is_absolute():
+        raise ContractViolationError(
+            "agent_runtime_snapshot.source_config_path must be absolute"
+        )
+    verified = build_agent_runtime_config(config.agents)
+    if verified.configuration_digest != config.configuration_digest:
+        raise ContractViolationError(
+            "agent runtime configuration digest mismatch"
+        )
+    return AgentRuntimeSnapshot(
+        schema_version=AGENT_RUNTIME_SCHEMA_VERSION,
+        run_id=run_id,
+        agents=verified.agents,
+        configuration_digest=verified.configuration_digest,
+        source_config_path=validated_source_path,
+    )
+
+
+def serialize_agent_runtime_snapshot(snapshot: AgentRuntimeSnapshot) -> str:
+    config = build_agent_runtime_config(snapshot.agents)
+    verified = build_agent_runtime_snapshot(
+        snapshot.run_id,
+        config,
+        snapshot.source_config_path,
+    )
+    if snapshot.configuration_digest != verified.configuration_digest:
+        raise ContractViolationError(
+            "agent runtime snapshot digest mismatch"
+        )
+    value = _agent_runtime_value(verified.agents)
+    value.update(
+        {
+            "run_id": verified.run_id,
+            "configuration_digest": verified.configuration_digest,
+            "source_config_path": verified.source_config_path,
+        }
+    )
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def parse_agent_runtime_snapshot(
+    raw_text: str,
+    expected_run_id: str,
+) -> AgentRuntimeSnapshot:
+    raw = _exact(
+        _strict_json_object(raw_text, "agent_runtime_snapshot"),
+        {
+            "schema_version",
+            "run_id",
+            "agents",
+            "configuration_digest",
+            "source_config_path",
+        },
+        context="agent_runtime_snapshot",
+    )
+    schema_version = _agent_runtime_schema(
+        raw["schema_version"],
+        "agent_runtime_snapshot",
+    )
+    run_id = _identifier(raw["run_id"], "agent_runtime_snapshot.run_id")
+    if run_id != expected_run_id:
+        raise ContractViolationError(
+            "agent runtime snapshot run_id mismatch"
+        )
+    agents = _parse_agent_runtime_agents(
+        raw["agents"],
+        "agent_runtime_snapshot.agents",
+        schema_version,
+    )
+    config = build_agent_runtime_config(agents)
+    claimed = _digest(
+        raw["configuration_digest"],
+        "agent_runtime_snapshot.configuration_digest",
+    )
+    expected_digest = (
+        digest_value(_legacy_agent_runtime_value(agents))
+        if schema_version == LEGACY_AGENT_RUNTIME_SCHEMA_VERSION
+        else config.configuration_digest
+    )
+    if claimed != expected_digest:
+        raise ContractViolationError(
+            "agent runtime snapshot digest mismatch"
+        )
+    source_path = _runtime_string(
+        raw["source_config_path"],
+        "agent_runtime_snapshot.source_config_path",
+    )
+    return build_agent_runtime_snapshot(run_id, config, source_path)
+
+
 def _object(value: object, context: str) -> dict[str, object]:
     if not isinstance(value, dict):
         raise ContractViolationError(f"{context} must be an object")
@@ -401,7 +735,8 @@ def parse_plan_document(
         )
     if any(item.side is not Side.CLAUDE for item in decisions):
         raise ContractViolationError(
-            "plan finding decisions must use the CLAUDE side"
+            "plan finding decisions must use the primary consensus lane "
+            "(legacy CLAUDE wire value)"
         )
     if expected_snapshot_digest is not None and any(
         item.snapshot_digest != expected_snapshot_digest
@@ -1123,13 +1458,22 @@ def parse_permission_report(raw_text: str) -> PermissionFeasibilityReport:
         )
     )
     checks = _tuple(raw["checks"], parse_check, "permission_report.checks")
+    check_ids = tuple(item.check_id for item in checks)
+    valid_check_sequences = {
+        MANDATORY_PERMISSION_CHECK_IDS,
+        MANDATORY_PERMISSION_CHECK_IDS + OPTIONAL_PERMISSION_CHECK_IDS,
+    }
+    if check_ids not in valid_check_sequences:
+        raise ContractViolationError(
+            "permission report checks must be ordered V-PERM-01..05 "
+            "with optional V-PERM-06"
+        )
     if status is ValidationStatus.PASS and (
         strategy is None
-        or len(checks) != 5
         or any(item.status is not ValidationStatus.PASS for item in checks)
     ):
         raise ContractViolationError(
-            "PASS permission report requires strategy and five PASS checks"
+            "PASS permission report requires strategy and all checks PASS"
         )
     return PermissionFeasibilityReport(
         schema_version=SCHEMA_VERSION,
@@ -1151,6 +1495,45 @@ def parse_permission_report(raw_text: str) -> PermissionFeasibilityReport:
         ),
         report_digest=claimed,
     )
+
+
+def permission_capabilities(
+    report: PermissionFeasibilityReport,
+) -> frozenset[ProviderCapability]:
+    checks = {item.check_id: item.status for item in report.checks}
+    capabilities: set[ProviderCapability] = set()
+    if (
+        checks.get("V-PERM-02") is ValidationStatus.PASS
+        and checks.get("V-PERM-03") is ValidationStatus.PASS
+    ):
+        capabilities.add(
+            ProviderCapability(
+                AgentProvider.CLAUDE,
+                AgentAccessMode.READ_ONLY,
+            )
+        )
+    if checks.get("V-PERM-04") is ValidationStatus.PASS:
+        capabilities.add(
+            ProviderCapability(
+                AgentProvider.CODEX,
+                AgentAccessMode.READ_ONLY,
+            )
+        )
+    if checks.get("V-PERM-05") is ValidationStatus.PASS:
+        capabilities.add(
+            ProviderCapability(
+                AgentProvider.CODEX,
+                AgentAccessMode.WRITABLE,
+            )
+        )
+    if checks.get("V-PERM-06") is ValidationStatus.PASS:
+        capabilities.add(
+            ProviderCapability(
+                AgentProvider.CLAUDE,
+                AgentAccessMode.WRITABLE,
+            )
+        )
+    return frozenset(capabilities)
 
 
 def parse_human_decision(raw_text: str) -> HumanDecision:

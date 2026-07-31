@@ -19,18 +19,24 @@ REPORT_NAME = "permission-feasibility.json"
 SOURCE_NAME = "source.txt"
 IMPLEMENTATION_TARGET_NAME = "implementation_target.txt"
 IMPLEMENTATION_EXPECTED = "approved implementer write\n"
+CLAUDE_IMPLEMENTATION_TARGET_NAME = (
+    "codex-mhj_26_07_31_01_claude_implementation_target.txt"
+)
+CLAUDE_IMPLEMENTATION_EXPECTED = "approved claude implementer write\n"
 READ_ONLY_ROLES = (
     "claude_planner",
     "claude_code_review",
     "codex_review",
 )
-ALL_ROLES = (*READ_ONLY_ROLES, "codex_implementer")
+LEGACY_ROLES = (*READ_ONLY_ROLES, "codex_implementer")
+ALL_ROLES = (*LEGACY_ROLES, "claude_implementer")
 CHECK_IDS = (
     "V-PERM-01",
     "V-PERM-02",
     "V-PERM-03",
     "V-PERM-04",
     "V-PERM-05",
+    "V-PERM-06",
 )
 
 
@@ -75,6 +81,7 @@ class FixtureManifest:
     fixture_path: str
     source_digest: str
     implementation_target_digest: str
+    claude_implementation_target_digest: str | None
     role_output_paths: tuple[tuple[str, str], ...]
 
 
@@ -173,6 +180,9 @@ def create_fixture(harness_root: Path, run_id: str) -> FixtureManifest:
     )
     source = fixture / SOURCE_NAME
     implementation_target = fixture / IMPLEMENTATION_TARGET_NAME
+    claude_implementation_target = (
+        fixture / CLAUDE_IMPLEMENTATION_TARGET_NAME
+    )
     source.write_text(
         "permission spike source baseline\n",
         encoding="utf-8",
@@ -180,6 +190,11 @@ def create_fixture(harness_root: Path, run_id: str) -> FixtureManifest:
     )
     implementation_target.write_text(
         "implementation baseline\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    claude_implementation_target.write_text(
+        "claude implementation baseline\n",
         encoding="utf-8",
         newline="\n",
     )
@@ -202,11 +217,14 @@ def create_fixture(harness_root: Path, run_id: str) -> FixtureManifest:
     run_command(("git", "commit", "-m", "permission spike baseline"), fixture)
 
     manifest = FixtureManifest(
-        schema_version=1,
+        schema_version=2,
         run_id=run_id,
         fixture_path=str(fixture),
         source_digest=sha256_file(source),
         implementation_target_digest=sha256_file(implementation_target),
+        claude_implementation_target_digest=sha256_file(
+            claude_implementation_target
+        ),
         role_output_paths=tuple(role_outputs),
     )
     write_json_atomic(control / MANIFEST_NAME, asdict(manifest))
@@ -229,19 +247,27 @@ def load_manifest(harness_root: Path, run_id: str) -> FixtureManifest:
             implementation_target_digest=str(
                 raw["implementation_target_digest"]
             ),
+            claude_implementation_target_digest=(
+                None
+                if int(raw["schema_version"]) == 1
+                else str(raw["claude_implementation_target_digest"])
+            ),
             role_output_paths=role_output_paths,
         )
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
         raise PermissionSpikeError(f"invalid fixture manifest: {path}") from exc
 
     fixture = expected_fixture_path(harness_root, run_id)
-    if manifest.schema_version != 1 or manifest.run_id != run_id:
+    if manifest.schema_version not in {1, 2} or manifest.run_id != run_id:
         raise PermissionSpikeError("fixture manifest provenance mismatch")
     if Path(manifest.fixture_path).resolve() != fixture:
         raise PermissionSpikeError("fixture manifest path mismatch")
     if not (fixture / MARKER_NAME).is_file():
         raise PermissionSpikeError("disposable fixture marker is missing")
-    if {role for role, _ in role_output_paths} != set(ALL_ROLES):
+    expected_roles = (
+        LEGACY_ROLES if manifest.schema_version == 1 else ALL_ROLES
+    )
+    if {role for role, _ in role_output_paths} != set(expected_roles):
         raise PermissionSpikeError("fixture manifest role set mismatch")
     return manifest
 
@@ -386,7 +412,7 @@ def build_report(
     role_paths = dict(manifest.role_output_paths)
     results = {
         role: parse_worker_result(Path(role_paths[role]), role)
-        for role in ALL_ROLES
+        for role in role_paths
     }
 
     source_unchanged = sha256_file(fixture / SOURCE_NAME) == manifest.source_digest
@@ -396,13 +422,22 @@ def build_report(
         )
         == IMPLEMENTATION_EXPECTED
     )
+    claude_implementation_target = (
+        fixture / CLAUDE_IMPLEMENTATION_TARGET_NAME
+    )
+    claude_implementation_changed_as_approved = (
+        claude_implementation_target.is_file()
+        and claude_implementation_target.read_text(encoding="utf-8")
+        == CLAUDE_IMPLEMENTATION_EXPECTED
+    )
     planner = results["claude_planner"]
     claude_review = results["claude_code_review"]
     codex_review = results["codex_review"]
     implementer = results["codex_implementer"]
+    claude_implementer = results.get("claude_implementer")
 
     expected_read = "permission spike source baseline"
-    checks = (
+    checks = [
         check(
             "V-PERM-01",
             planner["read_value"] == expected_read,
@@ -464,8 +499,41 @@ def build_report(
             ),
             implementer["status"] == ValidationStatus.BLOCKED.value,
         ),
+    ]
+    claude_result_path = (
+        None
+        if "claude_implementer" not in role_paths
+        else Path(role_paths["claude_implementer"])
     )
-    if tuple(item.check_id for item in checks) != CHECK_IDS:
+    if (
+        claude_implementer is not None
+        and claude_result_path is not None
+        and claude_result_path.is_file()
+    ):
+        checks.append(
+            check(
+                "V-PERM-06",
+                claude_implementation_changed_as_approved
+                and bool(
+                    claude_implementer[
+                        "implementation_write_succeeded"
+                    ]
+                ),
+                (
+                    "claude_approved_target="
+                    f"{claude_implementation_changed_as_approved}",
+                    "claude_implementer_reported="
+                    f"{claude_implementer['implementation_write_succeeded']}",
+                    *claude_implementer["evidence"],
+                ),
+                claude_implementer["status"]
+                == ValidationStatus.BLOCKED.value,
+            )
+        )
+    if tuple(item.check_id for item in checks) not in {
+        CHECK_IDS[:-1],
+        CHECK_IDS,
+    }:
         raise PermissionSpikeError("internal permission check order mismatch")
 
     report_status = (
@@ -492,6 +560,14 @@ def build_report(
         f"source_digest={sha256_file(fixture / SOURCE_NAME)}",
         f"implementation_target_digest="
         f"{sha256_file(fixture / IMPLEMENTATION_TARGET_NAME)}",
+        *(
+            (
+                "claude_implementation_target_digest="
+                f"{sha256_file(claude_implementation_target)}",
+            )
+            if claude_implementation_target.is_file()
+            else ()
+        ),
         *(f"runtime_id={runtime_id}" for runtime_id in runtime_ids),
     ]
     without_digest = {

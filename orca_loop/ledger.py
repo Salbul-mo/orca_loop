@@ -314,7 +314,8 @@ def apply_plan_document(
     for decision in plan.finding_decisions:
         if decision.side is not Side.CLAUDE:
             raise LedgerIntegrityError(
-                "plan decisions must use the CLAUDE side"
+                "plan decisions must use the primary consensus lane "
+                "(legacy CLAUDE wire value)"
             )
         record = records.get(decision.finding_id)
         if record is None or record.status not in UNRESOLVED_STATUSES:

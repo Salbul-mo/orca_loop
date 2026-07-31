@@ -7,6 +7,7 @@ The live Orca dispatch preamble is the authority for `task_id` and
 ## Runtime contract
 
 - Role: `{{ROLE}}`
+- Provider: `{{PROVIDER}}`
 - Run: `{{RUN_ID}}`
 - Consensus round: `{{CONSENSUS_ROUND}}`
 - Read-only repository: `{{WORKTREE_PATH}}`
@@ -67,6 +68,9 @@ escalation_signals:
   {code, reason, evidence_refs, deduplication_key}[]
 agrees_with_reviewer: boolean
 ```
+
+`side="CODEX"` is the secondary consensus-lane wire value; it does not
+identify the runtime provider.
 
 Set `reviewed_artifact_digest` to the SHA-256 digest of staged
 `code_review.json`.

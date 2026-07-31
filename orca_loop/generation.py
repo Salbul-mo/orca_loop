@@ -83,6 +83,28 @@ def _atomic_write_fsync(path: Path, raw: bytes) -> None:
         raise AtomicWriteError(f"failed atomic write: {path}") from exc
 
 
+def write_atomic_bytes(path: Path, raw: bytes) -> Path:
+    target = path.resolve()
+    if path.is_symlink():
+        raise AtomicWriteError(f"atomic write target must not be a symlink: {path}")
+    if target.exists() and not target.is_file():
+        raise AtomicWriteError(
+            f"atomic write target must be a regular file: {target}"
+        )
+    _atomic_write_fsync(target, raw)
+    try:
+        persisted = target.read_bytes()
+    except OSError as exc:
+        raise AtomicWriteError(
+            f"failed to verify atomic write: {target}"
+        ) from exc
+    if persisted != raw:
+        raise AtomicWriteError(
+            f"atomic write verification mismatch: {target}"
+        )
+    return target
+
+
 def _decode(expected_type: Any, value: object, context: str) -> object:
     origin = get_origin(expected_type)
     args = get_args(expected_type)

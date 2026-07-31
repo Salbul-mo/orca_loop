@@ -6,6 +6,7 @@ authority for `task_id` and `dispatch_id`.
 ## Runtime contract
 
 - Role: `{{ROLE}}`
+- Provider: `{{PROVIDER}}`
 - Run: `{{RUN_ID}}`
 - Consensus round: `{{CONSENSUS_ROUND}}`
 - Worktree: `{{WORKTREE_PATH}}`
@@ -82,7 +83,8 @@ finding_decisions:
   {finding_id, side, decision, snapshot_digest, round, evidence_refs}[]
 ```
 
-`side` is `CLAUDE`. `decision` is `APPROVE`, `CHANGE_REQUIRED`, or
+`side` is `CLAUDE`, the primary consensus-lane wire value. It does not identify
+the runtime provider. `decision` is `APPROVE`, `CHANGE_REQUIRED`, or
 `VERIFY_REQUIRED`. Do not add prose, Markdown fences, or unknown fields.
 Set output `plan_version` to the current plan version plus one.
 
@@ -97,9 +99,9 @@ Set output `plan_version` to the current plan version plus one.
    implementation steps, data/API/schema changes, error handling, tests,
    acceptance criteria, risks, and out-of-scope items.
 6. Set `reviewed_finding_ids` exactly to the delivered finding IDs and decide
-   each one in `finding_decisions` with side `CLAUDE`, the current snapshot,
-   and the current consensus round. Use empty arrays when no finding is
-   delivered.
+   each one in `finding_decisions` with the primary consensus-lane wire value
+   `CLAUDE`, the current snapshot, and the current consensus round. Use empty
+   arrays when no finding is delivered.
 7. Do not begin implementation.
 
 Return the artifact JSON only on stdout. The deterministic worker wrapper writes

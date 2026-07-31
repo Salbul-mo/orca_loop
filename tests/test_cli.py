@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import subprocess
 import tempfile
@@ -7,20 +8,35 @@ import unittest
 from pathlib import Path
 
 from orca_loop.config import (
+    ConfigurationError,
     PreflightResult,
+    default_agent_runtime_config,
     empty_test_policy,
+    persist_agent_runtime_snapshot,
+    persist_agent_runtime_source,
     PreflightError,
     parse_run_arguments,
+    prepare_agent_runtime,
+    resolve_agent_runtime,
     run_preflight,
 )
-from orca_loop.contracts import digest_value
+from orca_loop.contracts import (
+    build_agent_runtime_config,
+    default_agent_provider,
+    digest_value,
+    parse_agent_runtime_config,
+    serialize_agent_runtime_config,
+)
 from orca_loop.models import (
+    AgentProvider,
+    AgentRuntimeOptions,
     LoopState,
     PermissionCheck,
     PermissionFeasibilityReport,
     PermissionStrategy,
     RunStatus,
     ValidationStatus,
+    WorkerKey,
 )
 from run_loop import (
     EXIT_READY,
@@ -38,7 +54,60 @@ from orca_loop.locking import (
 from tests.fakes import FakeOrcaClient
 
 
+def passing_permission_report(
+    root: Path,
+    *,
+    include_claude_writable: bool = False,
+) -> PermissionFeasibilityReport:
+    check_count = 6 if include_claude_writable else 5
+    return PermissionFeasibilityReport(
+        schema_version=1,
+        run_id="spike",
+        status=ValidationStatus.PASS,
+        strategy=PermissionStrategy.READONLY_REPOSITORY,
+        checks=tuple(
+            PermissionCheck(
+                f"V-PERM-0{index}",
+                ValidationStatus.PASS,
+                ("evidence",),
+            )
+            for index in range(1, check_count + 1)
+        ),
+        evidence=("evidence",),
+        orca_version="1.4.159",
+        canonical_path=str(root / "permission.json"),
+        report_digest="sha256:" + "a" * 64,
+    )
+
+
 class CliConfigurationTest(unittest.TestCase):
+    def arguments(
+        self,
+        root: Path,
+        *extra: str,
+        resume: bool = False,
+    ):
+        request = root / "request.md"
+        report = root / "permission.json"
+        request.write_text("request", encoding="utf-8")
+        report.write_text("{}", encoding="utf-8")
+        values = [
+            "--run-id",
+            "run-1",
+            "--request",
+            str(request),
+            "--worktree",
+            str(root),
+            "--coordinator-handle",
+            "term-1",
+            "--permission-report",
+            str(report),
+            *extra,
+        ]
+        if resume:
+            values.append("--resume")
+        return parse_run_arguments(tuple(values), harness_root=root)
+
     def test_parser_keeps_approved_five_round_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -70,6 +139,452 @@ class CliConfigurationTest(unittest.TestCase):
                 5,
                 arguments.config.code_consensus_round_limit,
             )
+
+    def test_agent_cli_overrides_are_typed_and_duplicates_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            arguments = self.arguments(
+                root,
+                "--agent-provider",
+                "claude_planner=codex",
+                "--agent-model",
+                "codex_implementer=gpt-test",
+                "--agent-effort",
+                "codex_implementer=inherit",
+            )
+            request = arguments.agent_runtime_request
+            self.assertIsNotNone(request)
+            assert request is not None
+            self.assertEqual(
+                ((WorkerKey.CLAUDE_PLANNER, AgentProvider.CODEX),),
+                request.provider_overrides,
+            )
+            self.assertEqual(
+                ((WorkerKey.CODEX_IMPLEMENTER, "gpt-test"),),
+                request.model_overrides,
+            )
+            self.assertEqual(
+                ((WorkerKey.CODEX_IMPLEMENTER, None),),
+                request.effort_overrides,
+            )
+            with self.assertRaisesRegex(ConfigurationError, "duplicates"):
+                self.arguments(
+                    root,
+                    "--agent-model",
+                    "codex_review=one",
+                    "--agent-model",
+                    "codex_review=two",
+                )
+            with self.assertRaisesRegex(ConfigurationError, "unknown worker"):
+                self.arguments(
+                    root,
+                    "--agent-effort",
+                    "unknown=high",
+                )
+            with self.assertRaisesRegex(ConfigurationError, "claude or codex"):
+                self.arguments(
+                    root,
+                    "--agent-provider",
+                    "codex_review=unknown",
+                )
+
+    def test_wizard_persists_base_but_not_cli_override(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            config_path = root.parent / f"{root.name}-agent-runtime.json"
+            self.addCleanup(config_path.unlink, missing_ok=True)
+            initial = build_agent_runtime_config(
+                tuple(
+                    AgentRuntimeOptions(
+                        worker,
+                        default_agent_provider(worker),
+                        f"model-{worker.value}",
+                        "high",
+                    )
+                    for worker in WorkerKey
+                )
+            )
+            config_path.write_text(
+                serialize_agent_runtime_config(initial) + "\n",
+                encoding="utf-8",
+            )
+            arguments = self.arguments(
+                root,
+                "--agent-config",
+                str(config_path),
+                "--configure-agents",
+                "--agent-model",
+                "codex_implementer=one-shot-model",
+            )
+            answers = iter(
+                ["", "inherit", "", *("",) * 9, "y"]
+            )
+            stderr = io.StringIO()
+            resolution = resolve_agent_runtime(
+                arguments.agent_runtime_request,
+                resume=False,
+                worktree_path=root,
+                interactive=True,
+                input_fn=lambda: next(answers),
+                stderr=stderr,
+            )
+            persist_agent_runtime_source(resolution)
+            persisted = parse_agent_runtime_config(
+                config_path.read_text(encoding="utf-8")
+            )
+            persisted_by_worker = {
+                item.worker_key: item for item in persisted.agents
+            }
+            resolved_by_worker = {
+                item.worker_key: item for item in resolution.config.agents
+            }
+            self.assertIsNone(
+                persisted_by_worker[WorkerKey.CLAUDE_PLANNER].model
+            )
+            self.assertNotEqual(
+                "one-shot-model",
+                persisted_by_worker[WorkerKey.CODEX_IMPLEMENTER].model,
+            )
+            self.assertEqual(
+                "one-shot-model",
+                resolved_by_worker[WorkerKey.CODEX_IMPLEMENTER].model,
+            )
+            self.assertIn("Resolved agent runtime:", stderr.getvalue())
+
+    def test_provider_change_rejects_stale_runtime_values(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            config_path = root.parent / f"{root.name}-provider-runtime.json"
+            self.addCleanup(config_path.unlink, missing_ok=True)
+            initial = build_agent_runtime_config(
+                tuple(
+                    AgentRuntimeOptions(
+                        worker,
+                        default_agent_provider(worker),
+                        "provider-specific-model",
+                        "high",
+                    )
+                    for worker in WorkerKey
+                )
+            )
+            config_path.write_text(
+                serialize_agent_runtime_config(initial),
+                encoding="utf-8",
+            )
+            stale = self.arguments(
+                root,
+                "--agent-config",
+                str(config_path),
+                "--agent-provider",
+                "claude_planner=codex",
+            )
+            with self.assertRaisesRegex(ConfigurationError, "provider-specific"):
+                resolve_agent_runtime(
+                    stale.agent_runtime_request,
+                    resume=False,
+                    worktree_path=root,
+                    interactive=False,
+                )
+
+            explicit = self.arguments(
+                root,
+                "--agent-config",
+                str(config_path),
+                "--agent-provider",
+                "claude_planner=codex",
+                "--agent-model",
+                "claude_planner=inherit",
+                "--agent-effort",
+                "claude_planner=inherit",
+            )
+            resolved = resolve_agent_runtime(
+                explicit.agent_runtime_request,
+                resume=False,
+                worktree_path=root,
+                interactive=False,
+            ).config
+            planner = {
+                item.worker_key: item for item in resolved.agents
+            }[WorkerKey.CLAUDE_PLANNER]
+            self.assertEqual(AgentProvider.CODEX, planner.provider)
+            self.assertIsNone(planner.model)
+            self.assertIsNone(planner.effort)
+
+    def test_claude_implementer_requires_v_perm_06(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            arguments = self.arguments(
+                root,
+                "--agent-provider",
+                "codex_implementer=claude",
+            )
+            base = PreflightResult(
+                arguments,
+                empty_test_policy(),
+                passing_permission_report(root),
+                "1.4.159",
+                "a" * 40,
+            )
+            with self.assertRaisesRegex(PreflightError, "V-PERM-06"):
+                prepare_agent_runtime(
+                    base,
+                    interactive=False,
+                    stderr=io.StringIO(),
+                )
+            prepared = prepare_agent_runtime(
+                PreflightResult(
+                    arguments,
+                    empty_test_policy(),
+                    passing_permission_report(
+                        root,
+                        include_claude_writable=True,
+                    ),
+                    "1.4.159",
+                    "a" * 40,
+                ),
+                interactive=False,
+                stderr=io.StringIO(),
+            )
+            assert prepared.agent_runtime is not None
+            implementer = {
+                item.worker_key: item
+                for item in prepared.agent_runtime.agents
+            }[WorkerKey.CODEX_IMPLEMENTER]
+            self.assertEqual(AgentProvider.CLAUDE, implementer.provider)
+
+    def test_wizard_can_create_a_new_strict_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            config_path = root.parent / f"{root.name}-new-agent-runtime.json"
+            self.addCleanup(config_path.unlink, missing_ok=True)
+            arguments = self.arguments(
+                root,
+                "--agent-config",
+                str(config_path),
+                "--configure-agents",
+            )
+            answers = iter([*("",) * 12, "y"])
+            resolution = resolve_agent_runtime(
+                arguments.agent_runtime_request,
+                resume=False,
+                worktree_path=root,
+                interactive=True,
+                input_fn=lambda: next(answers),
+                stderr=io.StringIO(),
+            )
+            persisted_path = persist_agent_runtime_source(resolution)
+            self.assertEqual(config_path.resolve(), persisted_path)
+            self.assertEqual(
+                default_agent_runtime_config(),
+                parse_agent_runtime_config(
+                    config_path.read_text(encoding="utf-8")
+                ),
+            )
+
+    def test_wizard_provider_change_clears_model_and_effort(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            config_path = root.parent / f"{root.name}-wizard-provider.json"
+            self.addCleanup(config_path.unlink, missing_ok=True)
+            initial = build_agent_runtime_config(
+                tuple(
+                    AgentRuntimeOptions(
+                        worker,
+                        default_agent_provider(worker),
+                        "provider-specific-model",
+                        "high",
+                    )
+                    for worker in WorkerKey
+                )
+            )
+            config_path.write_text(
+                serialize_agent_runtime_config(initial),
+                encoding="utf-8",
+            )
+            arguments = self.arguments(
+                root,
+                "--agent-config",
+                str(config_path),
+                "--configure-agents",
+            )
+            answers = iter(["codex", "", "", *("",) * 9, "y"])
+            resolution = resolve_agent_runtime(
+                arguments.agent_runtime_request,
+                resume=False,
+                worktree_path=root,
+                interactive=True,
+                input_fn=lambda: next(answers),
+                stderr=io.StringIO(),
+            )
+            persist_agent_runtime_source(resolution)
+            persisted = parse_agent_runtime_config(
+                config_path.read_text(encoding="utf-8")
+            )
+            planner = {
+                item.worker_key: item for item in persisted.agents
+            }[WorkerKey.CLAUDE_PLANNER]
+            self.assertEqual(AgentProvider.CODEX, planner.provider)
+            self.assertIsNone(planner.model)
+            self.assertIsNone(planner.effort)
+
+    def test_wizard_cancel_and_concurrent_change_preserve_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            config_path = root.parent / f"{root.name}-agent-runtime.json"
+            self.addCleanup(config_path.unlink, missing_ok=True)
+            original = serialize_agent_runtime_config(
+                default_agent_runtime_config()
+            ) + "\n"
+            config_path.write_text(original, encoding="utf-8")
+            arguments = self.arguments(
+                root,
+                "--agent-config",
+                str(config_path),
+                "--configure-agents",
+            )
+            with self.assertRaisesRegex(ConfigurationError, "interactive"):
+                resolve_agent_runtime(
+                    arguments.agent_runtime_request,
+                    resume=False,
+                    worktree_path=root,
+                    interactive=False,
+                    stderr=io.StringIO(),
+                )
+            with self.assertRaisesRegex(ConfigurationError, "cancelled"):
+                resolve_agent_runtime(
+                    arguments.agent_runtime_request,
+                    resume=False,
+                    worktree_path=root,
+                    interactive=True,
+                    input_fn=lambda: (_ for _ in ()).throw(EOFError()),
+                    stderr=io.StringIO(),
+                )
+            cancelled = iter([*("",) * 12, "n"])
+            with self.assertRaisesRegex(ConfigurationError, "cancelled"):
+                resolve_agent_runtime(
+                    arguments.agent_runtime_request,
+                    resume=False,
+                    worktree_path=root,
+                    interactive=True,
+                    input_fn=lambda: next(cancelled),
+                    stderr=io.StringIO(),
+                )
+            self.assertEqual(original, config_path.read_text(encoding="utf-8"))
+
+            accepted = iter([*("",) * 12, "y"])
+            resolution = resolve_agent_runtime(
+                arguments.agent_runtime_request,
+                resume=False,
+                worktree_path=root,
+                interactive=True,
+                input_fn=lambda: next(accepted),
+                stderr=io.StringIO(),
+            )
+            config_path.write_text("external change\n", encoding="utf-8")
+            with self.assertRaisesRegex(ConfigurationError, "changed during"):
+                persist_agent_runtime_source(resolution)
+
+    def test_resume_uses_snapshot_and_rejects_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            control = root / "runs" / "run-1" / "control"
+            control.mkdir(parents=True)
+            stored = build_agent_runtime_config(
+                tuple(
+                    AgentRuntimeOptions(
+                        worker,
+                        default_agent_provider(worker),
+                        "stored-model",
+                        "high",
+                    )
+                    for worker in WorkerKey
+                )
+            )
+            persist_agent_runtime_snapshot(
+                control,
+                "run-1",
+                stored,
+                None,
+            )
+            arguments = self.arguments(root, resume=True)
+            report = passing_permission_report(root)
+            prepared = prepare_agent_runtime(
+                PreflightResult(
+                    arguments,
+                    empty_test_policy(),
+                    report,
+                    "1.4.159",
+                    "a" * 40,
+                ),
+                interactive=False,
+                stderr=io.StringIO(),
+            )
+            self.assertEqual(stored, prepared.agent_runtime)
+
+            drifted_arguments = self.arguments(
+                root,
+                "--agent-model",
+                "codex_review=different-model",
+                resume=True,
+            )
+            with self.assertRaisesRegex(PreflightError, "drift"):
+                prepare_agent_runtime(
+                    PreflightResult(
+                        drifted_arguments,
+                        empty_test_policy(),
+                        report,
+                        "1.4.159",
+                        "a" * 40,
+                    ),
+                    interactive=False,
+                    stderr=io.StringIO(),
+                )
+
+            provider_drift = self.arguments(
+                root,
+                "--agent-provider",
+                "claude_planner=codex",
+                "--agent-model",
+                "claude_planner=inherit",
+                "--agent-effort",
+                "claude_planner=inherit",
+                resume=True,
+            )
+            with self.assertRaisesRegex(PreflightError, "drift"):
+                prepare_agent_runtime(
+                    PreflightResult(
+                        provider_drift,
+                        empty_test_policy(),
+                        report,
+                        "1.4.159",
+                        "a" * 40,
+                    ),
+                    interactive=False,
+                    stderr=io.StringIO(),
+                )
+
+    def test_legacy_resume_reports_snapshot_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            arguments = self.arguments(root, resume=True)
+            report = passing_permission_report(root)
+            stderr = io.StringIO()
+            prepared = prepare_agent_runtime(
+                PreflightResult(
+                    arguments,
+                    empty_test_policy(),
+                    report,
+                    "1.4.159",
+                    "a" * 40,
+                ),
+                interactive=False,
+                stderr=stderr,
+            )
+            self.assertEqual(
+                default_agent_runtime_config(),
+                prepared.agent_runtime,
+            )
+            self.assertIn("migration snapshot", stderr.getvalue())
 
     def test_preflight_rejects_dirty_worktree_before_orca_mutation(
         self,
@@ -354,6 +869,10 @@ class RunEntryPointTest(unittest.TestCase):
             self.assertEqual(LoopState.PLAN, controller.state.state)
             self.assertEqual(4, len(pool.workers))
             self.assertEqual(pool.workers, controller.state.worker_handles)
+            runtime_snapshot = (
+                controller.workspace.control_dir / "agent-runtime.json"
+            )
+            self.assertTrue(runtime_snapshot.is_file())
 
     def test_exit_code_mapping_is_exact(self) -> None:
         from tests.test_coordinator import initial_state

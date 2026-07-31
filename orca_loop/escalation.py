@@ -186,8 +186,8 @@ def build_user_decision_report(
         lines.append("| None | - | - | - |")
 
     for heading, side in (
-        ("5. Claude Positions", Side.CLAUDE),
-        ("6. Codex Positions", Side.CODEX),
+        ("5. Primary Consensus Lane (legacy CLAUDE)", Side.CLAUDE),
+        ("6. Secondary Consensus Lane (legacy CODEX)", Side.CODEX),
     ):
         lines.extend(["", f"## {heading}", ""])
         if not unresolved:
@@ -203,7 +203,7 @@ def build_user_decision_report(
     for record in unresolved:
         positions = _latest_decisions(record.decisions)
         common = (
-            "Both sides recorded the same decision."
+            "Both consensus lanes recorded the same decision."
             if (
                 Side.CLAUDE in positions
                 and Side.CODEX in positions
@@ -211,7 +211,7 @@ def build_user_decision_report(
                 is positions[Side.CODEX].decision
             )
             else (
-                "Both sides recognize this finding as part of the "
+                "Both consensus lanes recognize this finding as part of the "
                 "bounded unresolved scope."
             )
         )
