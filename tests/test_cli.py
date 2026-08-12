@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from orca_loop.catalog import load_catalog
 from orca_loop.config import (
     ConfigurationError,
     PreflightResult,
@@ -483,6 +484,168 @@ class CliConfigurationTest(unittest.TestCase):
             config_path.write_text("external change\n", encoding="utf-8")
             with self.assertRaisesRegex(ConfigurationError, "changed during"):
                 persist_agent_runtime_source(resolution)
+
+    def static_catalog(self, root: Path):
+        # `home=root` has no codex model cache, so the catalog falls back to
+        # the built-in static tables and stays independent of the machine.
+        return load_catalog(root, home=root)
+
+    def test_agent_runtime_normalizes_requested_values(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            arguments = self.arguments(
+                root,
+                "--agent-model",
+                "claude_planner=sonnet5",
+                "--agent-effort",
+                "claude_planner=mid",
+                "--agent-model",
+                "codex_implementer=terra",
+                "--agent-effort",
+                "codex_implementer=max",
+            )
+            stderr = io.StringIO()
+            prepared = prepare_agent_runtime(
+                PreflightResult(
+                    arguments,
+                    empty_test_policy(),
+                    passing_permission_report(root),
+                    "1.4.159",
+                    "a" * 40,
+                ),
+                interactive=False,
+                stderr=stderr,
+                catalog=self.static_catalog(root),
+            )
+            assert prepared.agent_runtime is not None
+            by_worker = {
+                item.worker_key: item
+                for item in prepared.agent_runtime.agents
+            }
+            planner = by_worker[WorkerKey.CLAUDE_PLANNER]
+            self.assertEqual("sonnet", planner.model)
+            self.assertEqual("medium", planner.effort)
+            implementer = by_worker[WorkerKey.CODEX_IMPLEMENTER]
+            self.assertEqual("gpt-5.6-terra", implementer.model)
+            self.assertEqual("max", implementer.effort)
+            self.assertIn("from 'sonnet5'", stderr.getvalue())
+            self.assertEqual(4, len(prepared.agent_resolutions))
+
+    def test_unknown_model_falls_back_with_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            arguments = self.arguments(
+                root,
+                "--agent-model",
+                "codex_review=gpt-9000",
+            )
+            stderr = io.StringIO()
+            prepared = prepare_agent_runtime(
+                PreflightResult(
+                    arguments,
+                    empty_test_policy(),
+                    passing_permission_report(root),
+                    "1.4.159",
+                    "a" * 40,
+                ),
+                interactive=False,
+                stderr=stderr,
+                catalog=self.static_catalog(root),
+            )
+            assert prepared.agent_runtime is not None
+            review = {
+                item.worker_key: item
+                for item in prepared.agent_runtime.agents
+            }[WorkerKey.CODEX_REVIEW]
+            self.assertEqual("gpt-5.6-terra", review.model)
+            self.assertIn("[WARN]", stderr.getvalue())
+            self.assertIs(
+                AgentProvider.CODEX,
+                review.provider,
+            )
+
+    def test_strict_agent_runtime_rejects_unknown_model(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            arguments = self.arguments(
+                root,
+                "--strict-agent-runtime",
+                "--agent-model",
+                "codex_review=gpt-9000",
+            )
+            self.assertTrue(arguments.strict_agent_runtime)
+            with self.assertRaisesRegex(
+                ConfigurationError,
+                "codex_review",
+            ):
+                prepare_agent_runtime(
+                    PreflightResult(
+                        arguments,
+                        empty_test_policy(),
+                        passing_permission_report(root),
+                        "1.4.159",
+                        "a" * 40,
+                    ),
+                    interactive=False,
+                    stderr=io.StringIO(),
+                    catalog=self.static_catalog(root),
+                )
+
+    def test_resume_accepts_equivalent_requested_values(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            control = root / "runs" / "run-1" / "control"
+            control.mkdir(parents=True)
+            stored = build_agent_runtime_config(
+                tuple(
+                    AgentRuntimeOptions(
+                        worker,
+                        default_agent_provider(worker),
+                        (
+                            "sonnet"
+                            if default_agent_provider(worker)
+                            is AgentProvider.CLAUDE
+                            else "gpt-5.6-terra"
+                        ),
+                        "medium",
+                    )
+                    for worker in WorkerKey
+                )
+            )
+            persist_agent_runtime_snapshot(control, "run-1", stored, None)
+            arguments = self.arguments(
+                root,
+                "--agent-model",
+                "claude_planner=sonnet5",
+                "--agent-effort",
+                "claude_planner=mid",
+                "--agent-model",
+                "claude_code_review=sonnet",
+                "--agent-effort",
+                "claude_code_review=medium",
+                "--agent-model",
+                "codex_implementer=terra",
+                "--agent-effort",
+                "codex_implementer=medium",
+                "--agent-model",
+                "codex_review=terra",
+                "--agent-effort",
+                "codex_review=medium",
+                resume=True,
+            )
+            prepared = prepare_agent_runtime(
+                PreflightResult(
+                    arguments,
+                    empty_test_policy(),
+                    passing_permission_report(root),
+                    "1.4.159",
+                    "a" * 40,
+                ),
+                interactive=False,
+                stderr=io.StringIO(),
+                catalog=self.static_catalog(root),
+            )
+            self.assertEqual(stored, prepared.agent_runtime)
 
     def test_resume_uses_snapshot_and_rejects_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

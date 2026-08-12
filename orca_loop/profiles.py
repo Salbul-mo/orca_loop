@@ -54,7 +54,10 @@ def _verify_permission_report(
         raise LaunchProfileError(
             "only the live-verified strategy D may be used"
         )
-    if report.orca_version != expected_orca_version:
+    if report.environment is None and report.orca_version != expected_orca_version:
+        # Only a legacy report without an environment fingerprint is judged
+        # on the Orca version; run_preflight verifies the fingerprint for
+        # every report that carries one.
         raise LaunchProfileError(
             "permission report Orca version does not match runtime"
         )

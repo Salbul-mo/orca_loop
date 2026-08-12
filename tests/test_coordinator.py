@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 from orca_loop.generation import (
     AtomicWriteError,
@@ -13,6 +14,8 @@ from orca_loop.generation import (
 )
 from orca_loop.config import validate_loop_config
 from orca_loop.coordinator import (
+    CoordinatorGuardError,
+    CoordinatorPermissionError,
     apply_worker_artifact,
     execute_evaluate,
     operational_retry_result,
@@ -29,6 +32,8 @@ from orca_loop.models import (
     ConsensusKind,
     CoordinatorState,
     ExpectedProvenance,
+    HumanDecision,
+    HumanDecisionKind,
     LoopConfig,
     LoopCounters,
     LoopState,
@@ -41,10 +46,14 @@ from orca_loop.models import (
     SignalKind,
     StepStage,
     TestContract,
+    Violation,
+    WorkerHandle,
+    WorkerKey,
 )
 from tests.test_ledger import DIGEST_B, review, finding, decision
 from orca_loop.ledger import apply_review_artifact, commit_round
 from orca_loop.models import DecisionValue, Side
+from run_loop import _user_scope
 
 
 DIGEST_A = "sha256:" + "a" * 64
@@ -74,6 +83,36 @@ def initial_state() -> CoordinatorState:
 
 
 class GenerationStoreTest(unittest.TestCase):
+    def test_typed_permission_errors_keep_worker_attribution(self) -> None:
+        active = ActiveStep(
+            step_id="step-1",
+            task_id="task-1",
+            dispatch_id="dispatch-1",
+            role=Role.PLANNER,
+            worker=WorkerHandle(
+                WorkerKey.CLAUDE_PLANNER,
+                "term-worker",
+                "worktree",
+                "tab",
+                "leaf",
+            ),
+        )
+        violation = Violation(
+            "readonly_source_delta",
+            "README.md",
+            "planner changed repository content",
+        )
+        guard_error = CoordinatorGuardError((violation,), active, DIGEST_A)
+        permission_error = CoordinatorPermissionError(
+            "OUTBOX_WRITE_DENIED",
+            active,
+            ("C:/logs/stderr.log",),
+            DIGEST_A,
+        )
+        self.assertEqual((violation,), guard_error.violations)
+        self.assertIs(active, guard_error.active)
+        self.assertEqual("OUTBOX_WRITE_DENIED", permission_error.reason_code)
+        self.assertEqual(WorkerKey.CLAUDE_PLANNER, permission_error.active.worker.worker_key)
     def test_commit_is_monotonic_and_roundtrips_typed_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             control = Path(temporary).resolve()
@@ -186,6 +225,39 @@ def config(root: Path) -> LoopConfig:
 
 
 class CoordinatorCoreTest(unittest.TestCase):
+    def test_merge_decision_delivers_full_approved_plan_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            artifact_dir = root / "artifacts"
+            artifact_dir.mkdir()
+            from orca_loop.contracts import serialize_json
+
+            value = plan()
+            (artifact_dir / "plan.json").write_text(
+                serialize_json(value),
+                encoding="utf-8",
+            )
+            controller = SimpleNamespace(
+                ledger=empty_ledger("run-1"),
+                workspace=SimpleNamespace(root=root),
+                state=SimpleNamespace(
+                    human_decision=HumanDecision(
+                        HumanDecisionKind.MERGE,
+                        "Approved bounded plan.",
+                        (),
+                        (),
+                        DIGEST_A,
+                    ),
+                    counters=LoopCounters(0, 0),
+                    history=(),
+                ),
+            )
+
+            scope = _user_scope(controller)
+
+            self.assertEqual(("AC-1",), scope.acceptance_criteria_ids)
+            self.assertEqual(("src/example.py",), scope.affected_files)
+
     def test_plan_artifact_records_explicit_claude_decision(self) -> None:
         base = apply_review_artifact(
             empty_ledger("run-1"),

@@ -1,14 +1,24 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Sequence, TextIO
 
+from .catalog import (
+    AgentCatalog,
+    ResolvedValue,
+    UnknownAgentValueError,
+    describe_value,
+    load_catalog,
+    resolve_agent,
+)
 from .contracts import (
     ContractViolationError,
     build_agent_runtime_config,
@@ -22,6 +32,11 @@ from .contracts import (
     permission_capabilities,
     serialize_agent_runtime_config,
     serialize_agent_runtime_snapshot,
+)
+from .environment import (
+    capture_environment,
+    compare_environment,
+    environment_notes,
 )
 from .generation import AtomicWriteError, write_atomic_bytes
 from .models import (
@@ -47,6 +62,7 @@ DEFAULT_OPERATIONAL_RETRY_LIMIT = 3
 DEFAULT_MAX_TRANSITION_COUNT = 128
 DEFAULT_STEP_TIMEOUT_MS = 900_000
 DEFAULT_TOTAL_TIMEOUT_MS = 7_200_000
+PERMISSION_REFRESH_MARKER_NAME = ".permission-refresh-required.json"
 
 
 class ConfigurationError(ValueError):
@@ -66,6 +82,27 @@ class RunArguments:
     resume: bool
     dry_run: bool
     agent_runtime_request: AgentRuntimeRequest | None = None
+    strict_agent_runtime: bool = False
+    accept_worktree_drift: bool = False
+    force_unlock: bool = False
+
+
+@dataclass(frozen=True)
+class AgentResolution:
+    """Requested-to-resolved provenance for one worker slot."""
+
+    worker_key: WorkerKey
+    provider: AgentProvider
+    model: ResolvedValue
+    effort: ResolvedValue
+
+    @property
+    def warnings(self) -> tuple[str, ...]:
+        return tuple(
+            item
+            for item in (self.model.warning, self.effort.warning)
+            if item
+        )
 
 
 @dataclass(frozen=True)
@@ -76,6 +113,7 @@ class PreflightResult:
     orca_version: str
     base_head: str
     agent_runtime: AgentRuntimeConfig | None = None
+    agent_resolutions: tuple[AgentResolution, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -472,21 +510,86 @@ def resolve_agent_runtime(
     )
 
 
+def normalize_agent_runtime(
+    config: AgentRuntimeConfig,
+    catalog: AgentCatalog,
+    *,
+    strict: bool = False,
+) -> tuple[AgentRuntimeConfig, tuple[AgentResolution, ...]]:
+    """Map requested model and effort values onto catalog values.
+
+    The provider of each worker is preserved exactly: the permission
+    feasibility report proves capabilities per provider, so resolution must
+    never move a worker to a provider the report does not cover.
+    """
+    mapping = _runtime_mapping(config)
+    options: list[AgentRuntimeOptions] = []
+    resolutions: list[AgentResolution] = []
+    for worker in WorkerKey:
+        current = mapping[worker]
+        try:
+            resolved = resolve_agent(
+                catalog,
+                current.provider,
+                current.model,
+                current.effort,
+                strict=strict,
+            )
+        except UnknownAgentValueError as exc:
+            raise ConfigurationError(
+                f"{worker.value}: {exc}"
+            ) from exc
+        options.append(
+            AgentRuntimeOptions(
+                worker,
+                current.provider,
+                resolved.model.value,
+                resolved.effort.value,
+            )
+        )
+        resolutions.append(
+            AgentResolution(
+                worker_key=worker,
+                provider=current.provider,
+                model=resolved.model,
+                effort=resolved.effort,
+            )
+        )
+    try:
+        normalized = build_agent_runtime_config(tuple(options))
+    except ContractViolationError as exc:
+        raise ConfigurationError(str(exc)) from exc
+    return normalized, tuple(resolutions)
+
+
 def print_agent_runtime_summary(
     config: AgentRuntimeConfig,
     *,
     stderr: TextIO | None = None,
+    resolutions: tuple[AgentResolution, ...] = (),
 ) -> None:
     output = sys.stderr if stderr is None else stderr
+    by_worker = {item.worker_key: item for item in resolutions}
     print("Resolved agent runtime:", file=output)
     for item in config.agents:
-        model = item.model or "<provider-default>"
-        effort = item.effort or "<provider-default>"
+        resolution = by_worker.get(item.worker_key)
+        if resolution is None:
+            model = item.model or "<provider-default>"
+            effort = item.effort or "<provider-default>"
+        else:
+            model = describe_value(resolution.model)
+            effort = describe_value(resolution.effort)
         print(
             f"- {item.worker_key.value}: provider={item.provider.value}, "
             f"model={model}, effort={effort}",
             file=output,
         )
+    for resolution in resolutions:
+        for warning in resolution.warnings:
+            print(
+                f"[WARN] {resolution.worker_key.value}: {warning}",
+                file=output,
+            )
 
 
 def persist_agent_runtime_source(
@@ -595,9 +698,17 @@ def prepare_agent_runtime(
     interactive: bool | None = None,
     input_fn: Callable[[], str] | None = None,
     stderr: TextIO | None = None,
+    catalog: AgentCatalog | None = None,
 ) -> PreflightResult:
     arguments = preflight.arguments
     request = arguments.agent_runtime_request
+    active_catalog = (
+        load_catalog(arguments.harness_root)
+        if catalog is None
+        else catalog
+    )
+    strict = arguments.strict_agent_runtime
+    resolutions: tuple[AgentResolution, ...] = ()
     persisted = (
         load_agent_runtime_snapshot(
             arguments.harness_root,
@@ -620,10 +731,20 @@ def prepare_agent_runtime(
                 input_fn=input_fn,
                 stderr=stderr,
             ).config
+            # Normalize the candidate the same way the original start did,
+            # so re-typing "sonnet5" for a run launched as "sonnet" is not
+            # reported as configuration drift.
+            candidate, _ = normalize_agent_runtime(
+                candidate,
+                active_catalog,
+                strict=strict,
+            )
             if candidate.configuration_digest != persisted.configuration_digest:
                 raise PreflightError(
                     "agent runtime configuration drift on resume"
                 )
+        # The persisted snapshot is what the run has been using; it is never
+        # re-normalized, because changing it mid-run is configuration drift.
         resolved = persisted
     else:
         resolution = resolve_agent_runtime(
@@ -635,7 +756,11 @@ def prepare_agent_runtime(
             stderr=stderr,
         )
         persist_agent_runtime_source(resolution)
-        resolved = resolution.config
+        resolved, resolutions = normalize_agent_runtime(
+            resolution.config,
+            active_catalog,
+            strict=strict,
+        )
         if arguments.resume:
             output = sys.stderr if stderr is None else stderr
             print(
@@ -667,8 +792,16 @@ def prepare_agent_runtime(
                 f"{item.worker_key.value}; pass {check_hint} before "
                 "worker provisioning"
             )
-    print_agent_runtime_summary(resolved, stderr=stderr)
-    return replace(preflight, agent_runtime=resolved)
+    print_agent_runtime_summary(
+        resolved,
+        stderr=stderr,
+        resolutions=resolutions,
+    )
+    return replace(
+        preflight,
+        agent_runtime=resolved,
+        agent_resolutions=resolutions,
+    )
 
 
 def load_test_policy(path: Path | None) -> TestExecutionPolicy:
@@ -764,6 +897,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Override one agent effort for this run; may be repeated.",
     )
     parser.add_argument(
+        "--strict-agent-runtime",
+        action="store_true",
+        help=(
+            "Reject model or effort values that need a tolerant fallback "
+            "instead of resolving them to the closest catalog value."
+        ),
+    )
+    parser.add_argument(
         "--plan-consensus-round-limit",
         type=int,
         default=DEFAULT_PLAN_ROUND_LIMIT,
@@ -802,6 +943,22 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--accept-worktree-drift",
+        action="store_true",
+        help=(
+            "Resume a write step even though the worktree changed since the "
+            "last committed generation."
+        ),
+    )
+    parser.add_argument(
+        "--force-unlock",
+        action="store_true",
+        help=(
+            "Reclaim the coordinator lock even when its owning process still "
+            "appears to be running."
+        ),
+    )
     return parser
 
 
@@ -854,6 +1011,247 @@ def parse_run_arguments(
         resume=namespace.resume,
         dry_run=namespace.dry_run,
         agent_runtime_request=agent_runtime_request,
+        strict_agent_runtime=getattr(
+            namespace,
+            "strict_agent_runtime",
+            False,
+        ),
+        accept_worktree_drift=getattr(
+            namespace,
+            "accept_worktree_drift",
+            False,
+        ),
+        force_unlock=getattr(namespace, "force_unlock", False),
+    )
+
+
+def permission_report_candidates(harness_root: Path) -> tuple[Path, ...]:
+    runs_root = harness_root.resolve() / "runs"
+    if not runs_root.is_dir():
+        return ()
+    found = [
+        path
+        for path in runs_root.glob("*/control/permission-feasibility.json")
+        if path.is_file()
+    ]
+    return tuple(
+        sorted(
+            found,
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        )
+    )
+
+
+def permission_environment_problems(
+    report: PermissionFeasibilityReport,
+    harness_root: Path,
+    orca_version: str,
+) -> tuple[str, ...]:
+    """Return the blocking environment differences for a report.
+
+    A report that records an environment fingerprint is judged on that
+    fingerprint. Only a legacy report without one falls back to the old exact
+    Orca version comparison, because it carries no better evidence.
+    """
+    if report.environment is None:
+        if report.orca_version != orca_version:
+            return (
+                f"legacy report without environment fingerprint and "
+                f"orca_version {report.orca_version} does not match "
+                f"{orca_version}",
+            )
+        return ()
+    return compare_environment(
+        report.environment,
+        capture_environment(harness_root),
+    )
+
+
+def permission_report_notes(
+    report: PermissionFeasibilityReport,
+    orca_version: str,
+) -> tuple[str, ...]:
+    """Return non-blocking observations about a usable report."""
+    notes: list[str] = []
+    if report.environment is not None:
+        notes.extend(
+            environment_notes(
+                report.environment,
+                capture_environment(Path(report.canonical_path).resolve().parents[3]),
+            )
+        )
+    if report.environment is not None and report.orca_version != orca_version:
+        notes.append(
+            f"permission report was produced under Orca {report.orca_version} "
+            f"and the runtime is {orca_version}; Orca does not mediate file "
+            "access, so this is informational"
+        )
+    return tuple(notes)
+
+
+def permission_refresh_marker_path(harness_root: Path) -> Path:
+    return harness_root.resolve() / "runs" / PERMISSION_REFRESH_MARKER_NAME
+
+
+def _parse_utc(value: str, context: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise PreflightError(f"{context} must be ISO-8601 UTC") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+        raise PreflightError(f"{context} must use UTC offset")
+    return parsed
+
+
+def _read_permission_refresh_marker(harness_root: Path) -> dict[str, object] | None:
+    path = permission_refresh_marker_path(harness_root)
+    if not path.exists():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PreflightError(f"permission refresh marker is unreadable: {exc}") from exc
+    required = {
+        "schema_version", "run_id", "detected_at", "reason_code",
+        "worker_key", "step_id", "blocked_report_digest", "evidence_paths",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise PreflightError("permission refresh marker schema is invalid")
+    if value.get("schema_version") != 1 or not isinstance(value["detected_at"], str):
+        raise PreflightError("permission refresh marker schema is invalid")
+    _parse_utc(value["detected_at"], "permission refresh marker detected_at")
+    if not isinstance(value["blocked_report_digest"], str):
+        raise PreflightError("permission refresh marker digest is invalid")
+    return value
+
+
+def _remove_marker_atomically(path: Path) -> None:
+    retired = path.with_name(path.name + ".cleared")
+    os.replace(path, retired)
+    retired.unlink()
+
+
+def permission_refresh_problem(
+    harness_root: Path,
+    report: PermissionFeasibilityReport,
+) -> str | None:
+    marker = _read_permission_refresh_marker(harness_root)
+    if marker is None:
+        return None
+    if report.created_at is None:
+        return "permission refresh required; selected report has no created_at"
+    created_at = _parse_utc(report.created_at, "permission report created_at")
+    detected_at = _parse_utc(str(marker["detected_at"]), "permission refresh marker detected_at")
+    if (
+        report.report_digest == marker["blocked_report_digest"]
+        or created_at <= detected_at
+    ):
+        return "permission refresh required; selected report predates the recorded permission failure"
+    try:
+        _remove_marker_atomically(permission_refresh_marker_path(harness_root))
+    except OSError as exc:
+        return f"permission refresh marker could not be cleared: {exc}"
+    return None
+
+
+def record_permission_refresh_marker(
+    harness_root: Path,
+    *,
+    run_id: str,
+    reason_code: str,
+    worker_key: str,
+    step_id: str,
+    blocked_report_digest: str,
+    evidence_paths: Sequence[str],
+) -> None:
+    value = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "detected_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "reason_code": reason_code,
+        "worker_key": worker_key,
+        "step_id": step_id,
+        "blocked_report_digest": blocked_report_digest,
+        "evidence_paths": list(evidence_paths),
+    }
+    raw = json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8") + b"\n"
+    write_atomic_bytes(permission_refresh_marker_path(harness_root), raw)
+
+
+def permission_report_problem(
+    path: Path,
+    orca_version: str,
+    *,
+    harness_root: Path | None = None,
+) -> str | None:
+    """Return why a report is unusable, or None when it qualifies.
+
+    These are exactly the conditions an operator was previously expected to
+    check by hand before every launch.
+    """
+    try:
+        report = parse_permission_report(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ContractViolationError) as exc:
+        return f"unreadable ({exc})"
+    if report.status is not ValidationStatus.PASS:
+        return f"status is {report.status.value}"
+    if report.strategy is not PermissionStrategy.READONLY_REPOSITORY:
+        return f"strategy is {report.strategy.value}"
+    environment_problems = permission_environment_problems(
+        report,
+        # <harness>/runs/<run-id>/control/permission-feasibility.json
+        path.resolve().parents[3] if harness_root is None else harness_root,
+        orca_version,
+    )
+    if environment_problems:
+        return "; ".join(environment_problems)
+    if any(item.status is not ValidationStatus.PASS for item in report.checks):
+        failing = ", ".join(
+            item.check_id
+            for item in report.checks
+            if item.status is not ValidationStatus.PASS
+        )
+        return f"non-PASS checks: {failing}"
+    try:
+        canonical = Path(report.canonical_path).resolve()
+    except OSError:
+        return "canonical_path cannot be resolved"
+    if canonical != path.resolve():
+        return f"canonical_path points elsewhere: {report.canonical_path}"
+    refresh_problem = permission_refresh_problem(
+        path.resolve().parents[3] if harness_root is None else harness_root,
+        report,
+    )
+    if refresh_problem:
+        return refresh_problem
+    return None
+
+
+def discover_permission_report(
+    harness_root: Path,
+    orca_version: str,
+) -> Path:
+    """Pick the newest permission report that satisfies every gate."""
+    candidates = permission_report_candidates(harness_root)
+    if not candidates:
+        raise PreflightError(
+            "no permission feasibility report found under "
+            f"{harness_root / 'runs'}; run the permission spike first"
+        )
+    problems: list[str] = []
+    for path in candidates:
+        problem = permission_report_problem(
+            path,
+            orca_version,
+            harness_root=harness_root,
+        )
+        if problem is None:
+            return path
+        problems.append(f"{path}: {problem}")
+    raise PreflightError(
+        "no permission feasibility report qualifies for Orca "
+        f"{orca_version}: " + "; ".join(problems[:5])
     )
 
 
@@ -889,11 +1287,17 @@ def _orca_version(status: dict[str, object]) -> str:
     raise PreflightError("Orca status has no app version")
 
 
+def orca_version_from_status(status: dict[str, object]) -> str:
+    """Read the Orca app version out of a `status --json` result."""
+    return _orca_version(status)
+
+
 def run_preflight(
     arguments: RunArguments,
     client: OrcaClient,
     *,
     expected_orca_version: str = "1.4.159",
+    verify_coordinator: bool = True,
 ) -> PreflightResult:
     config = arguments.config
     if sys.version_info < (3, 11):
@@ -952,19 +1356,34 @@ def run_preflight(
         raise PreflightError("Orca runtime and graph must both be ready")
     version = _orca_version(status)
     if version != expected_orca_version:
-        raise PreflightError(
-            f"Orca version drift: expected {expected_orca_version}, got {version}"
+        # Informational only: Orca does not mediate file access, so a version
+        # change does not by itself invalidate the permission proof.
+        print(
+            f"[NOTE] Orca runtime is {version}; the harness was last "
+            f"verified against {expected_orca_version}",
+            file=sys.stderr,
         )
     if (
         permission.status is not ValidationStatus.PASS
         or permission.strategy
         is not PermissionStrategy.READONLY_REPOSITORY
-        or permission.orca_version != version
     ):
         raise PreflightError(
-            "permission report is not a PASS result for strategy D "
-            "and the active Orca version"
+            "permission report is not a PASS result for strategy D"
         )
+    environment_problems = permission_environment_problems(
+        permission,
+        arguments.harness_root,
+        version,
+    )
+    if environment_problems:
+        raise PreflightError(
+            "permission report no longer matches this environment; "
+            "re-run the permission spike: "
+            + "; ".join(environment_problems)
+        )
+    for note in permission_report_notes(permission, version):
+        print(f"[NOTE] {note}", file=sys.stderr)
     if (
         Path(permission.canonical_path).resolve()
         != arguments.permission_report_path
@@ -979,15 +1398,25 @@ def run_preflight(
         raise PreflightError(
             "permission report contains a non-PASS check"
         )
-    client.call(
-        (
-            "terminal",
-            "show",
-            "--terminal",
-            config.coordinator_handle,
-        ),
-        timeout_ms=10_000,
+    refresh_problem = permission_refresh_problem(
+        arguments.harness_root,
+        permission,
     )
+    if refresh_problem:
+        raise PreflightError(refresh_problem)
+    if verify_coordinator:
+        # Resume verifies (and rebinds) the coordinator terminal separately,
+        # because a handle that died with the previous process must not make
+        # the run unresumable.
+        client.call(
+            (
+                "terminal",
+                "show",
+                "--terminal",
+                config.coordinator_handle,
+            ),
+            timeout_ms=10_000,
+        )
     return PreflightResult(
         arguments=arguments,
         test_policy=policy,

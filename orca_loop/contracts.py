@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime, timezone
 import re
 from dataclasses import fields, is_dataclass
 from enum import Enum
@@ -34,6 +35,7 @@ from .models import (
     ImplementationStatus,
     InformationalFinding,
     PermissionCheck,
+    PermissionEnvironment,
     PermissionFeasibilityReport,
     PermissionStrategy,
     PlanDocument,
@@ -1393,20 +1395,65 @@ def parse_test_policy(raw_text: str) -> TestExecutionPolicy:
     )
 
 
-def parse_permission_report(raw_text: str) -> PermissionFeasibilityReport:
+def _parse_permission_environment(
+    value: object,
+) -> PermissionEnvironment:
     raw = _exact(
-        _decode(raw_text),
-        {
-            "schema_version",
-            "run_id",
-            "status",
-            "strategy",
-            "checks",
-            "evidence",
-            "orca_version",
-            "canonical_path",
-            "report_digest",
-        },
+        _object(value, "permission_report.environment"),
+        {"platform", "claude_cli", "codex_cli", "enforcement_digest"},
+        context="permission_report.environment",
+    )
+    return PermissionEnvironment(
+        platform=_string(
+            raw["platform"],
+            "permission_report.environment.platform",
+        ),
+        claude_cli=(
+            None
+            if raw["claude_cli"] is None
+            else _string(
+                raw["claude_cli"],
+                "permission_report.environment.claude_cli",
+            )
+        ),
+        codex_cli=(
+            None
+            if raw["codex_cli"] is None
+            else _string(
+                raw["codex_cli"],
+                "permission_report.environment.codex_cli",
+            )
+        ),
+        enforcement_digest=_digest(
+            raw["enforcement_digest"],
+            "permission_report.environment.enforcement_digest",
+        ),
+    )
+
+
+def parse_permission_report(raw_text: str) -> PermissionFeasibilityReport:
+    decoded = _decode(raw_text)
+    required = {
+        "schema_version",
+        "run_id",
+        "status",
+        "strategy",
+        "checks",
+        "evidence",
+        "orca_version",
+        "canonical_path",
+        "report_digest",
+    }
+    # `environment` is optional so that reports written before the
+    # environment fingerprint existed still parse; those fall back to the
+    # older exact Orca version comparison.
+    if isinstance(decoded, dict) and "environment" in decoded:
+        required = required | {"environment"}
+    if isinstance(decoded, dict) and "created_at" in decoded:
+        required = required | {"created_at"}
+    raw = _exact(
+        decoded,
+        required,
         context="permission_report",
     )
     _schema(raw, "permission_report")
@@ -1475,6 +1522,19 @@ def parse_permission_report(raw_text: str) -> PermissionFeasibilityReport:
         raise ContractViolationError(
             "PASS permission report requires strategy and all checks PASS"
         )
+    created_at = None
+    if "created_at" in raw:
+        created_at = _string(raw["created_at"], "permission_report.created_at")
+        try:
+            parsed_created_at = datetime.fromisoformat(created_at)
+        except ValueError as exc:
+            raise ContractViolationError(
+                "permission_report.created_at must be ISO-8601 UTC"
+            ) from exc
+        if parsed_created_at.tzinfo is None or parsed_created_at.utcoffset() != timezone.utc.utcoffset(parsed_created_at):
+            raise ContractViolationError(
+                "permission_report.created_at must use UTC offset"
+            )
     return PermissionFeasibilityReport(
         schema_version=SCHEMA_VERSION,
         run_id=_identifier(raw["run_id"], "permission_report.run_id"),
@@ -1494,6 +1554,12 @@ def parse_permission_report(raw_text: str) -> PermissionFeasibilityReport:
             "permission_report.canonical_path",
         ),
         report_digest=claimed,
+        environment=(
+            None
+            if "environment" not in raw
+            else _parse_permission_environment(raw["environment"])
+        ),
+        created_at=created_at,
     )
 
 

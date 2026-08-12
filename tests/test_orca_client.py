@@ -17,6 +17,7 @@ from orca_loop.models import (
 )
 from orca_loop.orca_client import (
     OrcaClient,
+    OrcaCommandError,
     OrcaProtocolError,
     OrcaTimeoutError,
 )
@@ -58,6 +59,20 @@ class OrcaClientTest(unittest.TestCase):
             with patch("subprocess.Popen", return_value=process):
                 with self.assertRaises(OrcaProtocolError):
                     self.client().call(("status",), timeout_ms=1000)
+
+    def test_nonzero_exit_preserves_stdout_and_stderr(self) -> None:
+        process = MagicMock()
+        process.communicate.return_value = (
+            b'{"ok":false,"error":{"code":"run_required"}}',
+            b"diagnostic stderr",
+        )
+        process.returncode = 1
+        with patch("subprocess.Popen", return_value=process):
+            with self.assertRaisesRegex(
+                OrcaCommandError,
+                "run_required.*diagnostic stderr|diagnostic stderr.*run_required",
+            ):
+                self.client().call(("status",), timeout_ms=1000)
 
     def test_timeout_raises_typed_error(self) -> None:
         process = MagicMock()

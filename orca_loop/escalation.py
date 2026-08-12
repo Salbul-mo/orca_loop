@@ -370,7 +370,8 @@ def create_gate(
             "--question",
             (
                 f"{question} Review {report.path} for "
-                f"{','.join(report.finding_ids) or 'the final decision'}."
+                f"{','.join(report.finding_ids) or 'the final decision'}. "
+                f"Report digest: {report.digest}."
             ),
             "--options",
             json.dumps(options, ensure_ascii=False),
@@ -378,12 +379,65 @@ def create_gate(
         timeout_ms=timeout_ms,
     )
     value = _result_object(response.result_json)
-    gate_id = _first_string(value, "id", "gateId", "gate_id")
-    returned_task = _first_string(value, "taskId", "task_id", "task")
+    nested_gate = value.get("gate")
+    gate_value = nested_gate if isinstance(nested_gate, dict) else value
+    gate_id = _first_string(gate_value, "id", "gateId", "gate_id")
+    returned_task = _first_string(
+        gate_value,
+        "taskId",
+        "task_id",
+        "task",
+    )
     if gate_id is None:
         raise GateProtocolError("gate-create result has no gate ID")
     if returned_task is not None and returned_task != task_id:
         raise GateProtocolError("gate-create returned a foreign task ID")
+    return GateBinding(
+        gate_id=gate_id,
+        task_id=task_id,
+        report_digest=report.digest,
+        gate_kind=gate_kind,
+    )
+
+
+def find_gate_for_report(
+    client: OrcaClient,
+    *,
+    report: DecisionReport,
+    gate_kind: GateKind,
+    timeout_ms: int,
+) -> GateBinding | None:
+    response = client.call(
+        ("orchestration", "gate-list"),
+        timeout_ms=timeout_ms,
+    )
+    value = _result_object(response.result_json)
+    raw_gates = value.get("gates", value.get("items", []))
+    if not isinstance(raw_gates, list):
+        raise GateProtocolError("gate-list result has no gates array")
+    report_path = str(report.path)
+    matches: list[tuple[str, str]] = []
+    for item in raw_gates:
+        if not isinstance(item, dict):
+            continue
+        gate_id = _first_string(item, "id", "gateId", "gate_id")
+        task_id = _first_string(item, "taskId", "task_id", "task")
+        question = item.get("question")
+        if (
+            gate_id is not None
+            and task_id is not None
+            and isinstance(question, str)
+            and report_path in question
+            and report.digest in question
+        ):
+            matches.append((gate_id, task_id))
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise GateProtocolError(
+            "expected at most one gate for the decision report"
+        )
+    gate_id, task_id = matches[0]
     return GateBinding(
         gate_id=gate_id,
         task_id=task_id,
@@ -428,6 +482,18 @@ def wait_gate_resolution(
     if isinstance(resolution, dict):
         raw_resolution = json.dumps(resolution, ensure_ascii=False)
     elif isinstance(resolution, str):
+        simple_decision = resolution.strip()
+        if simple_decision in {
+            HumanDecisionKind.MERGE.value,
+            HumanDecisionKind.REJECT.value,
+        }:
+            return HumanDecision(
+                decision=HumanDecisionKind(simple_decision),
+                decision_note=None,
+                affected_acceptance_criteria=(),
+                affected_finding_ids=(),
+                report_digest=binding.report_digest,
+            )
         raw_resolution = resolution
     else:
         raise GateProtocolError("resolved gate has no usable resolution")

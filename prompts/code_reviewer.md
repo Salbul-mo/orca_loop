@@ -76,6 +76,16 @@ the runtime provider.
 
 Set `reviewed_artifact_digest` to the SHA-256 digest of staged
 `implementation.json`.
+Use `P0|P1|P2` for `severity` and `B1|B2|B3|B4|B5` for
+`blocking_reason`. `impact_class` must be exactly one of `none`,
+`architecture`, `requirement_interpretation`, `db_schema`, `external_api`, or
+`security_auth`. Set `reopens` to a single JSON string or JSON `null`, never an
+array, object, number, or boolean. Set `reviewed_finding_ids` to the exact
+delivered finding IDs without adding, omitting, or reordering IDs.
+Each blocking finding needs exactly one nonempty `required_fix` or
+`required_change`; set the unused field to JSON `null`, never an empty string.
+Set `line` to JSON `null` when no positive source line is available, otherwise
+use an integer >= 1; never use `0`.
 Return raw JSON only, with no unknown fields.
 
 Return exactly one strict `ReviewArtifact` JSON object on stdout. The wrapper

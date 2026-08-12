@@ -354,6 +354,11 @@ def _messages(result: Mapping[str, object]) -> tuple[dict[str, object], ...]:
     return tuple(item for item in raw if isinstance(item, dict))
 
 
+def _delivery_id(result: Mapping[str, object]) -> str | None:
+    value = _field(result, "deliveryId", "delivery_id")
+    return value if isinstance(value, str) and value else None
+
+
 def _message_value(message: Mapping[str, object]) -> dict[str, object]:
     nested = message.get("message")
     return dict(nested) if isinstance(nested, dict) else dict(message)
@@ -364,7 +369,20 @@ def _message_ids(
 ) -> tuple[str | None, str | None, dict[str, object]]:
     value = _message_value(message)
     payload = value.get("payload")
-    payload_value = dict(payload) if isinstance(payload, dict) else {}
+    if isinstance(payload, dict):
+        payload_value = dict(payload)
+    elif isinstance(payload, str):
+        try:
+            decoded_payload = json.loads(payload)
+        except json.JSONDecodeError:
+            decoded_payload = None
+        payload_value = (
+            dict(decoded_payload)
+            if isinstance(decoded_payload, dict)
+            else {}
+        )
+    else:
+        payload_value = {}
     task_id = _field(value, "task_id", "taskId")
     if task_id is None:
         task_id = _field(payload_value, "task_id", "taskId")
@@ -446,6 +464,10 @@ def dispatch_and_wait(
         "orca_executable": orca_executable,
         "timeout_ms": step_timeout_ms,
         "preamble": preamble,
+        # runs/<run-id>/logs; the runner persists the agent command line and
+        # both output streams there whatever the exit code turns out to be.
+        "log_dir": str((step.root.parents[1] / "logs").resolve()),
+        "step_id": step.step_id,
     }
     command = _runner_command(job, runner_path)
     client.call(
@@ -482,7 +504,10 @@ def dispatch_and_wait(
             ),
             timeout_ms=min(65_000, window + 5_000),
         )
-        for raw_message in _messages(_result(checked)):
+        checked_result = _result(checked)
+        delivery_id = _delivery_id(checked_result)
+        matched_completion: Completion | None = None
+        for raw_message in _messages(checked_result):
             value = _message_value(raw_message)
             message_type = _field(value, "type", "message_type")
             task_id, message_dispatch_id, payload = _message_ids(value)
@@ -495,6 +520,7 @@ def dispatch_and_wait(
                 continue
             if message_type == "worker_done":
                 normalized_payload = dict(payload)
+                normalized_payload.pop("outcome", None)
                 normalized_payload.setdefault("taskId", prepared.task_id)
                 normalized_payload.setdefault("dispatchId", dispatch_id)
                 report_path = _field(value, "report_path", "reportPath")
@@ -504,47 +530,52 @@ def dispatch_and_wait(
                     and "report_path" not in normalized_payload
                 ):
                     normalized_payload["reportPath"] = report_path
-                return (
-                    handle,
-                    Completion(
-                        CompletionKind.WORKER_DONE,
-                        prepared.task_id,
-                        dispatch_id,
-                        json.dumps(
-                            normalized_payload,
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        ),
+                matched_completion = Completion(
+                    CompletionKind.WORKER_DONE,
+                    prepared.task_id,
+                    dispatch_id,
+                    json.dumps(
+                        normalized_payload,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
                     ),
                 )
-            if message_type == "escalation":
-                return (
-                    handle,
-                    Completion(
-                        CompletionKind.ESCALATION,
-                        prepared.task_id,
-                        dispatch_id,
-                        json.dumps(
-                            payload,
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        ),
+            elif message_type == "escalation":
+                matched_completion = Completion(
+                    CompletionKind.ESCALATION,
+                    prepared.task_id,
+                    dispatch_id,
+                    json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
                     ),
                 )
-            if message_type == "decision_gate":
-                return (
-                    handle,
-                    Completion(
-                        CompletionKind.DECISION_GATE,
-                        prepared.task_id,
-                        dispatch_id,
-                        json.dumps(
-                            payload,
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        ),
+            elif message_type == "decision_gate":
+                matched_completion = Completion(
+                    CompletionKind.DECISION_GATE,
+                    prepared.task_id,
+                    dispatch_id,
+                    json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
                     ),
                 )
+        if delivery_id is not None:
+            client.call(
+                (
+                    "orchestration",
+                    "check",
+                    "--terminal",
+                    coordinator_handle,
+                    "--ack",
+                    delivery_id,
+                ),
+                timeout_ms=30_000,
+            )
+        if matched_completion is not None:
+            return handle, matched_completion
     return (
         handle,
         Completion(

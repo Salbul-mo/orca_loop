@@ -80,7 +80,7 @@ def _lock_windows(path: Path) -> None:
             str(path),
             "/inheritance:r",
             "/grant:r",
-            f"{identity}:(OI)(CI)(RX)",
+            f"{identity}:(RX)",
             "/T",
             "/C",
         ),
@@ -120,9 +120,9 @@ def prepare_readonly_mirror(
         raise ReadOnlyMirrorError(
             f"worktree is not a Git repository: {source}"
         )
-    if not _inside(destination_parent, source):
+    if _inside(destination_parent, source):
         raise ReadOnlyMirrorError(
-            "review_root must be inside the harness worktree"
+            "review_root must be outside the target worktree"
         )
     if generation < 0:
         raise ReadOnlyMirrorError("generation must be nonnegative")

@@ -149,7 +149,7 @@ class OrcaClient:
         if process.returncode != 0:
             raise OrcaCommandError(
                 f"Orca command failed ({process.returncode}): {argv!r}; "
-                f"stderr={stderr[-4096:]!r}"
+                f"stderr={stderr[-4096:]!r}; stdout={stdout[-4096:]!r}"
             )
         try:
             value = json.loads(stdout)

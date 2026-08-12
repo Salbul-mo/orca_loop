@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import json
 import re
@@ -10,6 +11,11 @@ from dataclasses import asdict, dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Sequence
+
+# The environment fingerprint must be computed by exactly the same code the
+# coordinator uses to verify it, so this is imported rather than duplicated.
+from orca_loop.environment import capture_environment
+from orca_loop.models import PermissionEnvironment
 
 
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
@@ -72,6 +78,8 @@ class PermissionFeasibilityReport:
     orca_version: str
     canonical_path: str
     report_digest: str
+    environment: PermissionEnvironment | None = None
+    created_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -570,6 +578,13 @@ def build_report(
         ),
         *(f"runtime_id={runtime_id}" for runtime_id in runtime_ids),
     ]
+    environment = capture_environment(harness_root)
+    environment_value = {
+        "platform": environment.platform,
+        "claude_cli": environment.claude_cli,
+        "codex_cli": environment.codex_cli,
+        "enforcement_digest": environment.enforcement_digest,
+    }
     without_digest = {
         "schema_version": 1,
         "run_id": run_id,
@@ -586,6 +601,8 @@ def build_report(
         "evidence": evidence,
         "orca_version": orca_version,
         "canonical_path": canonical_path,
+        "environment": environment_value,
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
     digest = sha256_bytes(canonical_json_bytes(without_digest))
     return PermissionFeasibilityReport(
@@ -600,6 +617,8 @@ def build_report(
         orca_version=orca_version,
         canonical_path=canonical_path,
         report_digest=digest,
+        environment=environment,
+        created_at=without_digest["created_at"],
     )
 
 
@@ -621,6 +640,13 @@ def serialize_report(report: PermissionFeasibilityReport) -> dict[str, object]:
         "orca_version": report.orca_version,
         "canonical_path": report.canonical_path,
         "report_digest": report.report_digest,
+        "environment": {
+            "platform": report.environment.platform,
+            "claude_cli": report.environment.claude_cli,
+            "codex_cli": report.environment.codex_cli,
+            "enforcement_digest": report.environment.enforcement_digest,
+        },
+        "created_at": report.created_at,
     }
 
 

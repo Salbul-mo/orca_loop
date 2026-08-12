@@ -268,6 +268,22 @@ class PermissionCheck:
 
 
 @dataclass(frozen=True)
+class PermissionEnvironment:
+    """What a permission proof actually depends on.
+
+    Orca creates terminals and routes messages; it does not mediate file
+    access. The read-only guarantee comes from the OS ACL applied by
+    ``readonly.py`` and from the launch flags in ``profiles.py``, exercised by
+    the agent CLIs. Those are the values worth pinning.
+    """
+
+    platform: str
+    claude_cli: str | None
+    codex_cli: str | None
+    enforcement_digest: str
+
+
+@dataclass(frozen=True)
 class PermissionFeasibilityReport:
     schema_version: int
     run_id: str
@@ -278,6 +294,8 @@ class PermissionFeasibilityReport:
     orca_version: str
     canonical_path: str
     report_digest: str
+    environment: PermissionEnvironment | None = None
+    created_at: str | None = None
 
 
 @dataclass(frozen=True)

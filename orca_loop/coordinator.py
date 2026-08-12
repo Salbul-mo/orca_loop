@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 from typing import Callable
@@ -65,9 +66,15 @@ from .models import (
     TestExecutionPolicy,
     TestGateStatus,
     TransitionSignal,
+    Violation,
     WorkerPool,
 )
 from .orca_client import OrcaClient
+from .reporting import (
+    record_artifact_history,
+    render_run_summary,
+    render_stage_report,
+)
 from .roles import ARTIFACT_FILENAMES
 from .snapshot import capture_snapshot
 from .testrunner import run_tests
@@ -84,6 +91,48 @@ class CoordinatorContractError(OrcaLoopError):
 
 class CoordinatorGuardError(OrcaLoopError):
     """Raised when repository or artifact scope guards reject a result."""
+
+    def __init__(
+        self,
+        violations: tuple[Violation, ...],
+        active: ActiveStep,
+        permission_report_digest: str,
+    ) -> None:
+        self.violations = violations
+        self.active = active
+        self.permission_report_digest = permission_report_digest
+        super().__init__(
+            "; ".join(
+                f"{item.code}:{item.path}:{item.detail}"
+                for item in violations
+            )
+        )
+
+
+class CoordinatorPermissionError(OrcaLoopError):
+    """Raised for an allowlisted, typed worker permission observation."""
+
+    def __init__(
+        self,
+        reason_code: str,
+        active: ActiveStep,
+        evidence_paths: tuple[str, ...],
+        permission_report_digest: str,
+    ) -> None:
+        self.reason_code = reason_code
+        self.active = active
+        self.evidence_paths = evidence_paths
+        self.permission_report_digest = permission_report_digest
+        super().__init__(f"worker permission observation: {reason_code}")
+
+
+PERMISSION_REASON_CODES = frozenset(
+    {
+        "OUTBOX_WRITE_DENIED",
+        "SOURCE_DIRECTORY_READ_DENIED",
+        "PROCESS_EXECUTION_DENIED",
+    }
+)
 
 
 class ResumeAmbiguityError(OrcaLoopError):
@@ -353,6 +402,15 @@ class GenerationController:
         )
         self.state = next_state
         self.ledger = next_ledger
+        # Refresh the readable summary only after the durable commit has
+        # succeeded; render_run_summary swallows its own failures so that
+        # reporting can never turn a committed generation into an error.
+        render_run_summary(
+            self.workspace.root,
+            next_state,
+            next_ledger,
+            harness_root=self.workspace.root.parents[1],
+        )
         return next_state
 
 
@@ -442,6 +500,26 @@ def execute_worker_step(
             None,
         )
     if completion.kind is CompletionKind.ESCALATION:
+        payload_text = completion.payload_json or ""
+        try:
+            payload = json.loads(payload_text)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            reason_code = payload.get("reason_code")
+            evidence_paths = payload.get("evidence_paths", ())
+            if (
+                isinstance(reason_code, str)
+                and reason_code in PERMISSION_REASON_CODES
+                and isinstance(evidence_paths, list)
+                and all(isinstance(item, str) for item in evidence_paths)
+            ):
+                raise CoordinatorPermissionError(
+                    reason_code,
+                    active,
+                    tuple(evidence_paths),
+                    controller.state.permission_report_digest,
+                )
         return (
             StepExecutionResult(
                 TransitionSignal(
@@ -504,6 +582,21 @@ def execute_worker_step(
     artifact = parser(promoted.raw_text)
     if validate_artifact is not None:
         validate_artifact(artifact)
+    # Keep the promoted artifact addressable after the next revision
+    # overwrites artifacts/<kind>.json, and render it for a human reader.
+    next_generation = controller.state.generation + 1
+    record_artifact_history(
+        controller.workspace.root,
+        artifact_kind.value,
+        next_generation,
+        promoted.raw_text.encode("utf-8"),
+    )
+    render_stage_report(
+        controller.workspace.root,
+        artifact_kind.value,
+        promoted.raw_text,
+        next_generation,
+    )
     after_snapshot = capture_snapshot(worktree)
     after_files = capture_file_state(worktree)
     guard = guard_repository_delta(
@@ -516,11 +609,11 @@ def execute_worker_step(
         after_files=after_files,
     )
     if not guard.ok:
-        detail = "; ".join(
-            f"{item.code}:{item.path}:{item.detail}"
-            for item in guard.violations
+        raise CoordinatorGuardError(
+            guard.violations,
+            active,
+            controller.state.permission_report_digest,
         )
-        raise CoordinatorGuardError(detail)
     update = handler(controller.ledger, artifact)
     plan_version = (
         artifact.plan_version

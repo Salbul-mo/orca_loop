@@ -1,28 +1,40 @@
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
+import shutil
 import sys
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
+from orca_loop.catalog import describe_catalog, load_catalog
+from orca_loop.environment import capture_environment, describe_environment
 from orca_loop.config import (
     ConfigurationError,
     PreflightError,
     PreflightResult,
     default_agent_runtime_config,
+    discover_permission_report,
+    orca_version_from_status,
     parse_run_arguments,
+    permission_report_candidates,
+    permission_report_problem,
     persist_agent_runtime_snapshot,
     prepare_agent_runtime,
     run_preflight,
+    record_permission_refresh_marker,
 )
 from orca_loop.contracts import (
     ContractViolationError,
     parse_plan_document,
 )
 from orca_loop.coordinator import (
+    CoordinatorGuardError,
+    CoordinatorPermissionError,
     GenerationController,
     OrcaLoopError,
     WORKER_STATES,
@@ -33,6 +45,7 @@ from orca_loop.coordinator import (
     execute_test_gate,
     execute_worker_step,
     operational_retry_result,
+    reconcile_resume,
     role_for_state,
 )
 from orca_loop.dispatcher import provision_workers, worker_for_role
@@ -42,10 +55,12 @@ from orca_loop.escalation import (
     build_user_decision_report,
     create_gate,
     destructive_gate,
+    find_gate_for_report,
     wait_gate_resolution,
 )
 from orca_loop.generation import (
     AtomicWriteError,
+    GenerationError,
     commit_generation,
     load_committed,
 )
@@ -53,6 +68,8 @@ from orca_loop.ledger import empty_ledger, unresolved_scope
 from orca_loop.locking import (
     RunLockError,
     acquire_run_lock,
+    inspect_lock,
+    pid_alive,
     release_run_lock,
 )
 from orca_loop.machine import TERMINAL_STATES
@@ -67,6 +84,7 @@ from orca_loop.models import (
     LoopCounters,
     LoopState,
     PlanDocument,
+    ResumeDecision,
     ReviewArtifact,
     Role,
     RoleContext,
@@ -86,6 +104,22 @@ from orca_loop.models import (
 from orca_loop.orca_client import OrcaClient, OrcaCommandError
 from orca_loop.profiles import build_launch_profile
 from orca_loop.readonly import prepare_readonly_mirror
+from orca_loop.reporting import render_failure_report, resume_command_line
+from orca_loop.runspec import (
+    ManifestError,
+    build_manifest,
+    copy_request,
+    read_manifest,
+    update_terminals,
+    verify_inputs,
+    write_manifest,
+)
+from orca_loop.session import (
+    append_event,
+    create_terminal,
+    ensure_coordinator_terminal,
+    ensure_worker_pool,
+)
 from orca_loop.roles import ARTIFACT_FILENAMES, render_role_contract
 from orca_loop.snapshot import capture_snapshot, materialize_frozen_review
 from orca_loop.workspace import (
@@ -94,7 +128,14 @@ from orca_loop.workspace import (
 )
 
 
-EXPECTED_ORCA_VERSION = "1.4.159"
+# The Orca build this harness was last exercised against. Drift from it is
+# reported as a note, not a failure: the permission proof is pinned to the
+# environment fingerprint (agent CLIs, enforcement code, platform), which is
+# what actually decides whether a read-only worktree stays read-only.
+EXPECTED_ORCA_VERSION = "1.4.179"
+# Placeholder used only while rehearsing a launch, so a dry run never leaks
+# a coordinator terminal it will not use.
+DRY_RUN_HANDLE = "dry-run-no-terminal"
 EXIT_READY = 0
 EXIT_RUNTIME_FAILURE = 1
 EXIT_PREFLIGHT = 2
@@ -182,6 +223,10 @@ def _initialize(
         runtime,
         source_path,
     )
+    request_copy, request_digest = copy_request(
+        workspace.control_dir,
+        arguments.config.request_path,
+    )
     controller = GenerationController(workspace, state, ledger)
     pool = provision_workers(
         client,
@@ -207,6 +252,16 @@ def _initialize(
         active=None,
         reason="worker pool provenance recorded",
     )
+    write_manifest(
+        workspace.control_dir,
+        build_manifest(
+            preflight,
+            request_copy=request_copy,
+            request_digest=request_digest,
+            coordinator_handle=state.coordinator_handle,
+            pool=pool,
+        ),
+    )
     commit_step_transition(
         controller,
         StepExecutionResult(
@@ -223,8 +278,136 @@ def _initialize(
     return controller, pool
 
 
+class ResumeBlockedError(RuntimeError):
+    """Raised when a resume needs an explicit user decision to continue."""
+
+
+# States whose step only reads the worktree. Resuming one after the tree
+# changed cannot corrupt anything, so the recorded snapshot is re-baselined
+# automatically; a write step is not resumed over a changed tree without an
+# explicit --accept-worktree-drift.
+READ_ONLY_RESUME_STATES = frozenset(
+    {
+        LoopState.PLAN,
+        LoopState.PLAN_REVISE,
+        LoopState.PLAN_REVIEW,
+        LoopState.CODE_REVIEW,
+        LoopState.CROSS_CONFIRM,
+        LoopState.PLAN_CONSENSUS_EVALUATE,
+        LoopState.CONSENSUS_EVALUATE,
+        LoopState.TEST_GATE,
+        LoopState.HUMAN_GATE,
+        LoopState.USER_DECISION_REQUIRED,
+    }
+)
+
+
+@dataclass(frozen=True)
+class DriftDecision:
+    drifted: bool
+    rebaselined: bool
+    new_digest: str | None
+    detail: tuple[str, ...]
+
+
+def _snapshot_difference(
+    state: CoordinatorState,
+    current,
+) -> tuple[str, ...]:
+    lines = [
+        f"recorded snapshot: {state.snapshot_digest}",
+        f"current snapshot:  {current.snapshot_digest}",
+        f"recorded base HEAD: {state.base_head}",
+        f"current base HEAD:  {current.base_head}",
+    ]
+    if current.untracked:
+        lines.append(
+            "untracked files now present: "
+            + ", ".join(path for path, _ in current.untracked[:20])
+        )
+    return tuple(lines)
+
+
+def _resolve_drift(
+    state: CoordinatorState,
+    worktree: Path,
+    *,
+    accept: bool,
+) -> DriftDecision:
+    current = capture_snapshot(worktree)
+    if current.snapshot_digest == state.snapshot_digest:
+        return DriftDecision(False, False, None, ())
+    detail = _snapshot_difference(state, current)
+    if state.state in READ_ONLY_RESUME_STATES or accept:
+        return DriftDecision(True, True, current.snapshot_digest, detail)
+    raise ResumeBlockedError(
+        "worktree changed since the last committed generation while the run "
+        f"was in {state.state.value}, which writes to the worktree. Review "
+        "the changes, then resume with --accept-worktree-drift to continue "
+        "from the current tree. "
+        + "; ".join(detail)
+    )
+
+
+def _binding_facts(step_root: Path) -> tuple[bool, bool]:
+    path = step_root / "binding.json"
+    if not path.is_file():
+        return False, False
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False, False
+    if not isinstance(value, dict):
+        return False, False
+    return (
+        isinstance(value.get("task_id"), str) and bool(value.get("task_id")),
+        isinstance(value.get("dispatch_id"), str)
+        and bool(value.get("dispatch_id")),
+    )
+
+
+def _abandon_step(
+    workspace,
+    active: ActiveStep,
+    reason: str,
+) -> None:
+    """Mark an in-flight step as abandoned without deleting its evidence."""
+    step_root = workspace.steps_dir / active.step_id
+    if not step_root.is_dir():
+        return
+    outputs = (
+        sorted(
+            str(item)
+            for item in (step_root / "out").iterdir()
+            if item.is_file()
+        )
+        if (step_root / "out").is_dir()
+        else []
+    )
+    payload = {
+        "abandoned_at": datetime.now(timezone.utc).isoformat(
+            timespec="seconds"
+        ),
+        "reason": reason,
+        "step_id": active.step_id,
+        "role": active.role.value,
+        "task_id": active.task_id,
+        "dispatch_id": active.dispatch_id,
+        "preserved_outputs": outputs,
+    }
+    try:
+        (step_root / "ABANDONED").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        return
+
+
 def _resume(
     preflight: PreflightResult,
+    client: OrcaClient,
 ) -> tuple[GenerationController, WorkerPool]:
     arguments = preflight.arguments
     workspace, _ = create_run_workspace(
@@ -236,14 +419,10 @@ def _resume(
     state, ledger, _ = load_committed(workspace.control_dir)
     if state.run_id != arguments.run_id:
         raise OrcaLoopError("resume run ID does not match committed state")
-    if state.coordinator_handle != arguments.config.coordinator_handle:
+    if state.state in {LoopState.FAILED, LoopState.REJECTED}:
         raise OrcaLoopError(
-            "resume coordinator handle does not match committed state"
-        )
-    snapshot = capture_snapshot(arguments.config.worktree_path)
-    if snapshot.snapshot_digest != state.snapshot_digest:
-        raise OrcaLoopError(
-            "resume worktree snapshot does not match committed state"
+            f"run ended in {state.state.value}; start a new run instead of "
+            "resuming it"
         )
     runtime_path = workspace.control_dir / "agent-runtime.json"
     if not runtime_path.exists():
@@ -259,10 +438,144 @@ def _resume(
             runtime,
             source_path,
         )
-    pool = WorkerPool(state.worker_handles)
-    if len(pool.workers) != 4:
-        raise OrcaLoopError("committed worker pool is incomplete")
-    return GenerationController(workspace, state, ledger), pool
+
+    selector = _worktree_selector(arguments.config.worktree_path)
+    coordinator = ensure_coordinator_terminal(
+        client,
+        worktree_selector=selector,
+        run_id=state.run_id,
+        recorded_handles=(
+            state.coordinator_handle,
+            arguments.config.coordinator_handle,
+        ),
+    )
+    binding = ensure_worker_pool(
+        client,
+        worktree_selector=selector,
+        recorded={
+            item.worker_key: item.terminal_handle
+            for item in state.worker_handles
+        },
+        coordinator_handle=coordinator.handle,
+    )
+    drift = _resolve_drift(
+        state,
+        arguments.config.worktree_path,
+        accept=arguments.accept_worktree_drift,
+    )
+
+    controller = GenerationController(workspace, state, ledger)
+    if coordinator.rebound or binding.changed or drift.rebaselined:
+        reasons = []
+        if coordinator.rebound:
+            reasons.append("coordinator terminal rebound")
+        if binding.changed:
+            reasons.append(
+                "worker terminals rebound: "
+                + ",".join(item.value for item in binding.rebound)
+            )
+        if drift.rebaselined:
+            reasons.append("worktree snapshot re-baselined")
+        controller.state = replace(
+            controller.state,
+            coordinator_handle=coordinator.handle,
+            worker_handles=binding.pool.workers,
+        )
+        controller.commit(
+            stage=controller.state.step_stage,
+            active=controller.state.active,
+            reason="resume: " + "; ".join(reasons),
+            snapshot_digest=drift.new_digest,
+        )
+        append_event(
+            workspace.control_dir,
+            "resume_rebound",
+            {
+                "generation": controller.state.generation,
+                "coordinator_rebound": coordinator.rebound,
+                "coordinator_handle": coordinator.handle,
+                "workers_rebound": [
+                    item.value for item in binding.rebound
+                ],
+                "worktree_rebaselined": drift.rebaselined,
+                "drift_detail": list(drift.detail),
+            },
+        )
+    manifest = read_manifest(workspace.control_dir)
+    if manifest is not None:
+        update_terminals(
+            workspace.control_dir,
+            manifest,
+            coordinator_handle=coordinator.handle,
+            pool=binding.pool,
+        )
+
+    active = controller.state.active
+    task_exists, dispatch_exists = (
+        (False, False)
+        if active is None
+        else _binding_facts(workspace.steps_dir / active.step_id)
+    )
+    output_exists = False
+    if active is not None:
+        output_dir = workspace.steps_dir / active.step_id / "out"
+        output_exists = output_dir.is_dir() and any(
+            item.is_file() for item in output_dir.iterdir()
+        )
+    decision = reconcile_resume(
+        controller.state,
+        controller.ledger,
+        task_exists=task_exists,
+        dispatch_exists=dispatch_exists,
+        output_exists=output_exists,
+    )
+    _apply_resume_decision(controller, decision, workspace)
+    return controller, binding.pool
+
+
+def _apply_resume_decision(
+    controller: GenerationController,
+    decision: ResumeDecision,
+    workspace,
+) -> None:
+    """Return the run to a clean step boundary.
+
+    An in-flight step is abandoned rather than adopted: the dispatch it was
+    waiting on died with the previous coordinator, and the guard baselines
+    that would be needed to accept its output (the pre-step snapshot and file
+    state) are not persisted. Re-running the step is correct by construction,
+    and the abandoned step keeps its inputs, outputs and logs on disk.
+    """
+    state = controller.state
+    if state.state in TERMINAL_STATES or state.state in {
+        LoopState.HUMAN_GATE,
+        LoopState.USER_DECISION_REQUIRED,
+    }:
+        return
+    if (
+        state.step_stage is StepStage.TRANSITION_COMMITTED
+        and state.active is None
+    ):
+        return
+    reason = f"resume from {state.step_stage.value} ({decision.action.value})"
+    if state.active is not None:
+        _abandon_step(workspace, state.active, reason)
+        append_event(
+            workspace.control_dir,
+            "step_abandoned",
+            {
+                "step_id": state.active.step_id,
+                "role": state.active.role.value,
+                "task_id": state.active.task_id,
+                "dispatch_id": state.active.dispatch_id,
+                "resume_action": decision.action.value,
+            },
+        )
+    controller.commit(
+        stage=StepStage.TRANSITION_COMMITTED,
+        active=None,
+        reason=reason,
+    )
 
 
 def _user_scope(
@@ -299,6 +612,27 @@ def _user_scope(
             targeted_test_results=scope.targeted_test_results,
             disagreement_excerpts=retry_note,
         )
+    if decision.decision is HumanDecisionKind.MERGE:
+        plan = _load_plan(controller.workspace.root)
+        if plan is not None:
+            return ScopePackage(
+                finding_ids=(),
+                acceptance_criteria_ids=tuple(
+                    item.criterion_id
+                    for item in plan.acceptance_criteria
+                ),
+                affected_files=tuple(
+                    item.path for item in plan.affected_files
+                ),
+                test_ids=plan.test_contract.test_ids,
+                targeted_test_results=(),
+                disagreement_excerpts=(
+                    retry_note
+                    if decision.decision_note is None
+                    else retry_note
+                    + (f"USER: {decision.decision_note}",)
+                ),
+            )
     return ScopePackage(
         finding_ids=(),
         acceptance_criteria_ids=(
@@ -646,10 +980,6 @@ def _ensure_gate(
         worktree_path=preflight.arguments.config.worktree_path,
         test_status=controller.state.test_gate_status,
     )
-    task_id = _create_decision_task(
-        client,
-        controller.state.run_id,
-    )
     plan = _load_plan(controller.workspace.root)
     destructive_pending = (
         controller.state.state is not LoopState.HUMAN_GATE
@@ -668,6 +998,25 @@ def _ensure_gate(
             if destructive_pending
             else GateKind.ESCALATION
         )
+    )
+    binding = find_gate_for_report(
+        client,
+        report=report,
+        gate_kind=kind,
+        timeout_ms=30_000,
+    )
+    if binding is not None:
+        controller.commit(
+            stage=StepStage.TRANSITION_COMMITTED,
+            active=None,
+            reason="existing user decision gate recovered",
+            status=RunStatus.BLOCKED,
+            gate_binding=binding,
+        )
+        return
+    task_id = _create_decision_task(
+        client,
+        controller.state.run_id,
     )
     binding = create_gate(
         client,
@@ -851,6 +1200,16 @@ def _run_loop(
                     continue
                 return controller.state
             _ensure_gate(controller, preflight, client)
+            if (
+                controller.state.gate_binding is not None
+                and _resume_gate(
+                    controller,
+                    preflight,
+                    client,
+                )
+            ):
+                transitions += 1
+                continue
             return controller.state
         if state in TERMINAL_STATES:
             return controller.state
@@ -939,7 +1298,7 @@ def run_coordinator(
     client: OrcaClient,
 ) -> CoordinatorState:
     if preflight.arguments.resume:
-        controller, pool = _resume(preflight)
+        controller, pool = _resume(preflight, client)
     else:
         controller, pool = _initialize(preflight, client)
     return _run_loop(controller, pool, preflight, client)
@@ -958,19 +1317,391 @@ def exit_code(state: CoordinatorState) -> int:
     return EXIT_RUNTIME_FAILURE
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    harness_root = Path(__file__).resolve().parent
-    lock = None
+def _report_failure(
+    arguments,
+    reason: str,
+    detail: Sequence[str] = (),
+) -> None:
+    """Leave a readable stop report inside the run directory when one exists."""
+    if arguments is None:
+        return
+    run_root = arguments.harness_root / "runs" / arguments.run_id
+    if not run_root.is_dir():
+        return
+    render_failure_report(
+        run_root,
+        reason=reason,
+        harness_root=arguments.harness_root,
+        run_id=arguments.run_id,
+        detail=detail,
+    )
+
+
+def _record_permission_refresh(arguments, error) -> tuple[str, ...]:
+    """Persist only directly observed permission-contract failures."""
+    if arguments is None:
+        return ("permission marker skipped: run arguments unavailable",)
+    if isinstance(error, CoordinatorGuardError):
+        if not any(item.code == "readonly_source_delta" for item in error.violations):
+            return ()
+        reason_code = "READONLY_SOURCE_DELTA"
+        evidence_paths: tuple[str, ...] = ()
+    elif isinstance(error, CoordinatorPermissionError):
+        reason_code = error.reason_code
+        evidence_paths = error.evidence_paths
+    else:
+        return ()
     try:
-        arguments = parse_run_arguments(
-            argv,
+        record_permission_refresh_marker(
+            arguments.harness_root,
+            run_id=arguments.run_id,
+            reason_code=reason_code,
+            worker_key=error.active.worker.worker_key.value,
+            step_id=error.active.step_id,
+            blocked_report_digest=error.permission_report_digest,
+            evidence_paths=evidence_paths,
+        )
+    except (AtomicWriteError, OSError, ValueError) as marker_error:
+        return (f"MARKER_WRITE_FAILED: {marker_error}",)
+    return ()
+
+
+SUBCOMMANDS = ("start", "resume", "status", "doctor")
+
+
+def _split_command(
+    argv: Sequence[str] | None,
+) -> tuple[str, list[str]]:
+    """Select the subcommand, defaulting to ``start``.
+
+    Every pre-subcommand invocation form keeps working: a plain flag list is
+    read as ``start`` with exactly the arguments it always had.
+    """
+    values = list(sys.argv[1:] if argv is None else argv)
+    if values and values[0] in SUBCOMMANDS:
+        return values[0], values[1:]
+    return "start", values
+
+
+def _expand_agent_shorthand(values: Sequence[str]) -> list[str]:
+    """Turn ``--agent KEY=MODEL/EFFORT`` into the explicit override flags."""
+    expanded: list[str] = []
+    for item in values:
+        key, separator, rest = item.partition("=")
+        if not separator:
+            raise ConfigurationError(
+                "--agent must use WORKER_KEY=MODEL[/EFFORT]"
+            )
+        model, slash, effort = rest.partition("/")
+        model = model.strip()
+        effort = effort.strip()
+        if not model:
+            raise ConfigurationError("--agent model must be nonempty")
+        expanded.extend(("--agent-model", f"{key.strip()}={model}"))
+        if slash:
+            if not effort:
+                raise ConfigurationError(
+                    "--agent effort must be nonempty when a slash is used"
+                )
+            expanded.extend(("--agent-effort", f"{key.strip()}={effort}"))
+    return expanded
+
+
+def _start_argv(
+    values: Sequence[str],
+    client: OrcaClient,
+    harness_root: Path,
+) -> list[str]:
+    """Resolve the inputs an operator used to assemble by hand."""
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--agent", action="append", default=[])
+    pre.add_argument("--no-create-terminals", action="store_true")
+    known, rest = pre.parse_known_args(list(values))
+
+    peek = argparse.ArgumentParser(add_help=False)
+    peek.add_argument("--run-id")
+    peek.add_argument("--worktree")
+    peek.add_argument("--coordinator-handle")
+    peek.add_argument("--permission-report")
+    peek.add_argument("--dry-run", action="store_true")
+    peeked, _ = peek.parse_known_args(rest)
+
+    resolved = list(rest) + _expand_agent_shorthand(known.agent)
+    if peeked.permission_report is None:
+        resolved.extend(
+            (
+                "--permission-report",
+                str(
+                    discover_permission_report(
+                        harness_root,
+                        EXPECTED_ORCA_VERSION,
+                    )
+                ),
+            )
+        )
+    if peeked.coordinator_handle is None:
+        if known.no_create_terminals:
+            raise ConfigurationError(
+                "--no-create-terminals requires --coordinator-handle"
+            )
+        if peeked.dry_run:
+            # A dry run validates configuration only; creating a terminal it
+            # would never use leaks one per rehearsal.
+            resolved.extend(("--coordinator-handle", DRY_RUN_HANDLE))
+        else:
+            if not peeked.worktree:
+                raise ConfigurationError("--worktree is required")
+            created = create_terminal(
+                client,
+                _worktree_selector(Path(peeked.worktree)),
+                f"ORCA LOOP {peeked.run_id or 'run'}",
+            )
+            resolved.extend(
+                ("--coordinator-handle", created.terminal_handle)
+            )
+    return resolved
+
+
+def _resume_argv(
+    values: Sequence[str],
+    harness_root: Path,
+) -> list[str]:
+    """Rebuild a resume launch from the manifest, given only the run ID."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--accept-worktree-drift", action="store_true")
+    parser.add_argument("--force-unlock", action="store_true")
+    parser.add_argument("--strict-agent-runtime", action="store_true")
+    known, rest = parser.parse_known_args(list(values))
+    if rest:
+        raise ConfigurationError(
+            f"resume does not accept these arguments: {' '.join(rest)}"
+        )
+    control = harness_root / "runs" / known.run_id / "control"
+    manifest = read_manifest(control)
+    if manifest is None:
+        raise ConfigurationError(
+            f"run {known.run_id} has no {control / 'run-manifest.json'}; "
+            "resume it with the original explicit flags instead"
+        )
+    problems = verify_inputs(manifest)
+    if problems:
+        raise ManifestError("; ".join(problems))
+    limits = manifest.limits
+    resolved = [
+        "--run-id",
+        manifest.run_id,
+        "--request",
+        manifest.request_copy,
+        "--worktree",
+        manifest.worktree_path,
+        "--coordinator-handle",
+        manifest.coordinator_handle,
+        "--permission-report",
+        manifest.permission_report.path,
+        "--resume",
+    ]
+    if manifest.test_policy is not None:
+        resolved.extend(("--test-policy", manifest.test_policy.path))
+    for key in (
+        "test_fix_attempt_limit",
+        "operational_retry_limit",
+        "max_transition_count",
+        "step_timeout_ms",
+        "total_timeout_ms",
+    ):
+        resolved.extend((f"--{key.replace('_', '-')}", str(limits[key])))
+    if known.accept_worktree_drift:
+        resolved.append("--accept-worktree-drift")
+    if known.force_unlock:
+        resolved.append("--force-unlock")
+    if known.strict_agent_runtime:
+        resolved.append("--strict-agent-runtime")
+    return resolved
+
+
+def _status_report(harness_root: Path, run_id: str) -> dict[str, object]:
+    """Describe a run without changing a single byte of it."""
+    run_root = harness_root / "runs" / run_id
+    control = run_root / "control"
+    if not control.is_dir():
+        return {"status": "BLOCKED", "error": f"unknown run: {run_id}"}
+    value: dict[str, object] = {"status": "PASS", "run_id": run_id}
+    try:
+        state, ledger, _ = load_committed(control)
+    except (AtomicWriteError, GenerationError) as exc:
+        return {"status": "BLOCKED", "error": str(exc)}
+    value.update(
+        {
+            "state": state.state.value,
+            "run_status": state.status.value,
+            "generation": state.generation,
+            "step_stage": state.step_stage.value,
+            "plan_version": state.plan_version,
+            "plan_round": ledger.plan_round,
+            "code_round": ledger.code_round,
+            "unresolved_findings": sum(
+                1
+                for record in ledger.findings
+                if record.status.value != "RESOLVED"
+            ),
+            "artifacts": sorted(
+                item.name
+                for item in (run_root / "artifacts").glob("*.json")
+            ),
+            "reports": sorted(
+                item.name for item in (run_root / "reports").glob("*.md")
+            ),
+            "resumable": state.state
+            not in {LoopState.FAILED, LoopState.REJECTED},
+            "resume_command": resume_command_line(harness_root, run_id),
+        }
+    )
+    manifest = read_manifest(control)
+    if manifest is not None:
+        value["worktree"] = manifest.worktree_path
+        value["agents"] = {
+            record.worker_key.value: {
+                "provider": record.provider.value,
+                "model": record.model,
+                "effort": record.effort,
+            }
+            for record in manifest.agents
+        }
+        value["input_problems"] = list(verify_inputs(manifest))
+    lock = inspect_lock(harness_root, Path(str(value.get("worktree", ""))))
+    if lock is not None:
+        value["lock"] = {
+            "path": str(lock.path),
+            "run_id": lock.run_id,
+            "pid": lock.pid,
+            "alive": lock.alive,
+        }
+    return value
+
+
+def _doctor_report(harness_root: Path) -> dict[str, object]:
+    value: dict[str, object] = {"status": "PASS", "harness_root": str(harness_root)}
+    try:
+        client = OrcaClient(cwd=harness_root)
+        response = client.call(("status",), timeout_ms=10_000)
+        status = json.loads(response.result_json)
+        value["orca"] = {
+            "executable": client.executable,
+            "runtime": (status.get("runtime") or {}).get("state"),
+            "graph": (status.get("graph") or {}).get("state"),
+            "version": orca_version_from_status(status),
+            "expected_version": EXPECTED_ORCA_VERSION,
+        }
+    except (CoordinatorGuardError, CoordinatorPermissionError) as exc:
+        marker_detail = _record_permission_refresh(arguments, exc)
+        _report_failure(arguments, str(exc), marker_detail)
+        print(
+            json.dumps(
+                {"status": "FAIL", "error": str(exc)},
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return EXIT_RUNTIME_FAILURE
+    except (
+        OrcaCommandError,
+        PreflightError,
+        json.JSONDecodeError,
+        AttributeError,
+    ) as exc:
+        value["status"] = "BLOCKED"
+        value["orca"] = {"error": str(exc)}
+    value["agent_cli"] = {
+        name: shutil.which(name) or "not found"
+        for name in ("claude", "codex")
+    }
+    catalog = load_catalog(harness_root)
+    value["catalog"] = list(describe_catalog(catalog))
+    live_version = str(
+        (value.get("orca") or {}).get("version") or EXPECTED_ORCA_VERSION
+    )
+    value["environment"] = describe_environment(
+        capture_environment(harness_root)
+    )
+    reports = []
+    for path in permission_report_candidates(harness_root):
+        problem = permission_report_problem(
+            path,
+            live_version,
             harness_root=harness_root,
         )
+        reports.append(
+            {"path": str(path), "usable": problem is None, "problem": problem}
+        )
+    value["permission_reports"] = reports
+    if not any(item["usable"] for item in reports):
+        value["status"] = "BLOCKED"
+    locks = []
+    lock_dir = harness_root / "runs" / ".locks"
+    if lock_dir.is_dir():
+        for path in sorted(lock_dir.glob("*.lock")):
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                locks.append({"path": str(path), "readable": False})
+                continue
+            pid = raw.get("pid")
+            locks.append(
+                {
+                    "path": str(path),
+                    "readable": True,
+                    "run_id": raw.get("run_id"),
+                    "pid": pid,
+                    "alive": (
+                        pid_alive(pid) if isinstance(pid, int) else None
+                    ),
+                }
+            )
+    value["locks"] = locks
+    return value
+
+
+def _emit(value: Mapping[str, object]) -> None:
+    print(json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2))
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    harness_root = Path(__file__).resolve().parent
+    command, values = _split_command(argv)
+    if command == "doctor":
+        report = _doctor_report(harness_root)
+        _emit(report)
+        return EXIT_READY if report["status"] == "PASS" else EXIT_PREFLIGHT
+    if command == "status":
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument("--run-id", required=True)
+        known, _ = parser.parse_known_args(values)
+        report = _status_report(harness_root, known.run_id)
+        _emit(report)
+        return EXIT_READY if report["status"] == "PASS" else EXIT_PREFLIGHT
+
+    lock = None
+    arguments = None
+    try:
         client = OrcaClient(cwd=harness_root)
+        if command == "resume":
+            values = _resume_argv(values, harness_root)
+        else:
+            values = _start_argv(values, client, harness_root)
+        arguments = parse_run_arguments(
+            values,
+            harness_root=harness_root,
+        )
         preflight = run_preflight(
             arguments,
             client,
             expected_orca_version=EXPECTED_ORCA_VERSION,
+            verify_coordinator=(
+                not arguments.resume
+                and arguments.config.coordinator_handle != DRY_RUN_HANDLE
+            ),
         )
         preflight = prepare_agent_runtime(preflight)
         if arguments.dry_run:
@@ -981,8 +1712,28 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "mode": "dry-run",
                         "run_id": arguments.run_id,
                         "orca_version": preflight.orca_version,
+                        "permission_report": str(
+                            arguments.permission_report_path
+                        ),
                         "plan_consensus_round_limit": 5,
                         "code_consensus_round_limit": 5,
+                        "agents": {
+                            item.worker_key.value: {
+                                "provider": item.provider.value,
+                                "requested_model": item.model.requested,
+                                "model": item.model.value,
+                                "model_resolution": item.model.method,
+                                "requested_effort": item.effort.requested,
+                                "effort": item.effort.value,
+                                "effort_resolution": item.effort.method,
+                            }
+                            for item in preflight.agent_resolutions
+                        },
+                        "warnings": [
+                            f"{item.worker_key.value}: {warning}"
+                            for item in preflight.agent_resolutions
+                            for warning in item.warnings
+                        ],
                     },
                     ensure_ascii=False,
                     sort_keys=True,
@@ -993,6 +1744,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.harness_root,
             arguments.config.worktree_path,
             arguments.run_id,
+            reclaim_stale=True,
+            force=arguments.force_unlock,
+            on_reclaim=lambda info: print(
+                json.dumps(
+                    {
+                        "status": "INFO",
+                        "event": "stale_lock_reclaimed",
+                        "lock": str(info.path),
+                        "previous_run_id": info.run_id,
+                        "previous_pid": info.pid,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+            ),
         )
         final = run_coordinator(preflight, client)
         print(
@@ -1012,6 +1779,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ConfigurationError,
         PreflightError,
         RunWorkspaceExistsError,
+        ManifestError,
     ) as exc:
         print(
             json.dumps(
@@ -1022,6 +1790,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         return EXIT_PREFLIGHT
+    except ResumeBlockedError as exc:
+        _report_failure(arguments, str(exc))
+        print(
+            json.dumps(
+                {"status": "BLOCKED", "error": str(exc)},
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return EXIT_USER_REQUIRED
     except (
         OrcaLoopError,
         OrcaCommandError,
@@ -1029,6 +1808,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         GateProtocolError,
         RunLockError,
     ) as exc:
+        _report_failure(arguments, str(exc))
         print(
             json.dumps(
                 {"status": "FAIL", "error": str(exc)},
@@ -1039,6 +1819,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return EXIT_RUNTIME_FAILURE
     except KeyboardInterrupt:
+        _report_failure(arguments, "interrupted")
         print(
             json.dumps(
                 {"status": "FAIL", "error": "interrupted"},

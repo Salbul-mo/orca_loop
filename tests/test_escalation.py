@@ -10,6 +10,7 @@ from orca_loop.escalation import (
     build_user_decision_report,
     create_gate,
     destructive_gate,
+    find_gate_for_report,
     route_gate,
     wait_gate_resolution,
 )
@@ -126,7 +127,10 @@ class GateLifecycleTest(unittest.TestCase):
 
         def handler(argv: tuple[str, ...], _: int) -> dict[str, object]:
             if argv[1] == "gate-create":
-                return {"id": "gate-1", "taskId": "task-1"}
+                return {
+                    "gate": {"id": "gate-1", "task_id": "task-1"},
+                    "mutation": {"replayed": False},
+                }
             return {
                 "gates": [
                     {
@@ -167,6 +171,77 @@ class GateLifecycleTest(unittest.TestCase):
             route_gate(decision_value, gate_kind=GateKind.FINAL).kind,
         )
 
+    def test_find_gate_for_report_recovers_nested_current_shape(self) -> None:
+        digest = "sha256:" + "d" * 64
+        report = type("Report", (), {
+            "path": Path(r"C:\run\user-decision.md"),
+            "digest": digest,
+            "finding_ids": (),
+        })()
+        client = FakeOrcaClient(
+            lambda _argv, _timeout: {
+                "runId": "run-1",
+                "gates": [
+                    {
+                        "id": "gate-1",
+                        "task_id": "task-1",
+                        "question": (
+                            "Resolve the bounded disagreement. Review "
+                            f"{report.path} for the final decision. "
+                            f"Report digest: {digest}."
+                        ),
+                        "status": "pending",
+                    }
+                ],
+            }
+        )
+
+        binding = find_gate_for_report(
+            client,
+            report=report,
+            gate_kind=GateKind.ESCALATION,
+            timeout_ms=1000,
+        )
+
+        self.assertIsNotNone(binding)
+        self.assertEqual("gate-1", binding.gate_id)
+        self.assertEqual("task-1", binding.task_id)
+        self.assertEqual(digest, binding.report_digest)
+
+    def test_find_gate_for_report_ignores_stale_report_path_match(self) -> None:
+        digest = "sha256:" + "d" * 64
+        stale_digest = "sha256:" + "e" * 64
+        report = type("Report", (), {
+            "path": Path(r"C:\run\user-decision.md"),
+            "digest": digest,
+            "finding_ids": (),
+        })()
+        client = FakeOrcaClient(
+            lambda _argv, _timeout: {
+                "gates": [
+                    {
+                        "id": "gate-1",
+                        "task_id": "task-1",
+                        "question": (
+                            "Resolve the bounded disagreement. Review "
+                            f"{report.path} for the final decision. "
+                            f"Report digest: {stale_digest}."
+                        ),
+                        "status": "resolved",
+                    }
+                ],
+            }
+        )
+
+        binding = find_gate_for_report(
+            client,
+            report=report,
+            gate_kind=GateKind.ESCALATION,
+            timeout_ms=1000,
+        )
+
+        self.assertIsNone(binding)
+
     def test_stale_report_digest_is_rejected(self) -> None:
         client = FakeOrcaClient(
             lambda _argv, _timeout: {
@@ -193,6 +268,55 @@ class GateLifecycleTest(unittest.TestCase):
             wait_gate_resolution(
                 client,
                 binding=binding,
+                timeout_ms=1000,
+            )
+
+    def test_simple_terminal_gate_options_use_bound_report_digest(self) -> None:
+        digest = "sha256:" + "d" * 64
+        binding = create_binding(digest)
+
+        for resolution, expected in (
+            ("merge", HumanDecisionKind.MERGE),
+            ("reject", HumanDecisionKind.REJECT),
+        ):
+            with self.subTest(resolution=resolution):
+                client = FakeOrcaClient(
+                    lambda _argv, _timeout, value=resolution: {
+                        "gates": [
+                            {
+                                "id": "gate-1",
+                                "resolution": value,
+                            }
+                        ]
+                    }
+                )
+
+                decision_value = wait_gate_resolution(
+                    client,
+                    binding=binding,
+                    timeout_ms=1000,
+                )
+
+                self.assertEqual(expected, decision_value.decision)
+                self.assertEqual(digest, decision_value.report_digest)
+                self.assertEqual((), decision_value.affected_finding_ids)
+
+    def test_simple_revision_gate_option_still_requires_scope(self) -> None:
+        client = FakeOrcaClient(
+            lambda _argv, _timeout: {
+                "gates": [
+                    {
+                        "id": "gate-1",
+                        "resolution": "revise_design",
+                    }
+                ]
+            }
+        )
+
+        with self.assertRaisesRegex(GateProtocolError, "JSON object"):
+            wait_gate_resolution(
+                client,
+                binding=create_binding("sha256:" + "d" * 64),
                 timeout_ms=1000,
             )
 

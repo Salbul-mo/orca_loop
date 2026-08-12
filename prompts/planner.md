@@ -60,7 +60,7 @@ The root object must contain exactly:
 ```text
 schema_version=1
 plan_version: integer >= 1
-request_digest: sha256 lowercase digest of staged request.md bytes
+request_digest: exact sha256:<64 lowercase hex> digest of staged request.md bytes
 source_instruction: nonempty string
 interpretation: nonempty string
 rationale: nonempty string
@@ -74,8 +74,10 @@ error_handling: string[]
 test_contract:
   commands: {argv:string[], cwd:string, timeout_ms:integer, kind:unit|integration|db|external}[]
   test_ids: string[]
-test_policy_digest: sha256 lowercase digest
+test_policy_digest: exact sha256:<64 lowercase hex> digest
 acceptance_criteria: {criterion_id, verification_method}[]
+  criterion_id: 1..160 ASCII characters matching ^[A-Za-z0-9_.:-]{1,160}$
+  use one unique identifier per criterion; put ranges and Korean prose only in verification_method
 risks: string[]
 out_of_scope: string[]
 reviewed_finding_ids: string[]
@@ -92,7 +94,9 @@ Set output `plan_version` to the current plan version plus one.
 
 1. Read the staged request and repository instructions.
 2. Inspect relevant source before planning.
-3. Do not modify application source, repository metadata, or permissions.
+3. Do not use the Write tool or create or modify any file. Do not modify
+   application source, repository metadata, permissions, or the designated
+   output path; the wrapper owns artifact persistence.
 4. Produce exactly one strict `PlanDocument` JSON object, including
    `reviewed_finding_ids` and `finding_decisions`.
 5. Include objective interpretation, current-state evidence, affected files,
