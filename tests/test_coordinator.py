@@ -364,7 +364,7 @@ class CoordinatorCoreTest(unittest.TestCase):
             ledger=ledger,
             counters=LoopCounters(0, 0),
             limit=2,
-            error=ContractViolationError("malformed artifact"),
+            reason=ContractViolationError("malformed artifact").reason,
             finding_ids=(),
         )
         self.assertEqual(SignalKind.OPERATIONAL_RETRY, result.signal.kind)
@@ -373,12 +373,26 @@ class CoordinatorCoreTest(unittest.TestCase):
             ledger=ledger,
             counters=LoopCounters(0, 1),
             limit=2,
-            error=ContractViolationError(
-                "missing_finding_decision"
-            ),
+            reason=ContractViolationError("missing_finding_decision").reason,
             finding_ids=("F-1",),
         )
         self.assertEqual(SignalKind.ESCALATE, final.signal.kind)
+
+    def test_a_transient_reason_reaches_the_same_retry_budget(self) -> None:
+        """Runtime failures were previously unable to reach this path at all."""
+        result = operational_retry_result(
+            ledger=empty_ledger("run-1"),
+            counters=LoopCounters(0, 0),
+            limit=3,
+            reason="Orca command timed out after 30000 ms",
+            finding_ids=(),
+        )
+
+        self.assertEqual(SignalKind.OPERATIONAL_RETRY, result.signal.kind)
+        self.assertEqual(
+            "Orca command timed out after 30000 ms",
+            result.signal.reason,
+        )
 
     def test_resume_maps_each_durable_stage_without_duplicate_dispatch(
         self,

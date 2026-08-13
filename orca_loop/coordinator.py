@@ -823,13 +823,18 @@ def operational_retry_result(
     ledger: ConsensusLedger,
     counters,
     limit: int,
-    error: ContractViolationError,
+    reason: str,
     finding_ids: tuple[str, ...],
 ) -> StepExecutionResult:
+    """Decide how a retryable step failure moves the loop.
+
+    Takes the reason as text rather than an exception so that transient
+    runtime failures can reach the same retry budget as contract violations.
+    """
     if counters.operational_retries < limit - 1:
         signal = SignalKind.OPERATIONAL_RETRY
     elif any(
-        marker in error.reason
+        marker in reason
         for marker in (
             "approval_obligation",
             "missing finding decisions",
@@ -840,7 +845,7 @@ def operational_retry_result(
     else:
         signal = SignalKind.ABORT
     return StepExecutionResult(
-        TransitionSignal(signal, error.reason, finding_ids),
+        TransitionSignal(signal, reason, finding_ids),
         ledger,
         None,
     )

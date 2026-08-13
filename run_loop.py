@@ -71,6 +71,16 @@ from orca_loop.escalation import (
     wait_gate_resolution,
 )
 from orca_loop.notify import NoticeAnnouncer, NoticeTarget
+from orca_loop.failure import (
+    FORCE_FAIL_EVENT_KIND,
+    STOP_REASON_LIMIT,
+    StopClass,
+    StopEvent,
+    classify_stop,
+    read_latest_stop_event,
+    record_stop_event,
+)
+from orca_loop.session import append_event
 from orca_loop.generation import (
     AtomicWriteError,
     GenerationError,
@@ -80,6 +90,7 @@ from orca_loop.generation import (
 )
 from orca_loop.ledger import empty_ledger, unresolved_scope
 from orca_loop.locking import (
+    LockInfo,
     RunLockError,
     acquire_run_lock,
     inspect_lock,
@@ -151,6 +162,7 @@ from orca_loop.roles import ARTIFACT_FILENAMES, render_role_contract
 from orca_loop.snapshot import capture_snapshot, materialize_frozen_review
 from orca_loop.workspace import (
     RunWorkspaceExistsError,
+    WorkspaceError,
     create_run_workspace,
 )
 
@@ -1623,6 +1635,11 @@ def _run_loop(
             return controller.state
         if state in TERMINAL_STATES:
             return controller.state
+        # A worker step issues task-create and dispatch mutations, so a
+        # transient failure inside it leaves their effect unknown. Only a
+        # contract violation, which is raised after the mutations settle, may
+        # be retried in place there.
+        in_worker = state in WORKER_STATES
         try:
             if state in WORKER_STATES:
                 _execute_worker(
@@ -1682,12 +1699,21 @@ def _run_loop(
                 )
             commit_step_transition(controller, result, config)
             transitions += 1
-        except ContractViolationError as exc:
+        except Exception as exc:
+            if classify_stop(exc) is not StopClass.RETRYABLE:
+                raise
+            if in_worker and not isinstance(exc, ContractViolationError):
+                raise
+            reason = (
+                exc.reason
+                if isinstance(exc, ContractViolationError)
+                else " ".join(str(exc).split())[:STOP_REASON_LIMIT]
+            )
             retry = operational_retry_result(
                 ledger=controller.ledger,
                 counters=controller.state.counters,
                 limit=config.operational_retry_limit,
-                error=exc,
+                reason=reason,
                 finding_ids=_user_scope(controller).finding_ids,
             )
             commit_step_transition(controller, retry, config)
@@ -1711,7 +1737,40 @@ def run_coordinator(
         controller, pool = _resume(preflight, client)
     else:
         controller, pool = _initialize(preflight, client)
-    return _run_loop(controller, pool, preflight, client)
+    # The controller exists only here, so this is the only place that can both
+    # judge a stop and record it against the run's own durable state.
+    try:
+        return _run_loop(controller, pool, preflight, client)
+    except BaseException as exc:
+        classification = classify_stop(exc)
+        committed = False
+        if classification is StopClass.TERMINAL:
+            try:
+                controller.commit(
+                    stage=StepStage.TRANSITION_COMMITTED,
+                    active=None,
+                    reason=f"stopped: {type(exc).__name__}",
+                    signal=SignalKind.ABORT,
+                    state_value=LoopState.FAILED,
+                    status=RunStatus.FAILED,
+                )
+                committed = True
+            except (GenerationError, OSError):
+                # A stop mid-commit can leave the generation discontiguous, so
+                # the recovery commit fails the same way the run just did.
+                # The event below is what survives that.
+                committed = False
+        record_stop_event(
+            controller.workspace.control_dir,
+            exc=exc,
+            classification=classification,
+            generation=controller.state.generation,
+            state=controller.state.state,
+            state_committed=committed,
+        )
+        if classification is StopClass.TERMINAL:
+            return controller.state
+        raise
 
 
 def exit_code(state: CoordinatorState) -> int:
@@ -1725,6 +1784,28 @@ def exit_code(state: CoordinatorState) -> int:
     } or state.status is RunStatus.BLOCKED:
         return EXIT_USER_REQUIRED
     return EXIT_RUNTIME_FAILURE
+
+
+def _record_stop(arguments, exc: BaseException) -> None:
+    """Record a stop that happened outside the coordinator's own boundary.
+
+    No controller exists here, so the real generation is unknown. ``-1`` can
+    never equal a committed generation, which keeps these events out of the
+    status verdict while still preserving them as evidence.
+    """
+    if arguments is None:
+        return
+    control = arguments.harness_root / "runs" / arguments.run_id / "control"
+    if not control.is_dir():
+        return
+    record_stop_event(
+        control,
+        exc=exc,
+        classification=classify_stop(exc),
+        generation=-1,
+        state=None,
+        state_committed=False,
+    )
 
 
 def _report_failure(
@@ -1776,7 +1857,7 @@ def _record_permission_refresh(arguments, error) -> tuple[str, ...]:
     return ()
 
 
-SUBCOMMANDS = ("start", "resume", "status", "doctor")
+SUBCOMMANDS = ("start", "resume", "status", "doctor", "force-fail")
 
 
 def _split_command(
@@ -1927,6 +2008,31 @@ def _resume_argv(
     return resolved
 
 
+def _run_verdict(
+    state: CoordinatorState,
+    stop: StopEvent | None,
+    lock: LockInfo | None,
+    run_id: str,
+) -> str:
+    """State what the run is actually doing right now.
+
+    The last branch is the one that used to have no answer: a run left in
+    IN_PROGRESS with nobody holding its lock is a dead coordinator, not work
+    still in flight.
+    """
+    if state.state in {LoopState.READY_FOR_MERGE, LoopState.REJECTED}:
+        return "COMPLETED"
+    if state.state in {LoopState.HUMAN_GATE, LoopState.USER_DECISION_REQUIRED}:
+        return "BLOCKED_ON_USER"
+    if state.state is LoopState.FAILED:
+        return "STOPPED_TERMINAL"
+    if stop is not None and stop.resumable:
+        return "STOPPED_RESUMABLE"
+    if lock is not None and lock.alive and lock.run_id == run_id:
+        return "RUNNING"
+    return "STOPPED_RESUMABLE"
+
+
 def _status_report(harness_root: Path, run_id: str) -> dict[str, object]:
     """Describe a run without changing a single byte of it.
 
@@ -2074,6 +2180,7 @@ def _status_report(harness_root: Path, run_id: str) -> dict[str, object]:
     # Only look for a lock once a real worktree is known: an empty path would
     # resolve to the process working directory and report a foreign lock.
     worktree = value.get("worktree")
+    lock = None
     if isinstance(worktree, str) and worktree:
         lock = inspect_lock(harness_root, Path(worktree))
         if lock is not None:
@@ -2087,10 +2194,118 @@ def _status_report(harness_root: Path, run_id: str) -> dict[str, object]:
                 blockers.append(
                     f"worktree is locked by run {lock.run_id} (pid {lock.pid})"
                 )
+    stop = read_latest_stop_event(control)
+    # A stop recorded against an earlier generation was already resumed past,
+    # so it describes history rather than the run's current condition.
+    if stop is not None and stop.generation == state.generation:
+        value["stop"] = {
+            "classification": stop.classification.value,
+            "exception": stop.exception,
+            "reason": stop.reason,
+            "resumable": stop.resumable,
+            "state_committed": stop.state_committed,
+            "recorded_at": stop.recorded_at,
+        }
+    else:
+        stop = None
+    value["verdict"] = _run_verdict(state, stop, lock, run_id)
     value["blockers"] = blockers
     value["resumable"] = not blockers
     value["status"] = "BLOCKED" if blockers else "PASS"
     return value
+
+
+def _force_fail(harness_root: Path, values: Sequence[str]) -> int:
+    """End a stopped run on the operator's authority.
+
+    The boundary deliberately preserves state for anything it cannot prove is
+    terminal, so an operator needs a way to close a run out by hand.
+    """
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--reason", required=True)
+    try:
+        known, _ = parser.parse_known_args(list(values))
+    except SystemExit:
+        _emit_error("force-fail requires --run-id and --reason")
+        return EXIT_PREFLIGHT
+    if not known.reason.strip():
+        _emit_error("force-fail --reason must be nonempty")
+        return EXIT_PREFLIGHT
+    control = harness_root / "runs" / known.run_id / "control"
+    if not control.is_dir():
+        _emit_error(f"unknown run: {known.run_id}")
+        return EXIT_PREFLIGHT
+    try:
+        state, ledger, _ = load_committed(control)
+    except (AtomicWriteError, GenerationError) as exc:
+        _emit_error(str(exc))
+        return EXIT_PREFLIGHT
+    if state.state in TERMINAL_STATES:
+        _emit_error(f"run already ended in {state.state.value}")
+        return EXIT_PREFLIGHT
+    try:
+        manifest = read_manifest(control)
+    except ManifestError as exc:
+        _emit_error(str(exc))
+        return EXIT_PREFLIGHT
+    lock = inspect_lock(harness_root, Path(manifest.worktree_path))
+    if lock is not None and lock.alive and lock.run_id == known.run_id:
+        _emit_error(
+            f"run {known.run_id} still holds its lock (pid {lock.pid}); "
+            "stop the coordinator first"
+        )
+        return EXIT_PREFLIGHT
+    step_id = (
+        state.active.step_id if state.active is not None else "g0000-force-fail"
+    )
+    try:
+        workspace, _ = create_run_workspace(
+            harness_root,
+            known.run_id,
+            step_id,
+            resume=True,
+        )
+        final = GenerationController(workspace, state, ledger).commit(
+            stage=StepStage.TRANSITION_COMMITTED,
+            active=None,
+            reason=f"force-fail: {known.reason.strip()}",
+            signal=SignalKind.ABORT,
+            state_value=LoopState.FAILED,
+            status=RunStatus.FAILED,
+        )
+    except (GenerationError, WorkspaceError, OSError) as exc:
+        _emit_error(str(exc))
+        return EXIT_PREFLIGHT
+    append_event(
+        control,
+        FORCE_FAIL_EVENT_KIND,
+        {
+            "reason": known.reason.strip()[:STOP_REASON_LIMIT],
+            "generation": final.generation,
+            "previous_state": state.state.value,
+        },
+    )
+    _emit(
+        {
+            "status": final.status.value,
+            "state": final.state.value,
+            "run_id": final.run_id,
+            "generation": final.generation,
+        }
+    )
+    return EXIT_READY
+
+
+def _emit_error(message: str) -> None:
+    print(
+        json.dumps(
+            {"status": "BLOCKED", "error": message},
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+        file=sys.stderr,
+    )
 
 
 def _doctor_report(harness_root: Path) -> dict[str, object]:
@@ -2189,6 +2404,9 @@ def _print_subcommand_help(command: str) -> None:
         "resume": "usage: run_loop.py resume --run-id ID [--accept-worktree-drift] [--force-unlock]",
         "status": "usage: run_loop.py status --run-id ID",
         "doctor": "usage: run_loop.py doctor",
+        "force-fail": (
+            "usage: run_loop.py force-fail --run-id ID --reason TEXT"
+        ),
     }
     print(usage[command])
 
@@ -2210,6 +2428,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         report = _status_report(harness_root, known.run_id)
         _emit(report)
         return EXIT_READY if report["status"] == "PASS" else EXIT_PREFLIGHT
+    if command == "force-fail":
+        return _force_fail(harness_root, values)
 
     lock = None
     arguments = None
@@ -2349,10 +2569,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return EXIT_RUNTIME_FAILURE
     except KeyboardInterrupt:
+        _record_stop(arguments, KeyboardInterrupt("interrupted"))
         _report_failure(arguments, "interrupted")
         print(
             json.dumps(
                 {"status": "FAIL", "error": "interrupted"},
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return EXIT_RUNTIME_FAILURE
+    except BaseException as exc:
+        # Last boundary. Without it the classes that no handler above names
+        # leave a traceback and no evidence at all.
+        _record_stop(arguments, exc)
+        _report_failure(arguments, str(exc))
+        print(
+            json.dumps(
+                {
+                    "status": "FAIL",
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+                ensure_ascii=False,
                 sort_keys=True,
             ),
             file=sys.stderr,

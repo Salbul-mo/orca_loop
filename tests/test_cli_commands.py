@@ -27,6 +27,7 @@ from orca_loop.generation import commit_generation
 from orca_loop.ledger import empty_ledger
 from orca_loop.models import (
     DEFAULT_NOTICE_CHANNELS,
+    CoordinatorState,
     GateBinding,
     GateKind,
     LoopState,
@@ -35,9 +36,15 @@ from orca_loop.models import (
     RunStatus,
     UserDecisionNoticeDeliveryStatus,
 )
+from orca_loop.failure import StopClass, StopEvent, record_stop_event
+from orca_loop.locking import LockInfo
+from orca_loop.orca_client import OrcaCommandError
 from run_loop import (
+    EXIT_PREFLIGHT,
     _expand_agent_shorthand,
+    _force_fail,
     _resume_argv,
+    _run_verdict,
     _split_command,
     _status_report,
 )
@@ -384,6 +391,208 @@ class NoticeChannelConfigTest(unittest.TestCase):
     def test_empty_channel_names_are_rejected(self) -> None:
         with self.assertRaisesRegex(ConfigurationError, "must not be empty"):
             parse_notice_channels("board,,os-toast")
+
+
+class RunVerdictTest(unittest.TestCase):
+    def state_in(self, value: LoopState) -> CoordinatorState:
+        return replace(initial_state(), state=value)
+
+    def live_lock(self, run_id: str = "run-1") -> LockInfo:
+        return LockInfo(
+            path=Path("lock"),
+            readable=True,
+            run_id=run_id,
+            pid=1234,
+            alive=True,
+            age_seconds=1.0,
+            worktree="C:/fixture",
+        )
+
+    def stop(self, *, resumable: bool) -> StopEvent:
+        return StopEvent(
+            classification=(
+                StopClass.INTERRUPTED if resumable else StopClass.TERMINAL
+            ),
+            exception="OrcaCommandError",
+            reason="orca is unreachable",
+            generation=0,
+            state="IMPLEMENT",
+            resumable=resumable,
+            state_committed=False,
+            recorded_at="2026-08-13T00:00:00+00:00",
+        )
+
+    def test_a_finished_run_reads_as_completed(self) -> None:
+        for value in (LoopState.READY_FOR_MERGE, LoopState.REJECTED):
+            with self.subTest(state=value):
+                self.assertEqual(
+                    "COMPLETED",
+                    _run_verdict(self.state_in(value), None, None, "run-1"),
+                )
+
+    def test_a_gate_reads_as_blocked_on_user(self) -> None:
+        for value in (
+            LoopState.HUMAN_GATE,
+            LoopState.USER_DECISION_REQUIRED,
+        ):
+            with self.subTest(state=value):
+                self.assertEqual(
+                    "BLOCKED_ON_USER",
+                    _run_verdict(self.state_in(value), None, None, "run-1"),
+                )
+
+    def test_a_failed_run_reads_as_terminal(self) -> None:
+        self.assertEqual(
+            "STOPPED_TERMINAL",
+            _run_verdict(self.state_in(LoopState.FAILED), None, None, "run-1"),
+        )
+
+    def test_a_live_lock_reads_as_running(self) -> None:
+        self.assertEqual(
+            "RUNNING",
+            _run_verdict(
+                self.state_in(LoopState.IMPLEMENT),
+                None,
+                self.live_lock(),
+                "run-1",
+            ),
+        )
+
+    def test_in_progress_without_a_lock_reads_as_stopped(self) -> None:
+        """The gap this whole boundary exists to close: a dead coordinator."""
+        self.assertEqual(
+            "STOPPED_RESUMABLE",
+            _run_verdict(
+                self.state_in(LoopState.IMPLEMENT),
+                None,
+                None,
+                "run-1",
+            ),
+        )
+
+    def test_a_foreign_lock_does_not_mean_this_run_is_running(self) -> None:
+        self.assertEqual(
+            "STOPPED_RESUMABLE",
+            _run_verdict(
+                self.state_in(LoopState.IMPLEMENT),
+                None,
+                self.live_lock("other-run"),
+                "run-1",
+            ),
+        )
+
+    def test_a_resumable_stop_outranks_a_stale_live_lock(self) -> None:
+        self.assertEqual(
+            "STOPPED_RESUMABLE",
+            _run_verdict(
+                self.state_in(LoopState.IMPLEMENT),
+                self.stop(resumable=True),
+                self.live_lock(),
+                "run-1",
+            ),
+        )
+
+
+class StatusStopEvidenceTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.control = self.root / "runs" / "run-1" / "control"
+        self.control.mkdir(parents=True)
+
+    def commit_state(self, state: CoordinatorState) -> None:
+        commit_generation(self.control, state, empty_ledger("run-1"))
+
+    def test_a_stop_at_the_current_generation_is_reported(self) -> None:
+        state = replace(
+            initial_state(),
+            state=LoopState.IMPLEMENT,
+            orchestration_run_id="orca-run-1",
+        )
+        self.commit_state(state)
+        record_stop_event(
+            self.control,
+            exc=OrcaCommandError("orca is unreachable"),
+            classification=StopClass.INTERRUPTED,
+            generation=state.generation,
+            state=state.state,
+            state_committed=False,
+        )
+
+        report = _status_report(self.root, "run-1")
+
+        self.assertIn("stop", report)
+        stop = report["stop"]
+        assert isinstance(stop, dict)
+        self.assertEqual("OrcaCommandError", stop["exception"])
+        self.assertTrue(stop["resumable"])
+        self.assertEqual("STOPPED_RESUMABLE", report["verdict"])
+
+    def test_a_stop_from_an_earlier_generation_is_history(self) -> None:
+        """Resuming past a stop must retire it without deleting the evidence."""
+        state = replace(
+            initial_state(),
+            state=LoopState.IMPLEMENT,
+            orchestration_run_id="orca-run-1",
+        )
+        self.commit_state(state)
+        record_stop_event(
+            self.control,
+            exc=OrcaCommandError("older failure"),
+            classification=StopClass.INTERRUPTED,
+            generation=state.generation - 1,
+            state=state.state,
+            state_committed=False,
+        )
+
+        report = _status_report(self.root, "run-1")
+
+        self.assertNotIn("stop", report)
+
+    def test_a_run_without_any_stop_still_gets_a_verdict(self) -> None:
+        state = replace(
+            initial_state(),
+            state=LoopState.READY_FOR_MERGE,
+            orchestration_run_id="orca-run-1",
+        )
+        self.commit_state(state)
+
+        report = _status_report(self.root, "run-1")
+
+        self.assertNotIn("stop", report)
+        self.assertEqual("COMPLETED", report["verdict"])
+
+
+class ForceFailTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.control = self.root / "runs" / "run-1" / "control"
+        self.control.mkdir(parents=True)
+
+    def test_an_unknown_run_is_refused(self) -> None:
+        code = _force_fail(self.root, ["--run-id", "missing", "--reason", "x"])
+        self.assertEqual(EXIT_PREFLIGHT, code)
+
+    def test_an_empty_reason_is_refused(self) -> None:
+        code = _force_fail(self.root, ["--run-id", "run-1", "--reason", "  "])
+        self.assertEqual(EXIT_PREFLIGHT, code)
+
+    def test_an_already_finished_run_is_refused(self) -> None:
+        commit_generation(
+            self.control,
+            replace(initial_state(), state=LoopState.REJECTED),
+            empty_ledger("run-1"),
+        )
+
+        code = _force_fail(
+            self.root,
+            ["--run-id", "run-1", "--reason", "operator stopped it"],
+        )
+
+        self.assertEqual(EXIT_PREFLIGHT, code)
 
 
 class PermissionDiscoveryTest(unittest.TestCase):
