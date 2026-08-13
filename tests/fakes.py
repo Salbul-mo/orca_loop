@@ -23,6 +23,10 @@ VALID_FLAGS: dict[tuple[str, ...], frozenset[str]] = {
     ("terminal", "show"): frozenset(
         {"environment", "json", "pairing-code", "terminal"}
     ),
+    ("worktree", "set"): frozenset(
+        {"comment", "environment", "json", "pairing-code", "workspace-status",
+         "worktree"}
+    ),
     ("orchestration", "run-create"): frozenset(
         {"environment", "from", "json", "objective", "pairing-code",
          "retry-request"}

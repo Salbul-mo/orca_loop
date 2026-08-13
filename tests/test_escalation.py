@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from orca_loop.escalation import (
@@ -10,9 +11,14 @@ from orca_loop.escalation import (
     build_user_decision_report,
     create_gate,
     destructive_gate,
+    ensure_user_decision_notice,
     find_gate_for_report,
+    read_user_decision_notice,
+    read_user_decision_notice_delivery,
+    resolve_user_decision_notice,
     route_gate,
     wait_gate_resolution,
+    write_user_decision_notice_delivery,
 )
 from orca_loop.ledger import empty_ledger
 from orca_loop.models import (
@@ -24,6 +30,7 @@ from orca_loop.models import (
     FindingDecision,
     FindingRecord,
     FindingStatus,
+    GateBinding,
     GateKind,
     HumanDecision,
     HumanDecisionKind,
@@ -38,6 +45,8 @@ from orca_loop.models import (
     Side,
     StepStage,
     TestContract,
+    UserDecisionNoticeDeliveryStatus,
+    UserDecisionNoticeStatus,
 )
 from tests.fakes import FakeOrcaClient
 from tests.test_ledger import DIGEST_A, decision, finding
@@ -64,6 +73,67 @@ def state() -> CoordinatorState:
         permission_report_digest=DIGEST_A,
         history=(),
     )
+
+
+class UserDecisionNoticeTest(unittest.TestCase):
+    def test_pending_notice_is_durable_idempotent_and_resolvable(self) -> None:
+        binding = GateBinding(
+            gate_id="gate-1",
+            task_id="task-1",
+            report_digest="sha256:" + "d" * 64,
+            gate_kind=GateKind.ESCALATION,
+            allowed_options=("merge", "reject", "revise_design"),
+        )
+        current = replace(
+            state(),
+            orchestration_run_id="orca-run-1",
+            gate_binding=binding,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            control = Path(directory).resolve()
+            first = ensure_user_decision_notice(
+                control,
+                state=current,
+                binding=binding,
+                report_path=control.parent / "user-decision.md",
+            )
+            second = ensure_user_decision_notice(
+                control,
+                state=current,
+                binding=binding,
+                report_path=control.parent / "user-decision.md",
+            )
+            self.assertEqual(first, second)
+            loaded = read_user_decision_notice(control)
+            self.assertIsNotNone(loaded)
+            assert loaded is not None
+            self.assertEqual(UserDecisionNoticeStatus.PENDING, loaded.status)
+            resolved = resolve_user_decision_notice(control, binding=binding)
+            self.assertIsNotNone(resolved)
+            assert resolved is not None
+            self.assertEqual(UserDecisionNoticeStatus.RESOLVED, resolved.status)
+            self.assertIsNotNone(resolved.resolved_at)
+
+    def test_notice_delivery_has_strict_success_and_failure_contracts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            control = Path(directory).resolve()
+            delivery = write_user_decision_notice_delivery(
+                control,
+                request_id="notice-1",
+                status=UserDecisionNoticeDeliveryStatus.DELIVERED,
+                error=None,
+            )
+            self.assertEqual(
+                delivery,
+                read_user_decision_notice_delivery(control),
+            )
+            with self.assertRaisesRegex(Exception, "requires error"):
+                write_user_decision_notice_delivery(
+                    control,
+                    request_id="notice-1",
+                    status=UserDecisionNoticeDeliveryStatus.FAILED,
+                    error=None,
+                )
 
 
 def ledger_with_unresolved(evidence_path: str) -> ConsensusLedger:

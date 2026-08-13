@@ -57,13 +57,19 @@ from orca_loop.dispatcher import (
     worker_for_role,
 )
 from orca_loop.escalation import (
+    DecisionReportError,
     GateProtocolError,
     approve_escalation_keys,
     build_user_decision_report,
     create_gate,
     destructive_gate,
+    ensure_user_decision_notice,
     find_gate_for_report,
+    read_user_decision_notice,
+    read_user_decision_notice_delivery,
+    resolve_user_decision_notice,
     wait_gate_resolution,
+    write_user_decision_notice_delivery,
 )
 from orca_loop.generation import (
     AtomicWriteError,
@@ -90,6 +96,7 @@ from orca_loop.models import (
     ConsensusKind,
     CoordinatorState,
     GateKind,
+    GateBinding,
     HumanDecisionKind,
     LaunchProfile,
     LoopCounters,
@@ -109,6 +116,8 @@ from orca_loop.models import (
     StagedInput,
     TestGateStatus,
     TransitionSignal,
+    UserDecisionNotice,
+    UserDecisionNoticeDeliveryStatus,
     WorkerKey,
     WorkerPool,
 )
@@ -1234,6 +1243,111 @@ def _gate_options(
     return ("revise_code", "revise_design", "reject")
 
 
+def _notice_comment(notice: UserDecisionNotice) -> str:
+    """Produce bounded single-line Orca board metadata from trusted notice data."""
+    report_path = Path(notice.report_path).name
+    options = ",".join(notice.allowed_options)
+    comment = (
+        "USER DECISION REQUIRED | "
+        f"run={notice.run_id} | gate={notice.gate_id} | "
+        f"options={options} | report={report_path}"
+    )
+    return " ".join(comment.split())[:500]
+
+
+def _record_worktree_metadata(
+    controller: GenerationController,
+    client: OrcaClient,
+    *,
+    notice: UserDecisionNotice,
+    workspace_status: str,
+    comment: str,
+) -> None:
+    """Best-effort Orca board update; durable notice state remains authoritative."""
+    try:
+        client.call(
+            (
+                "worktree",
+                "set",
+                "--worktree",
+                controller.state.worktree_selector,
+                "--workspace-status",
+                workspace_status,
+                "--comment",
+                comment,
+            ),
+            timeout_ms=30_000,
+        )
+    except OrcaCommandError as exc:
+        write_user_decision_notice_delivery(
+            controller.workspace.control_dir,
+            request_id=notice.request_id,
+            status=UserDecisionNoticeDeliveryStatus.FAILED,
+            error=str(exc)[:2000],
+        )
+        return
+    write_user_decision_notice_delivery(
+        controller.workspace.control_dir,
+        request_id=notice.request_id,
+        status=UserDecisionNoticeDeliveryStatus.DELIVERED,
+        error=None,
+    )
+
+
+def _publish_user_decision_notice(
+    controller: GenerationController,
+    client: OrcaClient,
+    *,
+    report_path: Path,
+) -> UserDecisionNotice:
+    binding = controller.state.gate_binding
+    if binding is None:
+        raise OrcaLoopError("cannot publish a user decision notice without a gate")
+    notice = ensure_user_decision_notice(
+        controller.workspace.control_dir,
+        state=controller.state,
+        binding=binding,
+        report_path=report_path,
+    )
+    _record_worktree_metadata(
+        controller,
+        client,
+        notice=notice,
+        workspace_status="in-review",
+        comment=_notice_comment(notice),
+    )
+    return notice
+
+
+def _close_user_decision_notice(
+    controller: GenerationController,
+    client: OrcaClient,
+    *,
+    binding: GateBinding,
+) -> None:
+    notice = resolve_user_decision_notice(
+        controller.workspace.control_dir,
+        binding=binding,
+    )
+    if notice is None:
+        return
+    workspace_status = (
+        "completed"
+        if controller.state.state in {LoopState.READY_FOR_MERGE, LoopState.REJECTED}
+        else "in-progress"
+    )
+    _record_worktree_metadata(
+        controller,
+        client,
+        notice=notice,
+        workspace_status=workspace_status,
+        comment=(
+            "Orca Loop user decision recorded | "
+            f"run={notice.run_id} | state={controller.state.state.value}"
+        ),
+    )
+
+
 def _ensure_gate(
     controller: GenerationController,
     preflight: PreflightResult,
@@ -1281,12 +1395,22 @@ def _ensure_gate(
         orchestration_run_id=controller.state.orchestration_run_id,
     )
     if binding is not None:
+        if not binding.allowed_options:
+            binding = replace(
+                binding,
+                allowed_options=_gate_options(controller, plan),
+            )
         controller.commit(
             stage=StepStage.TRANSITION_COMMITTED,
             active=None,
             reason="existing user decision gate recovered",
             status=RunStatus.BLOCKED,
             gate_binding=binding,
+        )
+        _publish_user_decision_notice(
+            controller,
+            client,
+            report_path=report.path,
         )
         return
     task_id, task_mutation = _create_decision_task(
@@ -1328,6 +1452,11 @@ def _ensure_gate(
     commit_mutation(controller.workspace.control_dir, task_mutation)
     if gate_mutation is not None:
         commit_mutation(controller.workspace.control_dir, gate_mutation)
+    _publish_user_decision_notice(
+        controller,
+        client,
+        report_path=report.path,
+    )
 
 
 def _resume_gate(
@@ -1338,6 +1467,11 @@ def _resume_gate(
     binding = controller.state.gate_binding
     if binding is None:
         return False
+    _publish_user_decision_notice(
+        controller,
+        client,
+        report_path=controller.workspace.root / "user-decision.md",
+    )
     try:
         decision = wait_gate_resolution(
             client,
@@ -1368,6 +1502,7 @@ def _resume_gate(
             clear_gate=True,
             clear_blocked_context=True,
         )
+        _close_user_decision_notice(controller, client, binding=binding)
         return True
 
     blocked = controller.state.blocked_from_state
@@ -1453,6 +1588,7 @@ def _resume_gate(
         clear_gate=True,
         clear_blocked_context=True,
     )
+    _close_user_decision_notice(controller, client, binding=binding)
     return True
 
 
@@ -1845,8 +1981,68 @@ def _status_report(harness_root: Path, run_id: str) -> dict[str, object]:
             "resume_command": resume_command_line(harness_root, run_id),
         }
     )
+    try:
+        notice = read_user_decision_notice(control)
+    except DecisionReportError as exc:
+        notice = None
+        notice_problem = f"invalid user decision notice: {exc}"
+        value["notice_problems"] = [notice_problem]
+        blockers.append(notice_problem)
+    else:
+        notice_problems: list[str] = []
+        if notice is not None:
+            binding = state.gate_binding
+            if notice.run_id != state.run_id:
+                notice_problems.append("user decision notice run_id is stale")
+            elif notice.orchestration_run_id != state.orchestration_run_id:
+                notice_problems.append(
+                    "user decision notice Orca Run binding is stale"
+                )
+            elif binding is not None and (
+                notice.gate_id != binding.gate_id
+                or notice.report_digest != binding.report_digest
+            ):
+                notice_problems.append("user decision notice does not match gate binding")
+            elif binding is None and notice.status.value == "PENDING":
+                notice_problems.append("pending user decision notice has no gate binding")
+            if notice.status.value == "PENDING" and not notice_problems:
+                value["pending_user_decision"] = {
+                    "request_id": notice.request_id,
+                    "gate_id": notice.gate_id,
+                    "gate_kind": notice.gate_kind.value,
+                    "allowed_options": list(notice.allowed_options),
+                    "reason": notice.reason,
+                    "report_path": notice.report_path,
+                    "resume_command": resume_command_line(harness_root, run_id),
+                }
+        try:
+            delivery = read_user_decision_notice_delivery(control)
+        except DecisionReportError as exc:
+            notice_problems.append(
+                f"invalid user decision notice delivery: {exc}"
+            )
+        else:
+            if delivery is not None:
+                if notice is None or delivery.request_id != notice.request_id:
+                    notice_problems.append(
+                        "user decision notice delivery does not match notice"
+                    )
+                value["user_decision_notice_delivery"] = {
+                    "request_id": delivery.request_id,
+                    "status": delivery.status.value,
+                    "attempted_at": delivery.attempted_at,
+                    "error": delivery.error,
+                }
+        if notice_problems:
+            value["notice_problems"] = notice_problems
+            blockers.extend(notice_problems)
     if state.state in {LoopState.FAILED, LoopState.REJECTED}:
         blockers.append(f"run ended in {state.state.value}")
+    elif state.state in {
+        LoopState.HUMAN_GATE,
+        LoopState.USER_DECISION_REQUIRED,
+    }:
+        blockers.append("run is awaiting a human gate decision")
     if not state.orchestration_run_id:
         blockers.append(
             "run predates durable Orca Run binding; it cannot be resumed"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from orca_loop.config import (
@@ -16,6 +17,10 @@ from orca_loop.config import (
 )
 from orca_loop.catalog import load_catalog
 from orca_loop.runspec import build_manifest, copy_request, write_manifest
+from orca_loop.escalation import ensure_user_decision_notice
+from orca_loop.generation import commit_generation
+from orca_loop.ledger import empty_ledger
+from orca_loop.models import GateBinding, GateKind, LoopState, RunStatus
 from run_loop import (
     _expand_agent_shorthand,
     _resume_argv,
@@ -23,6 +28,7 @@ from run_loop import (
     _status_report,
 )
 from tests.test_runspec import permission_report, sample_pool
+from tests.test_coordinator import initial_state
 
 
 class SplitCommandTest(unittest.TestCase):
@@ -199,6 +205,45 @@ class StatusReportTest(ResumeArgvTest):
             if item.is_file()
         )
         self.assertEqual(before, after)
+
+    def test_status_exposes_a_matching_pending_user_decision(self) -> None:
+        binding = GateBinding(
+            gate_id="gate-1",
+            task_id="task-1",
+            report_digest="sha256:" + "d" * 64,
+            gate_kind=GateKind.ESCALATION,
+            allowed_options=("merge", "reject", "revise_design"),
+        )
+        state = replace(
+            initial_state(),
+            state=LoopState.USER_DECISION_REQUIRED,
+            status=RunStatus.BLOCKED,
+            orchestration_run_id="orca-run-1",
+            gate_binding=binding,
+        )
+        commit_generation(self.control, state, empty_ledger("run-1"))
+        ensure_user_decision_notice(
+            self.control,
+            state=state,
+            binding=binding,
+            report_path=self.root / "runs" / "run-1" / "user-decision.md",
+        )
+
+        report = _status_report(self.root, "run-1")
+
+        self.assertEqual("BLOCKED", report["status"])
+        self.assertIn(
+            "run is awaiting a human gate decision",
+            report["blockers"],
+        )
+        self.assertIn("pending_user_decision", report)
+        pending = report["pending_user_decision"]
+        assert isinstance(pending, dict)
+        self.assertEqual("gate-1", pending["gate_id"])
+        self.assertEqual(
+            ["merge", "reject", "revise_design"],
+            pending["allowed_options"],
+        )
 
 
 class PermissionDiscoveryTest(unittest.TestCase):

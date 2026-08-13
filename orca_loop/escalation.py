@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping
 
@@ -29,6 +30,7 @@ from .models import (
     GateKind,
     HumanDecision,
     HumanDecisionKind,
+    LoopState,
     PlanDocument,
     ScopeManifest,
     Side,
@@ -36,6 +38,10 @@ from .models import (
     SnapshotIdentity,
     TestGateStatus,
     TransitionSignal,
+    UserDecisionNotice,
+    UserDecisionNoticeDelivery,
+    UserDecisionNoticeDeliveryStatus,
+    UserDecisionNoticeStatus,
 )
 from .orca_client import (
     OrcaClient,
@@ -43,6 +49,7 @@ from .orca_client import (
     commit_mutation,
     execute_mutation,
 )
+from .generation import AtomicWriteError, write_atomic_bytes
 
 
 class DecisionReportError(RuntimeError):
@@ -51,6 +58,280 @@ class DecisionReportError(RuntimeError):
 
 class GateProtocolError(RuntimeError):
     """Raised when an Orca decision gate violates its binding."""
+
+
+USER_DECISION_NOTICE_SCHEMA_VERSION = 1
+USER_DECISION_NOTICE_NAME = "user-decision-request.json"
+USER_DECISION_NOTICE_DELIVERY_NAME = "user-decision-notice-delivery.json"
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _notice_request_id(
+    run_id: str,
+    binding: GateBinding,
+) -> str:
+    source = "\n".join((run_id, binding.gate_id, binding.report_digest))
+    return "notice-" + hashlib.sha256(source.encode("utf-8")).hexdigest()[:24]
+
+
+def _notice_path(control_dir: Path) -> Path:
+    return control_dir / USER_DECISION_NOTICE_NAME
+
+
+def _notice_delivery_path(control_dir: Path) -> Path:
+    return control_dir / USER_DECISION_NOTICE_DELIVERY_NAME
+
+
+def _strict_notice_object(path: Path) -> dict[str, object]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DecisionReportError(
+            f"invalid user decision notice: {path}"
+        ) from exc
+    if not isinstance(value, dict):
+        raise DecisionReportError("user decision notice root must be an object")
+    return value
+
+
+def _exact_notice_fields(
+    value: dict[str, object],
+    expected: set[str],
+    context: str,
+) -> None:
+    if set(value) != expected:
+        raise DecisionReportError(
+            f"{context} fields mismatch: expected {sorted(expected)}, "
+            f"got {sorted(value)}"
+        )
+
+
+def _notice_string(
+    value: object,
+    name: str,
+    *,
+    allow_none: bool = False,
+) -> str | None:
+    if value is None and allow_none:
+        return None
+    if not isinstance(value, str) or not value:
+        raise DecisionReportError(f"user decision notice {name} must be nonempty")
+    return value
+
+
+def _notice_options(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list) or not value:
+        raise DecisionReportError(
+            "user decision notice allowed_options must be a nonempty array"
+        )
+    if any(not isinstance(item, str) or not item for item in value):
+        raise DecisionReportError(
+            "user decision notice allowed_options entries must be nonempty"
+        )
+    return tuple(value)
+
+
+def _notice_timestamp(value: object, name: str) -> str:
+    timestamp = _notice_string(value, name)
+    assert timestamp is not None
+    try:
+        parsed = datetime.fromisoformat(timestamp)
+    except ValueError as exc:
+        raise DecisionReportError(
+            f"user decision notice {name} must be ISO-8601"
+        ) from exc
+    if parsed.tzinfo is None:
+        raise DecisionReportError(
+            f"user decision notice {name} must include timezone"
+        )
+    return timestamp
+
+
+def _parse_notice(path: Path) -> UserDecisionNotice:
+    value = _strict_notice_object(path)
+    _exact_notice_fields(
+        value,
+        {
+            "schema_version", "request_id", "status", "run_id",
+            "orchestration_run_id", "gate_id", "gate_kind", "blocked_state",
+            "report_path", "report_digest", "allowed_options", "reason",
+            "created_at", "resolved_at",
+        },
+        "user decision notice",
+    )
+    if value["schema_version"] != USER_DECISION_NOTICE_SCHEMA_VERSION:
+        raise DecisionReportError("unsupported user decision notice schema")
+    try:
+        status = UserDecisionNoticeStatus(value["status"])
+        gate_kind = GateKind(value["gate_kind"])
+        blocked_state = LoopState(value["blocked_state"])
+    except (TypeError, ValueError) as exc:
+        raise DecisionReportError("user decision notice has invalid enum") from exc
+    created_at = _notice_timestamp(value["created_at"], "created_at")
+    resolved_at = (
+        None
+        if value["resolved_at"] is None
+        else _notice_timestamp(value["resolved_at"], "resolved_at")
+    )
+    if status is UserDecisionNoticeStatus.PENDING and resolved_at is not None:
+        raise DecisionReportError("pending user decision notice has resolved_at")
+    if status is UserDecisionNoticeStatus.RESOLVED and resolved_at is None:
+        raise DecisionReportError("resolved user decision notice lacks resolved_at")
+    return UserDecisionNotice(
+        schema_version=USER_DECISION_NOTICE_SCHEMA_VERSION,
+        request_id=_notice_string(value["request_id"], "request_id") or "",
+        status=status,
+        run_id=_notice_string(value["run_id"], "run_id") or "",
+        orchestration_run_id=(
+            _notice_string(value["orchestration_run_id"], "orchestration_run_id")
+            or ""
+        ),
+        gate_id=_notice_string(value["gate_id"], "gate_id") or "",
+        gate_kind=gate_kind,
+        blocked_state=blocked_state,
+        report_path=_notice_string(value["report_path"], "report_path") or "",
+        report_digest=_notice_string(value["report_digest"], "report_digest") or "",
+        allowed_options=_notice_options(value["allowed_options"]),
+        reason=_notice_string(value["reason"], "reason") or "",
+        created_at=created_at,
+        resolved_at=resolved_at,
+    )
+
+
+def read_user_decision_notice(control_dir: Path) -> UserDecisionNotice | None:
+    path = _notice_path(control_dir)
+    return None if not path.exists() else _parse_notice(path)
+
+
+def _write_notice(path: Path, value: object) -> None:
+    try:
+        write_atomic_bytes(path, (serialize_json(value) + "\n").encode("utf-8"))
+    except AtomicWriteError as exc:
+        raise DecisionReportError(f"failed to persist user decision notice: {path}") from exc
+
+
+def ensure_user_decision_notice(
+    control_dir: Path,
+    *,
+    state: CoordinatorState,
+    binding: GateBinding,
+    report_path: Path,
+) -> UserDecisionNotice:
+    if not state.orchestration_run_id:
+        raise DecisionReportError("user decision notice requires Orca Run binding")
+    request_id = _notice_request_id(state.run_id, binding)
+    existing = read_user_decision_notice(control_dir)
+    if existing is not None and existing.status is UserDecisionNoticeStatus.PENDING:
+        if existing.request_id != request_id:
+            raise DecisionReportError("conflicting pending user decision notice")
+        return existing
+    reason = (
+        state.history[-1].reason
+        if state.history
+        else "user decision gate is pending"
+    )
+    notice = UserDecisionNotice(
+        schema_version=USER_DECISION_NOTICE_SCHEMA_VERSION,
+        request_id=request_id,
+        status=UserDecisionNoticeStatus.PENDING,
+        run_id=state.run_id,
+        orchestration_run_id=state.orchestration_run_id,
+        gate_id=binding.gate_id,
+        gate_kind=binding.gate_kind,
+        blocked_state=state.state,
+        report_path=str(report_path),
+        report_digest=binding.report_digest,
+        allowed_options=binding.allowed_options,
+        reason=reason,
+        created_at=_utc_now(),
+        resolved_at=None,
+    )
+    _write_notice(_notice_path(control_dir), notice)
+    return notice
+
+
+def resolve_user_decision_notice(
+    control_dir: Path,
+    *,
+    binding: GateBinding,
+) -> UserDecisionNotice | None:
+    notice = read_user_decision_notice(control_dir)
+    if notice is None:
+        return None
+    expected = _notice_request_id(notice.run_id, binding)
+    if notice.request_id != expected:
+        raise DecisionReportError("user decision notice does not match gate binding")
+    if notice.status is UserDecisionNoticeStatus.RESOLVED:
+        return notice
+    resolved = replace(
+        notice,
+        status=UserDecisionNoticeStatus.RESOLVED,
+        resolved_at=_utc_now(),
+    )
+    _write_notice(_notice_path(control_dir), resolved)
+    return resolved
+
+
+def _parse_notice_delivery(path: Path) -> UserDecisionNoticeDelivery:
+    value = _strict_notice_object(path)
+    _exact_notice_fields(
+        value,
+        {"schema_version", "request_id", "status", "attempted_at", "error"},
+        "user decision notice delivery",
+    )
+    if value["schema_version"] != USER_DECISION_NOTICE_SCHEMA_VERSION:
+        raise DecisionReportError("unsupported user decision notice delivery schema")
+    try:
+        status = UserDecisionNoticeDeliveryStatus(value["status"])
+    except (TypeError, ValueError) as exc:
+        raise DecisionReportError("user decision notice delivery has invalid status") from exc
+    attempted_at = _notice_timestamp(value["attempted_at"], "attempted_at")
+    error = _notice_string(value["error"], "error", allow_none=True)
+    if status is UserDecisionNoticeDeliveryStatus.DELIVERED and error is not None:
+        raise DecisionReportError("delivered user decision notice has error")
+    if status is UserDecisionNoticeDeliveryStatus.FAILED and error is None:
+        raise DecisionReportError("failed user decision notice lacks error")
+    return UserDecisionNoticeDelivery(
+        schema_version=USER_DECISION_NOTICE_SCHEMA_VERSION,
+        request_id=_notice_string(value["request_id"], "request_id") or "",
+        status=status,
+        attempted_at=attempted_at,
+        error=error,
+    )
+
+
+def read_user_decision_notice_delivery(
+    control_dir: Path,
+) -> UserDecisionNoticeDelivery | None:
+    path = _notice_delivery_path(control_dir)
+    return None if not path.exists() else _parse_notice_delivery(path)
+
+
+def write_user_decision_notice_delivery(
+    control_dir: Path,
+    *,
+    request_id: str,
+    status: UserDecisionNoticeDeliveryStatus,
+    error: str | None,
+) -> UserDecisionNoticeDelivery:
+    if not request_id:
+        raise DecisionReportError("user decision notice delivery requires request_id")
+    if status is UserDecisionNoticeDeliveryStatus.DELIVERED and error is not None:
+        raise DecisionReportError("delivered user decision notice cannot contain error")
+    if status is UserDecisionNoticeDeliveryStatus.FAILED and not error:
+        raise DecisionReportError("failed user decision notice requires error")
+    delivery = UserDecisionNoticeDelivery(
+        schema_version=USER_DECISION_NOTICE_SCHEMA_VERSION,
+        request_id=request_id,
+        status=status,
+        attempted_at=_utc_now(),
+        error=error,
+    )
+    _write_notice(_notice_delivery_path(control_dir), delivery)
+    return delivery
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -457,7 +738,7 @@ def find_gate_for_report(
     if not isinstance(raw_gates, list):
         raise GateProtocolError("gate-list result has no gates array")
     report_path = str(report.path)
-    matches: list[tuple[str, str]] = []
+    matches: list[tuple[str, str, tuple[str, ...]]] = []
     for item in raw_gates:
         if not isinstance(item, dict):
             continue
@@ -471,19 +752,27 @@ def find_gate_for_report(
             and report_path in question
             and report.digest in question
         ):
-            matches.append((gate_id, task_id))
+            raw_options = item.get("options")
+            options = (
+                tuple(raw_options)
+                if isinstance(raw_options, list)
+                and all(isinstance(option, str) and option for option in raw_options)
+                else ()
+            )
+            matches.append((gate_id, task_id, options))
     if not matches:
         return None
     if len(matches) != 1:
         raise GateProtocolError(
             "expected at most one gate for the decision report"
         )
-    gate_id, task_id = matches[0]
+    gate_id, task_id, options = matches[0]
     return GateBinding(
         gate_id=gate_id,
         task_id=task_id,
         report_digest=report.digest,
         gate_kind=gate_kind,
+        allowed_options=options,
     )
 
 

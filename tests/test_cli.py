@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from orca_loop.catalog import load_catalog
 from orca_loop.config import (
@@ -36,15 +37,21 @@ from orca_loop.models import (
     PermissionFeasibilityReport,
     PermissionStrategy,
     RunStatus,
+    GateKind,
+    UserDecisionNotice,
+    UserDecisionNoticeStatus,
     ValidationStatus,
     WorkerKey,
 )
+from orca_loop.escalation import read_user_decision_notice_delivery
+from orca_loop.orca_client import OrcaCommandError
 from run_loop import (
     EXIT_READY,
     EXIT_REJECTED,
     EXIT_RUNTIME_FAILURE,
     EXIT_USER_REQUIRED,
     _initialize,
+    _record_worktree_metadata,
     exit_code,
 )
 from orca_loop.locking import (
@@ -53,6 +60,96 @@ from orca_loop.locking import (
     release_run_lock,
 )
 from tests.fakes import FakeOrcaClient
+
+
+class WorktreeNoticeMetadataTest(unittest.TestCase):
+    def test_pending_notice_uses_supported_orca_worktree_set_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            control = Path(directory).resolve()
+            controller = SimpleNamespace(
+                state=SimpleNamespace(worktree_selector="path:C:/fixture"),
+                workspace=SimpleNamespace(control_dir=control),
+            )
+            notice = UserDecisionNotice(
+                schema_version=1,
+                request_id="notice-1",
+                status=UserDecisionNoticeStatus.PENDING,
+                run_id="run-1",
+                orchestration_run_id="orca-run-1",
+                gate_id="gate-1",
+                gate_kind=GateKind.ESCALATION,
+                blocked_state=LoopState.USER_DECISION_REQUIRED,
+                report_path="C:/fixture/user-decision.md",
+                report_digest="sha256:" + "d" * 64,
+                allowed_options=("merge", "reject"),
+                reason="user decision gate created",
+                created_at="2026-08-13T00:00:00+00:00",
+                resolved_at=None,
+            )
+            client = FakeOrcaClient(lambda _argv, _timeout: {})
+
+            _record_worktree_metadata(
+                controller,
+                client,  # type: ignore[arg-type]
+                notice=notice,
+                workspace_status="in-review",
+                comment="USER DECISION REQUIRED",
+            )
+
+            self.assertEqual(
+                (
+                    "worktree", "set", "--worktree", "path:C:/fixture",
+                    "--workspace-status", "in-review", "--comment",
+                    "USER DECISION REQUIRED",
+                ),
+                client.calls[0][0],
+            )
+            delivery = read_user_decision_notice_delivery(control)
+            self.assertIsNotNone(delivery)
+            assert delivery is not None
+            self.assertEqual("DELIVERED", delivery.status.value)
+
+    def test_metadata_failure_is_recorded_without_raising(self) -> None:
+        class FailingClient:
+            def call(self, _argv, *, timeout_ms: int):
+                raise OrcaCommandError(f"metadata unavailable after {timeout_ms}ms")
+
+        with tempfile.TemporaryDirectory() as directory:
+            control = Path(directory).resolve()
+            controller = SimpleNamespace(
+                state=SimpleNamespace(worktree_selector="path:C:/fixture"),
+                workspace=SimpleNamespace(control_dir=control),
+            )
+            notice = UserDecisionNotice(
+                schema_version=1,
+                request_id="notice-2",
+                status=UserDecisionNoticeStatus.PENDING,
+                run_id="run-1",
+                orchestration_run_id="orca-run-1",
+                gate_id="gate-1",
+                gate_kind=GateKind.ESCALATION,
+                blocked_state=LoopState.USER_DECISION_REQUIRED,
+                report_path="C:/fixture/user-decision.md",
+                report_digest="sha256:" + "d" * 64,
+                allowed_options=("merge", "reject"),
+                reason="user decision gate created",
+                created_at="2026-08-13T00:00:00+00:00",
+                resolved_at=None,
+            )
+
+            _record_worktree_metadata(
+                controller,
+                FailingClient(),  # type: ignore[arg-type]
+                notice=notice,
+                workspace_status="in-review",
+                comment="USER DECISION REQUIRED",
+            )
+
+            delivery = read_user_decision_notice_delivery(control)
+            self.assertIsNotNone(delivery)
+            assert delivery is not None
+            self.assertEqual("FAILED", delivery.status.value)
+            self.assertIn("metadata unavailable", delivery.error or "")
 
 
 def passing_permission_report(

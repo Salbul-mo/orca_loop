@@ -186,6 +186,16 @@ class GateKind(StrEnum):
     DESTRUCTIVE = "DESTRUCTIVE"
 
 
+class UserDecisionNoticeStatus(StrEnum):
+    PENDING = "PENDING"
+    RESOLVED = "RESOLVED"
+
+
+class UserDecisionNoticeDeliveryStatus(StrEnum):
+    DELIVERED = "DELIVERED"
+    FAILED = "FAILED"
+
+
 class HumanDecisionKind(StrEnum):
     MERGE = "merge"
     REJECT = "reject"
@@ -955,6 +965,37 @@ class GateBinding:
     report_digest: str
     gate_kind: GateKind
     allowed_options: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class UserDecisionNotice:
+    """Durable operator-facing description of one pending decision gate."""
+
+    schema_version: int
+    request_id: str
+    status: UserDecisionNoticeStatus
+    run_id: str
+    orchestration_run_id: str
+    gate_id: str
+    gate_kind: GateKind
+    blocked_state: LoopState
+    report_path: str
+    report_digest: str
+    allowed_options: tuple[str, ...]
+    reason: str
+    created_at: str
+    resolved_at: str | None
+
+
+@dataclass(frozen=True)
+class UserDecisionNoticeDelivery:
+    """Best-effort Orca worktree metadata delivery evidence."""
+
+    schema_version: int
+    request_id: str
+    status: UserDecisionNoticeDeliveryStatus
+    attempted_at: str
+    error: str | None
 
 
 @dataclass(frozen=True)
