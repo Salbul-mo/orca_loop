@@ -1023,6 +1023,8 @@ class RunEntryPointTest(unittest.TestCase):
                     }
                 if argv[:2] == ("terminal", "show"):
                     return {"terminal": {"status": "running"}}
+                if argv[:2] == ("orchestration", "run-create"):
+                    return {"run": {"id": "orca-run-1"}}
                 self.fail(f"unexpected Orca call: {argv}")
 
             controller, pool = _initialize(

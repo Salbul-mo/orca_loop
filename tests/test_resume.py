@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from orca_loop.config import (
     PreflightResult,
@@ -34,6 +36,12 @@ from tests.fakes import FakeOrcaClient
 
 class ResumeHarness(unittest.TestCase):
     def setUp(self) -> None:
+        self.environment = patch.dict(
+            os.environ,
+            {"ORCA_TERMINAL_HANDLE": ""},
+        )
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
@@ -52,6 +60,10 @@ class ResumeHarness(unittest.TestCase):
         self._git("commit", "-m", "fixture")
         self.created: list[str] = []
         self.dead: set[str] = set()
+        # Authoritative Orca view of the active step's Dispatch. None means
+        # Orca has no record, which resume must treat as unproven, not done.
+        self.dispatch_status: str | None = None
+        self.assignee_handle: str = ""
         self.controller, self.pool = _initialize(
             self.preflight(),
             self.client(),
@@ -129,6 +141,25 @@ class ResumeHarness(unittest.TestCase):
 
                     raise OrcaCommandError(f"terminal is gone: {handle}")
                 return {"terminal": {"status": "running"}}
+            if argv[:2] == ("orchestration", "dispatch-show"):
+                if self.dispatch_status is None:
+                    return {}
+                return {
+                    "dispatch": {
+                        "id": "ctx-1",
+                        "task_id": "task-1",
+                        "status": self.dispatch_status,
+                        "assignee_handle": self.assignee_handle,
+                        "failure_count": 0,
+                        "completed_at": None,
+                    }
+                }
+            if argv[:2] == ("orchestration", "run-create"):
+                return {"run": {"id": "orca-run-1"}}
+            if argv[:2] == ("orchestration", "run-use"):
+                return {"run": {"id": "orca-run-1"}}
+            if argv[:2] == ("orchestration", "run-current"):
+                return {"run": {"id": "orca-run-1"}}
             raise AssertionError(f"unexpected Orca call: {argv}")
 
         return FakeOrcaClient(handler)  # type: ignore[return-value]
@@ -225,6 +256,31 @@ class TerminalRebindResumeTest(ResumeHarness):
             manifest.coordinator_handle,
         )
 
+    def test_attested_terminal_is_adopted_and_marked_rebound(self) -> None:
+        with patch.dict(os.environ, {"ORCA_TERMINAL_HANDLE": "term-attested"}):
+            controller, _ = self.resume()
+        self.assertEqual(
+            "term-attested",
+            controller.state.coordinator_handle,
+        )
+        events = read_events(self.control)
+        self.assertTrue(
+            any(item["kind"] == "resume_rebound" for item in events)
+        )
+
+    def test_dead_attested_terminal_blocks_instead_of_replacing(self) -> None:
+        self.dead.add("term-attested")
+        before = list(self.created)
+        with patch.dict(os.environ, {"ORCA_TERMINAL_HANDLE": "term-attested"}):
+            with self.assertRaisesRegex(
+                ResumeBlockedError,
+                "not live",
+            ):
+                self.resume()
+        # An unattested replacement terminal must never stand in for the
+        # coordinator, so resume creates nothing at all.
+        self.assertEqual(before, self.created)
+
 
 class InFlightStepResumeTest(ResumeHarness):
     def _dispatch_step(self, state: LoopState = LoopState.PLAN) -> str:
@@ -265,8 +321,15 @@ class InFlightStepResumeTest(ResumeHarness):
         )
         return step_id
 
-    def test_dispatched_step_is_abandoned_not_adopted(self) -> None:
+    def _worker_is_gone(self) -> None:
+        """Orca says the Dispatch is still open but its terminal is gone."""
+        self.dispatch_status = "dispatched"
+        self.assignee_handle = self.pool.workers[0].terminal_handle
+        self.dead.add(self.assignee_handle)
+
+    def test_dead_worker_step_is_abandoned_not_adopted(self) -> None:
         step_id = self._dispatch_step()
+        self._worker_is_gone()
         controller, _ = self.resume()
         marker = (
             self.controller.workspace.steps_dir / step_id / "ABANDONED"
@@ -283,8 +346,53 @@ class InFlightStepResumeTest(ResumeHarness):
         )
         self.assertEqual(LoopState.PLAN, controller.state.state)
 
+    def test_live_worker_blocks_resume_instead_of_being_replaced(self) -> None:
+        """The worker runs in its own terminal and outlives the coordinator.
+
+        Re-running its step would put a second editor in the same worktree, so
+        resume must stop rather than abandon and replace it.
+        """
+        step_id = self._dispatch_step()
+        self.dispatch_status = "dispatched"
+        self.assignee_handle = self.pool.workers[0].terminal_handle
+        with self.assertRaisesRegex(ResumeBlockedError, "still live"):
+            self.resume()
+        marker = (
+            self.controller.workspace.steps_dir / step_id / "ABANDONED"
+        )
+        self.assertFalse(marker.exists())
+        kinds = [item["kind"] for item in read_events(self.control)]
+        self.assertIn("resume_blocked", kinds)
+
+    def test_unknown_dispatch_blocks_rather_than_assuming_finished(
+        self,
+    ) -> None:
+        step_id = self._dispatch_step()
+        self.dispatch_status = None
+        with self.assertRaisesRegex(ResumeBlockedError, "cannot be proven"):
+            self.resume()
+        self.assertFalse(
+            (
+                self.controller.workspace.steps_dir / step_id / "ABANDONED"
+            ).exists()
+        )
+
+    def test_settled_dispatch_without_output_blocks(self) -> None:
+        self._dispatch_step()
+        self.dispatch_status = "completed"
+        self.assignee_handle = self.pool.workers[0].terminal_handle
+        step_root = (
+            self.controller.workspace.steps_dir
+            / self.controller.state.active.step_id
+        )
+        for item in (step_root / "out").iterdir():
+            item.unlink()
+        with self.assertRaisesRegex(ResumeBlockedError, "cannot be proven"):
+            self.resume()
+
     def test_abandoned_step_keeps_inputs_and_outputs(self) -> None:
         step_id = self._dispatch_step()
+        self._worker_is_gone()
         self.resume()
         step_root = self.controller.workspace.steps_dir / step_id
         self.assertTrue((step_root / "out" / "plan.json").is_file())
@@ -292,6 +400,7 @@ class InFlightStepResumeTest(ResumeHarness):
 
     def test_abandonment_is_recorded_as_an_event(self) -> None:
         self._dispatch_step()
+        self._worker_is_gone()
         self.resume()
         kinds = [item["kind"] for item in read_events(self.control)]
         self.assertIn("step_abandoned", kinds)

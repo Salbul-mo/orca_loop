@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -8,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from tests.fakes import assert_settlement_handshake
 from worker_runner import (
     EvidenceLog,
     PermissionObservationError,
@@ -74,7 +76,7 @@ class SuccessEvidenceTest(EvidenceTestCase):
                 result = run_job(self.job())
 
         self.assertEqual("PASS", result["status"])
-        send.assert_called_once()
+        assert_settlement_handshake(send)
         record = self.record()
         self.assertEqual("PASS", record["status"])
         self.assertEqual(0, record["exit_code"])
@@ -82,6 +84,16 @@ class SuccessEvidenceTest(EvidenceTestCase):
         self.assertEqual(["codex", "exec", "-"], record["command"])
         self.assertIn("schema_version", self.stdout_log())
         self.assertIn("warning: slow", self.stderr_log())
+
+    def test_provider_child_does_not_receive_orca_routing_environment(self) -> None:
+        process = SimpleNamespace(returncode=0)
+        process.communicate = lambda input, timeout: (b'{"schema_version":1}\n', b"")
+        with patch.dict(os.environ, {"ORCA_TERMINAL_HANDLE": "term-secret"}):
+            with patch("worker_runner.subprocess.Popen", return_value=process) as popen:
+                with patch("worker_runner._send"):
+                    run_job(self.job())
+        environment = popen.call_args.kwargs["env"]
+        self.assertNotIn("ORCA_TERMINAL_HANDLE", environment)
 
 
 class FailureEvidenceTest(EvidenceTestCase):

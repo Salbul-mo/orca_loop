@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from dataclasses import MISSING, replace
 import types
 from dataclasses import fields, is_dataclass
 from enum import Enum
@@ -13,6 +14,12 @@ from .models import (
     CommitManifest,
     ConsensusLedger,
     CoordinatorState,
+    MutationKind,
+    MutationPhase,
+    MutationRecord,
+    MutationStore,
+    DeliveryReceipt,
+    InboxState,
 )
 
 
@@ -151,8 +158,18 @@ def _decode(expected_type: Any, value: object, context: str) -> object:
         if not isinstance(value, dict):
             raise AtomicWriteError(f"{context} must be an object")
         hints = get_type_hints(expected_type)
-        expected_fields = {field.name for field in fields(expected_type)}
-        if set(value) != expected_fields:
+        dataclass_fields = tuple(fields(expected_type))
+        expected_fields = {field.name for field in dataclass_fields}
+        missing = expected_fields - set(value)
+        unexpected = set(value) - expected_fields
+        required_missing = {
+            field.name
+            for field in dataclass_fields
+            if field.name in missing
+            and field.default is MISSING
+            and field.default_factory is MISSING
+        }
+        if unexpected or required_missing:
             raise AtomicWriteError(
                 f"{context} fields mismatch: expected "
                 f"{sorted(expected_fields)}, got {sorted(value)}"
@@ -163,7 +180,8 @@ def _decode(expected_type: Any, value: object, context: str) -> object:
                 value[field.name],
                 f"{context}.{field.name}",
             )
-            for field in fields(expected_type)
+            for field in dataclass_fields
+            if field.name in value
         }
         return expected_type(**kwargs)
     if expected_type is bool:
@@ -308,3 +326,217 @@ def load_committed(
             "committed generation provenance mismatch"
         )
     return state, ledger, manifest
+
+
+MUTATION_STORE_NAME = "orchestration-operations.json"
+_PHASE_ORDER = {
+    MutationPhase.INTENT: 0,
+    MutationPhase.APPLIED: 1,
+    MutationPhase.COMMITTED: 2,
+}
+
+
+def _mutation_path(control_dir: Path) -> Path:
+    control = control_dir.resolve()
+    path = (control / MUTATION_STORE_NAME).resolve()
+    if path.parent != control:
+        raise AtomicWriteError("mutation store escaped the control directory")
+    return path
+
+
+def read_mutations(control_dir: Path) -> tuple[MutationRecord, ...]:
+    """Return every tracked mutation, oldest first."""
+    path = _mutation_path(control_dir)
+    if not path.exists():
+        return ()
+    store = _decode(MutationStore, _load_json(path), "mutation_store")
+    return store.records  # type: ignore[union-attr]
+
+
+def find_mutation(
+    control_dir: Path,
+    request_id: str,
+) -> MutationRecord | None:
+    for record in read_mutations(control_dir):
+        if record.request_id == request_id:
+            return record
+    return None
+
+
+def unresolved_mutation(
+    control_dir: Path,
+    kind: MutationKind,
+    *,
+    step_id: str | None,
+) -> MutationRecord | None:
+    """Return the mutation of this kind that never reached COMMITTED.
+
+    A restart replays exactly this record instead of issuing a fresh mutation,
+    which is what keeps a lost response from creating a duplicate.
+    """
+    for record in read_mutations(control_dir):
+        if (
+            record.kind is kind
+            and record.step_id == step_id
+            and record.phase is not MutationPhase.COMMITTED
+        ):
+            return record
+    return None
+
+
+def write_mutation(
+    control_dir: Path,
+    record: MutationRecord,
+) -> MutationRecord:
+    """Persist a new mutation or a legal forward transition of an existing one."""
+    if not record.request_id:
+        raise GenerationMismatchError("mutation request ID must be nonempty")
+    if record.generation < 0:
+        raise GenerationMismatchError("mutation generation must be >= 0")
+    if not record.canonical_argv:
+        raise GenerationMismatchError("mutation argv must be nonempty")
+    path = _mutation_path(control_dir)
+    existing = read_mutations(control_dir)
+    updated: list[MutationRecord] = []
+    replaced = False
+    for item in existing:
+        if item.request_id != record.request_id:
+            updated.append(item)
+            continue
+        # Orca binds the request ID to the first attempt's argv, so a local
+        # record that drifts from it would replay into a rejection.
+        if (
+            item.kind is not record.kind
+            or item.run_id != record.run_id
+            or item.step_id != record.step_id
+            or item.canonical_argv != record.canonical_argv
+        ):
+            raise GenerationMismatchError(
+                "mutation record fields are immutable once written"
+            )
+        if _PHASE_ORDER[record.phase] < _PHASE_ORDER[item.phase]:
+            raise GenerationMismatchError(
+                f"mutation phase cannot move {item.phase} -> {record.phase}"
+            )
+        updated.append(record)
+        replaced = True
+    if not replaced:
+        updated.append(record)
+    store = MutationStore(schema_version=1, records=tuple(updated))
+    write_atomic_bytes(
+        path,
+        _canonical_bytes(_internal_value(store)) + b"\n",
+    )
+    reread = find_mutation(control_dir, record.request_id)
+    if reread != record:
+        raise AtomicWriteError("mutation record reread does not match")
+    return record
+
+
+INBOX_STORE_NAME = "inbox.json"
+# Bounded so a long run cannot grow the control file without limit while still
+# keeping enough history to recognise a replayed delivery after a restart.
+MAX_INBOX_RECEIPTS = 64
+MAX_PROMOTED_IDS = 512
+
+
+def _inbox_path(control_dir: Path) -> Path:
+    control = control_dir.resolve()
+    path = (control / INBOX_STORE_NAME).resolve()
+    if path.parent != control:
+        raise AtomicWriteError("inbox store escaped the control directory")
+    return path
+
+
+def read_inbox(control_dir: Path) -> InboxState:
+    path = _inbox_path(control_dir)
+    if not path.exists():
+        return InboxState(
+            schema_version=1,
+            receipts=(),
+            promoted_message_ids=(),
+        )
+    return _decode(  # type: ignore[return-value]
+        InboxState,
+        _load_json(path),
+        "inbox",
+    )
+
+
+def write_inbox(control_dir: Path, state: InboxState) -> InboxState:
+    bounded = InboxState(
+        schema_version=1,
+        receipts=state.receipts[-MAX_INBOX_RECEIPTS:],
+        promoted_message_ids=(
+            state.promoted_message_ids[-MAX_PROMOTED_IDS:]
+        ),
+    )
+    write_atomic_bytes(
+        _inbox_path(control_dir),
+        _canonical_bytes(_internal_value(bounded)) + b"\n",
+    )
+    if read_inbox(control_dir) != bounded:
+        raise AtomicWriteError("inbox reread does not match")
+    return bounded
+
+
+def find_receipt(
+    control_dir: Path,
+    delivery_id: str,
+) -> DeliveryReceipt | None:
+    for receipt in read_inbox(control_dir).receipts:
+        if receipt.delivery_id == delivery_id:
+            return receipt
+    return None
+
+
+def record_receipt(
+    control_dir: Path,
+    receipt: DeliveryReceipt,
+) -> DeliveryReceipt:
+    """Store a delivery and its classifications, replacing any earlier copy."""
+    if len(receipt.messages) != len(receipt.classifications):
+        raise GenerationMismatchError(
+            "every delivered message needs exactly one classification"
+        )
+    state = read_inbox(control_dir)
+    kept = tuple(
+        item
+        for item in state.receipts
+        if item.delivery_id != receipt.delivery_id
+    )
+    write_inbox(
+        control_dir,
+        replace(state, receipts=(*kept, receipt)),
+    )
+    return receipt
+
+
+def mark_promoted(
+    control_dir: Path,
+    message_ids: tuple[str, ...],
+) -> None:
+    """Record which messages already became domain events.
+
+    A crash between promoting a worker_done and acknowledging its delivery
+    replays that message; this index is what lets the replay be recognised as
+    a duplicate instead of being promoted twice or dropped silently.
+    """
+    if not message_ids:
+        return
+    state = read_inbox(control_dir)
+    known = set(state.promoted_message_ids)
+    added = tuple(item for item in message_ids if item not in known)
+    if not added:
+        return
+    write_inbox(
+        control_dir,
+        replace(
+            state,
+            promoted_message_ids=(*state.promoted_message_ids, *added),
+        ),
+    )
+
+
+def is_promoted(control_dir: Path, message_id: str) -> bool:
+    return message_id in set(read_inbox(control_dir).promoted_message_ids)

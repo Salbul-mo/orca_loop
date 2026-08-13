@@ -171,6 +171,23 @@ class PermissionFeasibilityTest(unittest.TestCase):
         self.assertEqual(ValidationStatus.FAIL, statuses["V-PERM-02"])
         self.assertEqual(ValidationStatus.FAIL, statuses["V-PERM-04"])
 
+    def test_failed_worker_cannot_produce_passing_permission_report(self) -> None:
+        self.prepare_passing_fixture()
+        self.write_result(
+            "claude_planner",
+            read_value="permission spike source baseline",
+            source_write_blocked=True,
+            out_write_succeeded=True,
+            status="FAIL",
+        )
+        report = build_report(
+            self.harness_root,
+            self.run_id,
+            PermissionStrategy.ADD_DIR,
+            "1.4.159",
+        )
+        self.assertEqual(ValidationStatus.FAIL, report.status)
+
     def test_existing_nonempty_run_is_rejected(self) -> None:
         run_root = self.harness_root / "runs" / self.run_id
         run_root.mkdir(parents=True)

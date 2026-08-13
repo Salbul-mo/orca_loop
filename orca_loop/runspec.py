@@ -32,7 +32,10 @@ from .models import (
 
 MANIFEST_NAME = "run-manifest.json"
 REQUEST_COPY_NAME = "request.md"
-MANIFEST_SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSION = 2
+# Version 1 predates the persisted Orca Run ID.  It still reads, so an
+# existing run keeps its status and reports; resume is what refuses it.
+SUPPORTED_MANIFEST_VERSIONS = (1, 2)
 
 LIMIT_KEYS = (
     "plan_consensus_round_limit",
@@ -83,6 +86,8 @@ class RunManifest:
     orca_version: str
     coordinator_handle: str
     workers: tuple[tuple[WorkerKey, str], ...]
+    # None only for a manifest migrated from schema version 1.
+    orchestration_run_id: str | None = None
 
     def worker_handles(self) -> dict[WorkerKey, str]:
         return {key: handle for key, handle in self.workers}
@@ -243,6 +248,7 @@ def _file_ref_value(value: FileRef | None) -> object:
 def manifest_value(manifest: RunManifest) -> dict[str, object]:
     return {
         "schema_version": manifest.schema_version,
+        "orchestration_run_id": manifest.orchestration_run_id,
         "run_id": manifest.run_id,
         "created_at": manifest.created_at,
         "harness_root": manifest.harness_root,
@@ -317,9 +323,17 @@ def parse_manifest(raw_text: str) -> RunManifest:
     if not isinstance(value, dict):
         raise ManifestError("run manifest root must be an object")
     schema_version = value.get("schema_version")
-    if schema_version != MANIFEST_SCHEMA_VERSION:
+    if schema_version not in SUPPORTED_MANIFEST_VERSIONS:
         raise ManifestError(
-            f"run manifest schema_version must be {MANIFEST_SCHEMA_VERSION}"
+            "run manifest schema_version must be one of "
+            f"{list(SUPPORTED_MANIFEST_VERSIONS)}"
+        )
+    orchestration_run_id = value.get("orchestration_run_id")
+    if orchestration_run_id is not None and (
+        not isinstance(orchestration_run_id, str) or not orchestration_run_id
+    ):
+        raise ManifestError(
+            "run manifest orchestration_run_id must be a nonempty string"
         )
     raw_limits = value.get("limits")
     if not isinstance(raw_limits, dict):
@@ -379,6 +393,7 @@ def parse_manifest(raw_text: str) -> RunManifest:
     raw_policy = value.get("test_policy")
     return RunManifest(
         schema_version=MANIFEST_SCHEMA_VERSION,
+        orchestration_run_id=orchestration_run_id,
         run_id=_require(value, "run_id", str),
         created_at=_require(value, "created_at", str),
         harness_root=_require(value, "harness_root", str),
@@ -552,3 +567,40 @@ def worker_pool_from_manifest(manifest: RunManifest) -> WorkerPool | None:
             for worker in WorkerKey
         )
     )
+
+
+def manifest_identity_problems(
+    manifest: RunManifest,
+    *,
+    requested_run_id: str,
+    harness_root: Path,
+) -> tuple[str, ...]:
+    """Report every way this manifest fails to describe the run being asked for.
+
+    A manifest copied from another run points at a foreign worktree and foreign
+    terminals; acting on it would drive the wrong repository.
+    """
+    problems: list[str] = []
+    if manifest.run_id != requested_run_id:
+        problems.append(
+            f"manifest run_id {manifest.run_id!r} is not the requested "
+            f"run {requested_run_id!r}"
+        )
+    recorded_root = Path(manifest.harness_root)
+    if recorded_root.resolve() != harness_root.resolve():
+        problems.append(
+            f"manifest harness_root {manifest.harness_root!r} is not "
+            f"{harness_root}"
+        )
+    control = (harness_root / "runs" / requested_run_id / "control").resolve()
+    copy_path = Path(manifest.request_copy).resolve()
+    if copy_path.parent != control:
+        problems.append(
+            f"request copy escapes this run's control directory: {copy_path}"
+        )
+    worktree = Path(manifest.worktree_path)
+    if not worktree.is_absolute():
+        problems.append(
+            f"manifest worktree_path must be absolute: {manifest.worktree_path}"
+        )
+    return tuple(problems)

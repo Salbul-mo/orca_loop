@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import sys
 import time
@@ -34,6 +35,7 @@ from orca_loop.contracts import (
 )
 from orca_loop.coordinator import (
     CoordinatorGuardError,
+    reconcile_worker,
     CoordinatorPermissionError,
     GenerationController,
     OrcaLoopError,
@@ -48,7 +50,12 @@ from orca_loop.coordinator import (
     reconcile_resume,
     role_for_state,
 )
-from orca_loop.dispatcher import provision_workers, worker_for_role
+from orca_loop.dispatcher import (
+    DispatcherError,
+    observe_dispatch,
+    provision_workers,
+    worker_for_role,
+)
 from orca_loop.escalation import (
     GateProtocolError,
     approve_escalation_keys,
@@ -63,6 +70,7 @@ from orca_loop.generation import (
     GenerationError,
     commit_generation,
     load_committed,
+    write_atomic_bytes,
 )
 from orca_loop.ledger import empty_ledger, unresolved_scope
 from orca_loop.locking import (
@@ -74,6 +82,9 @@ from orca_loop.locking import (
 )
 from orca_loop.machine import TERMINAL_STATES
 from orca_loop.models import (
+    MutationKind,
+    ResumeOutcome,
+    MutationRecord,
     ActiveStep,
     ArtifactKind,
     ConsensusKind,
@@ -101,12 +112,18 @@ from orca_loop.models import (
     WorkerKey,
     WorkerPool,
 )
-from orca_loop.orca_client import OrcaClient, OrcaCommandError
+from orca_loop.orca_client import (
+    OrcaClient,
+    OrcaCommandError,
+    commit_mutation,
+    execute_mutation,
+)
 from orca_loop.profiles import build_launch_profile
 from orca_loop.readonly import prepare_readonly_mirror
 from orca_loop.reporting import render_failure_report, resume_command_line
 from orca_loop.runspec import (
     ManifestError,
+    manifest_identity_problems,
     build_manifest,
     copy_request,
     read_manifest,
@@ -115,10 +132,11 @@ from orca_loop.runspec import (
     write_manifest,
 )
 from orca_loop.session import (
+    TerminalBinding,
     append_event,
-    create_terminal,
     ensure_coordinator_terminal,
     ensure_worker_pool,
+    terminal_alive,
 )
 from orca_loop.roles import ARTIFACT_FILENAMES, render_role_contract
 from orca_loop.snapshot import capture_snapshot, materialize_frozen_review
@@ -162,7 +180,7 @@ def _initial_state(preflight: PreflightResult) -> CoordinatorState:
     config = preflight.arguments.config
     snapshot = capture_snapshot(config.worktree_path)
     return CoordinatorState(
-        schema_version=1,
+        schema_version=2,
         generation=0,
         run_id=preflight.arguments.run_id,
         state=LoopState.INIT,
@@ -183,6 +201,107 @@ def _initial_state(preflight: PreflightResult) -> CoordinatorState:
         ),
         history=(),
     )
+
+
+def _result_object(response) -> dict[str, object]:
+    try:
+        value = json.loads(response.result_json)
+    except json.JSONDecodeError as exc:
+        raise OrcaLoopError("Orca orchestration response is malformed") from exc
+    if not isinstance(value, dict):
+        raise OrcaLoopError("Orca orchestration response must be an object")
+    return value
+
+
+def _run_id_from_response(response) -> str:
+    value = _result_object(response)
+    nested = value.get("run")
+    candidate = nested if isinstance(nested, dict) else value
+    for key in ("id", "runId", "run_id"):
+        run_id = candidate.get(key)
+        if isinstance(run_id, str) and run_id:
+            return run_id
+    raise OrcaLoopError("Orca orchestration response has no Run ID")
+
+
+def _write_orchestration_binding(
+    control_dir: Path,
+    *,
+    run_id: str,
+    coordinator_handle: str,
+) -> None:
+    write_atomic_bytes(
+        control_dir / "orchestration-binding.json",
+        (
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "orchestration_run_id": run_id,
+                    "coordinator_handle": coordinator_handle,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8"),
+    )
+
+
+def _create_orchestration_run(
+    client: OrcaClient,
+    control_dir: Path,
+    *,
+    coordinator_handle: str,
+    harness_run_id: str,
+    generation: int,
+) -> tuple[str, MutationRecord]:
+    # Losing this response without a durable intent would strand an Orca Run
+    # nobody owns and create a second one on the next attempt.
+    response, record = execute_mutation(
+        client,
+        control_dir,
+        kind=MutationKind.RUN_CREATE,
+        argv=(
+            "orchestration",
+            "run-create",
+            "--from",
+            coordinator_handle,
+            "--objective",
+            f"Orca Loop harness run {harness_run_id}",
+        ),
+        timeout_ms=30_000,
+        run_id=harness_run_id,
+        generation=generation,
+        external_id_keys=("run",),
+    )
+    return _run_id_from_response(response), record
+
+
+def _bind_orchestration_run(
+    client: OrcaClient,
+    *,
+    orchestration_run_id: str,
+    coordinator_handle: str,
+) -> None:
+    # run-use only rebinds an existing Run, so replaying it creates nothing.
+    # It stays a direct call: there is no external object to duplicate.
+    client.call(
+        (
+            "orchestration",
+            "run-use",
+            "--id",
+            orchestration_run_id,
+            "--from",
+            coordinator_handle,
+        ),
+        timeout_ms=30_000,
+    )
+    response = client.call(
+        ("orchestration", "run-current", "--from", coordinator_handle),
+        timeout_ms=30_000,
+    )
+    if _run_id_from_response(response) != orchestration_run_id:
+        raise OrcaLoopError("Orca Run binding did not persist for coordinator")
 
 
 def _dummy_profiles(
@@ -228,6 +347,29 @@ def _initialize(
         arguments.config.request_path,
     )
     controller = GenerationController(workspace, state, ledger)
+    orchestration_run_id, run_mutation = _create_orchestration_run(
+        client,
+        workspace.control_dir,
+        coordinator_handle=state.coordinator_handle,
+        harness_run_id=state.run_id,
+        generation=controller.state.generation,
+    )
+    controller.state = replace(
+        controller.state,
+        orchestration_run_id=orchestration_run_id,
+    )
+    controller.commit(
+        stage=StepStage.STEP_PENDING,
+        active=None,
+        reason="Orca Run binding recorded",
+    )
+    _write_orchestration_binding(
+        workspace.control_dir,
+        run_id=orchestration_run_id,
+        coordinator_handle=state.coordinator_handle,
+    )
+    # The Run is only settled once the binding it produced is durable.
+    commit_mutation(workspace.control_dir, run_mutation)
     pool = provision_workers(
         client,
         state.worktree_selector,
@@ -254,12 +396,15 @@ def _initialize(
     )
     write_manifest(
         workspace.control_dir,
-        build_manifest(
-            preflight,
-            request_copy=request_copy,
-            request_digest=request_digest,
-            coordinator_handle=state.coordinator_handle,
-            pool=pool,
+        replace(
+            build_manifest(
+                preflight,
+                request_copy=request_copy,
+                request_digest=request_digest,
+                coordinator_handle=state.coordinator_handle,
+                pool=pool,
+            ),
+            orchestration_run_id=orchestration_run_id,
         ),
     )
     commit_step_transition(
@@ -419,6 +564,20 @@ def _resume(
     state, ledger, _ = load_committed(workspace.control_dir)
     if state.run_id != arguments.run_id:
         raise OrcaLoopError("resume run ID does not match committed state")
+    # A manifest copied from another run names a foreign worktree and foreign
+    # terminals.  Refuse it before anything acts on those paths.
+    recorded = read_manifest(workspace.control_dir)
+    if recorded is not None:
+        identity = manifest_identity_problems(
+            recorded,
+            requested_run_id=arguments.run_id,
+            harness_root=arguments.harness_root,
+        )
+        if identity:
+            raise ManifestError(
+                "run manifest does not describe this run: "
+                + "; ".join(identity)
+            )
     if state.state in {LoopState.FAILED, LoopState.REJECTED}:
         raise OrcaLoopError(
             f"run ended in {state.state.value}; start a new run instead of "
@@ -440,15 +599,30 @@ def _resume(
         )
 
     selector = _worktree_selector(arguments.config.worktree_path)
-    coordinator = ensure_coordinator_terminal(
-        client,
-        worktree_selector=selector,
-        run_id=state.run_id,
-        recorded_handles=(
-            state.coordinator_handle,
-            arguments.config.coordinator_handle,
-        ),
-    )
+    current_handle = os.environ.get("ORCA_TERMINAL_HANDLE", "")
+    if current_handle:
+        # Resume adopts the attested terminal it is actually running in.  It
+        # must never silently fabricate a replacement: an unattested terminal
+        # cannot stand in for the coordinator, so a dead handle is BLOCKED.
+        if not terminal_alive(client, current_handle):
+            raise ResumeBlockedError(
+                "the current Orca terminal is not live; resume from an "
+                "attested coordinator terminal"
+            )
+        coordinator = TerminalBinding(
+            current_handle,
+            current_handle != state.coordinator_handle,
+        )
+    else:
+        coordinator = ensure_coordinator_terminal(
+            client,
+            worktree_selector=selector,
+            run_id=state.run_id,
+            recorded_handles=(
+                state.coordinator_handle,
+                arguments.config.coordinator_handle,
+            ),
+        )
     binding = ensure_worker_pool(
         client,
         worktree_selector=selector,
@@ -465,6 +639,15 @@ def _resume(
     )
 
     controller = GenerationController(workspace, state, ledger)
+    if not state.orchestration_run_id:
+        raise ResumeBlockedError(
+            "this run predates durable Orca Run binding; start a new run"
+        )
+    _bind_orchestration_run(
+        client,
+        orchestration_run_id=state.orchestration_run_id,
+        coordinator_handle=coordinator.handle,
+    )
     if coordinator.rebound or binding.changed or drift.rebaselined:
         reasons = []
         if coordinator.rebound:
@@ -521,6 +704,54 @@ def _resume(
         output_dir = workspace.steps_dir / active.step_id / "out"
         output_exists = output_dir.is_dir() and any(
             item.is_file() for item in output_dir.iterdir()
+        )
+    # Local binding files cannot tell a finished worker from one that is still
+    # editing the worktree: the worker runs in its own terminal and outlives
+    # the coordinator that dispatched it.  Ask Orca before touching the step.
+    observation = (
+        None
+        if active is None or active.task_id is None
+        else observe_dispatch(client, task_id=active.task_id)
+    )
+    outcome = reconcile_worker(
+        controller.state,
+        observation,
+        output_exists=output_exists,
+    )
+    if outcome in {
+        ResumeOutcome.ADOPT_WAIT,
+        ResumeOutcome.ABANDON_AND_BLOCK,
+    }:
+        append_event(
+            workspace.control_dir,
+            "resume_blocked",
+            {
+                "outcome": outcome.value,
+                "step_id": None if active is None else active.step_id,
+                "task_id": None if active is None else active.task_id,
+                "dispatch_id": None if active is None else active.dispatch_id,
+                "dispatch_status": (
+                    None if observation is None else observation.status
+                ),
+                "assignee_handle": (
+                    None if observation is None else observation.assignee_handle
+                ),
+                "assignee_alive": (
+                    None if observation is None else observation.assignee_alive
+                ),
+            },
+        )
+        detail = (
+            "its worker is still live"
+            if outcome is ResumeOutcome.ADOPT_WAIT
+            else "its worker outcome cannot be proven finished"
+        )
+        raise ResumeBlockedError(
+            f"step {'' if active is None else active.step_id} cannot be "
+            f"resumed because {detail}. Re-running it would put a second "
+            f"editor in the worktree. Stop or close the worker terminal "
+            f"{'' if observation is None else observation.assignee_handle} "
+            "and resume again."
         )
     decision = reconcile_resume(
         controller.state,
@@ -906,11 +1137,19 @@ def _round_evidence(
 def _create_decision_task(
     client: OrcaClient,
     run_id: str,
-) -> str:
-    response = client.call(
-        (
+    orchestration_run_id: str,
+    control_dir: Path,
+    generation: int,
+) -> tuple[str, MutationRecord]:
+    response, record = execute_mutation(
+        client,
+        control_dir,
+        kind=MutationKind.TASK_CREATE,
+        argv=(
             "orchestration",
             "task-create",
+            "--run",
+            orchestration_run_id,
             "--task-title",
             f"{run_id} user decision",
             "--display-name",
@@ -919,6 +1158,10 @@ def _create_decision_task(
             "Review the bound user-decision.md report.",
         ),
         timeout_ms=30_000,
+        run_id=run_id,
+        generation=generation,
+        step_id="user-decision",
+        external_id_keys=("task",),
     )
     try:
         result = json.loads(response.result_json)
@@ -930,7 +1173,11 @@ def _create_decision_task(
     task_id = task.get("id") if isinstance(task, dict) else None
     if not isinstance(task_id, str) or not task_id:
         raise OrcaLoopError("decision task response has no task ID")
-    return task_id
+    # Do not commit the mutation yet.  The Task only becomes locally owned
+    # when the Gate binding that uses it is in committed coordinator state.
+    # A crash before then must replay this exact request ID, not create another
+    # user-decision Task.
+    return task_id, record
 
 
 def _gate_options(
@@ -1004,6 +1251,7 @@ def _ensure_gate(
         report=report,
         gate_kind=kind,
         timeout_ms=30_000,
+        orchestration_run_id=controller.state.orchestration_run_id,
     )
     if binding is not None:
         controller.commit(
@@ -1014,11 +1262,14 @@ def _ensure_gate(
             gate_binding=binding,
         )
         return
-    task_id = _create_decision_task(
+    task_id, task_mutation = _create_decision_task(
         client,
         controller.state.run_id,
+        controller.state.orchestration_run_id or "",
+        controller.workspace.control_dir,
+        controller.state.generation,
     )
-    binding = create_gate(
+    binding, gate_mutation = create_gate(
         client,
         task_id=task_id,
         report=report,
@@ -1033,6 +1284,10 @@ def _ensure_gate(
             plan,
         ),
         timeout_ms=30_000,
+        control_dir=controller.workspace.control_dir,
+        generation=controller.state.generation,
+        run_id=controller.state.run_id,
+        commit_after_binding=False,
     )
     controller.commit(
         stage=StepStage.TRANSITION_COMMITTED,
@@ -1041,6 +1296,11 @@ def _ensure_gate(
         status=RunStatus.BLOCKED,
         gate_binding=binding,
     )
+    # Both external objects are now represented by the committed GateBinding.
+    # Mark their journal records complete only after that durable boundary.
+    commit_mutation(controller.workspace.control_dir, task_mutation)
+    if gate_mutation is not None:
+        commit_mutation(controller.workspace.control_dir, gate_mutation)
 
 
 def _resume_gate(
@@ -1056,6 +1316,7 @@ def _resume_gate(
             client,
             binding=binding,
             timeout_ms=30_000,
+            orchestration_run_id=controller.state.orchestration_run_id,
         )
     except GateProtocolError as exc:
         if "exactly one resolved gate" in str(exc):
@@ -1449,16 +1710,13 @@ def _start_argv(
             # would never use leaks one per rehearsal.
             resolved.extend(("--coordinator-handle", DRY_RUN_HANDLE))
         else:
-            if not peeked.worktree:
-                raise ConfigurationError("--worktree is required")
-            created = create_terminal(
-                client,
-                _worktree_selector(Path(peeked.worktree)),
-                f"ORCA LOOP {peeked.run_id or 'run'}",
-            )
-            resolved.extend(
-                ("--coordinator-handle", created.terminal_handle)
-            )
+            current_handle = os.environ.get("ORCA_TERMINAL_HANDLE", "")
+            if not current_handle:
+                raise ConfigurationError(
+                    "start must run inside the intended Orca coordinator "
+                    "terminal or provide --coordinator-handle"
+                )
+            resolved.extend(("--coordinator-handle", current_handle))
     return resolved
 
 
@@ -1521,12 +1779,17 @@ def _resume_argv(
 
 
 def _status_report(harness_root: Path, run_id: str) -> dict[str, object]:
-    """Describe a run without changing a single byte of it."""
+    """Describe a run without changing a single byte of it.
+
+    Status is derived from the blockers that would actually stop a resume, so
+    it never reports PASS over a problem an operator has to fix first.
+    """
     run_root = harness_root / "runs" / run_id
     control = run_root / "control"
     if not control.is_dir():
         return {"status": "BLOCKED", "error": f"unknown run: {run_id}"}
-    value: dict[str, object] = {"status": "PASS", "run_id": run_id}
+    value: dict[str, object] = {"run_id": run_id}
+    blockers: list[str] = []
     try:
         state, ledger, _ = load_committed(control)
     except (AtomicWriteError, GenerationError) as exc:
@@ -1552,13 +1815,23 @@ def _status_report(harness_root: Path, run_id: str) -> dict[str, object]:
             "reports": sorted(
                 item.name for item in (run_root / "reports").glob("*.md")
             ),
-            "resumable": state.state
-            not in {LoopState.FAILED, LoopState.REJECTED},
             "resume_command": resume_command_line(harness_root, run_id),
         }
     )
-    manifest = read_manifest(control)
-    if manifest is not None:
+    if state.state in {LoopState.FAILED, LoopState.REJECTED}:
+        blockers.append(f"run ended in {state.state.value}")
+    if not state.orchestration_run_id:
+        blockers.append(
+            "run predates durable Orca Run binding; it cannot be resumed"
+        )
+    try:
+        manifest = read_manifest(control)
+    except ManifestError as exc:
+        manifest = None
+        blockers.append(str(exc))
+    if manifest is None:
+        value["worktree"] = None
+    else:
         value["worktree"] = manifest.worktree_path
         value["agents"] = {
             record.worker_key.value: {
@@ -1568,15 +1841,35 @@ def _status_report(harness_root: Path, run_id: str) -> dict[str, object]:
             }
             for record in manifest.agents
         }
-        value["input_problems"] = list(verify_inputs(manifest))
-    lock = inspect_lock(harness_root, Path(str(value.get("worktree", ""))))
-    if lock is not None:
-        value["lock"] = {
-            "path": str(lock.path),
-            "run_id": lock.run_id,
-            "pid": lock.pid,
-            "alive": lock.alive,
-        }
+        identity = manifest_identity_problems(
+            manifest,
+            requested_run_id=run_id,
+            harness_root=harness_root,
+        )
+        input_problems = list(verify_inputs(manifest))
+        value["input_problems"] = input_problems
+        value["identity_problems"] = list(identity)
+        blockers.extend(identity)
+        blockers.extend(input_problems)
+    # Only look for a lock once a real worktree is known: an empty path would
+    # resolve to the process working directory and report a foreign lock.
+    worktree = value.get("worktree")
+    if isinstance(worktree, str) and worktree:
+        lock = inspect_lock(harness_root, Path(worktree))
+        if lock is not None:
+            value["lock"] = {
+                "path": str(lock.path),
+                "run_id": lock.run_id,
+                "pid": lock.pid,
+                "alive": lock.alive,
+            }
+            if lock.run_id != run_id and lock.alive:
+                blockers.append(
+                    f"worktree is locked by run {lock.run_id} (pid {lock.pid})"
+                )
+    value["blockers"] = blockers
+    value["resumable"] = not blockers
+    value["status"] = "BLOCKED" if blockers else "PASS"
     return value
 
 
@@ -1667,9 +1960,25 @@ def _emit(value: Mapping[str, object]) -> None:
     print(json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2))
 
 
+def _print_subcommand_help(command: str) -> None:
+    usage = {
+        "start": (
+            "usage: run_loop.py start --run-id ID --request PATH --worktree PATH "
+            "--agent KEY=MODEL/EFFORT [options]"
+        ),
+        "resume": "usage: run_loop.py resume --run-id ID [--accept-worktree-drift] [--force-unlock]",
+        "status": "usage: run_loop.py status --run-id ID",
+        "doctor": "usage: run_loop.py doctor",
+    }
+    print(usage[command])
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     harness_root = Path(__file__).resolve().parent
     command, values = _split_command(argv)
+    if values and all(item in {"-h", "--help"} for item in values):
+        _print_subcommand_help(command)
+        return EXIT_READY
     if command == "doctor":
         report = _doctor_report(harness_root)
         _emit(report)
@@ -1803,6 +2112,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_USER_REQUIRED
     except (
         OrcaLoopError,
+        DispatcherError,
         OrcaCommandError,
         AtomicWriteError,
         GateProtocolError,

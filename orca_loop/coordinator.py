@@ -13,6 +13,8 @@ from .contracts import (
     parse_worker_done,
 )
 from .dispatcher import (
+    acknowledge_delivery,
+    observe_dispatch,
     dispatch_and_wait,
     prepare_task,
     worker_for_role,
@@ -28,6 +30,8 @@ from .ledger import (
 )
 from .machine import TERMINAL_STATES, transition
 from .models import (
+    ResumeOutcome,
+    DispatchObservation,
     ActiveStep,
     ArtifactKind,
     CompletionKind,
@@ -451,6 +455,8 @@ def execute_worker_step(
         contract,
         worker,
         role,
+        orchestration_run_id=controller.state.orchestration_run_id or "",
+        generation=controller.state.generation,
         additional_inputs=additional_inputs,
         commit_stage=commit_stage,
     )
@@ -472,6 +478,8 @@ def execute_worker_step(
         prepared,
         step,
         profile,
+        orchestration_run_id=controller.state.orchestration_run_id or "",
+        generation=controller.state.generation,
         coordinator_handle=controller.state.coordinator_handle,
         orca_executable=orca_executable,
         runner_path=runner_path,
@@ -553,6 +561,12 @@ def execute_worker_step(
         stage=StepStage.WORKER_DONE_RECEIVED,
         active=active,
         reason=f"{loop_state.value} worker_done received",
+    )
+    acknowledge_delivery(
+        client,
+        orchestration_run_id=controller.state.orchestration_run_id or "",
+        coordinator_handle=controller.state.coordinator_handle,
+        delivery_id=completion.delivery_id,
     )
     expected = ExpectedProvenance(
         run_id=controller.state.run_id,
@@ -830,6 +844,48 @@ def operational_retry_result(
         ledger,
         None,
     )
+
+
+def reconcile_worker(
+    state: CoordinatorState,
+    observation: DispatchObservation | None,
+    *,
+    output_exists: bool,
+) -> ResumeOutcome:
+    """Decide what an interrupted step's worker is actually doing.
+
+    The worker runs `worker_runner.py` inside its own Orca terminal, so it
+    outlives the coordinator process that dispatched it.  Local binding files
+    cannot tell a finished worker from one still editing the worktree, so this
+    reads authoritative Orca state and fails closed when it cannot.
+    """
+    active = state.active
+    if active is None or active.dispatch_id is None:
+        return ResumeOutcome.NO_ACTIVE_STEP
+    if observation is None:
+        # Orca has no record, or the lookup failed.  Either way a live editor
+        # cannot be ruled out, so no replacement may be launched.
+        return ResumeOutcome.ABANDON_AND_BLOCK
+    if observation.dispatch_id != active.dispatch_id:
+        return ResumeOutcome.ABANDON_AND_BLOCK
+    status = observation.status.lower()
+    if status in {"completed", "succeeded", "failed"}:
+        # The worker settled on its own; its artifact is usable if it landed.
+        return (
+            ResumeOutcome.RECOVER_SETTLED
+            if output_exists
+            else ResumeOutcome.ABANDON_AND_BLOCK
+        )
+    if status in {"dispatched", "running", "ready"}:
+        if observation.assignee_alive:
+            # A live worker owns the worktree; re-running the step here would
+            # put two editors in it.
+            return ResumeOutcome.ADOPT_WAIT
+        # The terminal is gone, so nothing can still be writing.
+        return ResumeOutcome.STOP_AND_RETRY
+    if status in {"stopped", "cancelled", "abandoned"}:
+        return ResumeOutcome.STOP_AND_RETRY
+    return ResumeOutcome.ABANDON_AND_BLOCK
 
 
 def reconcile_resume(

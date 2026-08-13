@@ -145,10 +145,19 @@ def bind_artifact_provenance(
     job: dict[str, object],
 ) -> str:
     value = json.loads(artifact)
-    if "task_id" not in value and "dispatch_id" not in value:
+    has_task = "task_id" in value
+    has_dispatch = "dispatch_id" in value
+    if not has_task and not has_dispatch:
         return artifact
-    value["task_id"] = str(job["task_id"])
-    value["dispatch_id"] = str(job["dispatch_id"])
+    if has_task != has_dispatch:
+        raise WorkerRunnerError(
+            "artifact provenance must include task_id and dispatch_id together"
+        )
+    if (
+        value["task_id"] != str(job["task_id"])
+        or value["dispatch_id"] != str(job["dispatch_id"])
+    ):
+        raise WorkerRunnerError("artifact provenance conflicts with job binding")
     raw = json.dumps(
         value,
         ensure_ascii=False,
@@ -165,6 +174,16 @@ def _write_atomic(path: Path, raw: bytes) -> None:
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_bytes(raw)
     temporary.replace(path)
+
+
+def _agent_environment() -> dict[str, str]:
+    """Remove wrapper routing authority before starting the provider CLI."""
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith("ORCA_")
+        and "DISPATCH_CAPABILITY" not in key.upper()
+    }
 
 
 class EvidenceLog:
@@ -252,13 +271,44 @@ def _send(
         subject,
         "--type",
         message_type,
-        "--payload",
-        json.dumps(
-            message_payload,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ),
     ]
+    if message_type == "worker_done":
+        # Orca refuses --payload together with the structured payload flags,
+        # and it requires --outcome on a worker_done.  A worker_done therefore
+        # cannot carry the artifact digest or schema version at all: those ride
+        # the preceding artifact-ready status message instead.
+        outcome = message_payload["outcome"]
+        if outcome not in {"succeeded", "failed"}:
+            raise WorkerRunnerError(
+                f"worker_done outcome must be succeeded or failed: {outcome!r}"
+            )
+        command.extend(
+            (
+                "--task-id",
+                str(job["task_id"]),
+                "--dispatch-id",
+                str(job["dispatch_id"]),
+                "--outcome",
+                str(outcome),
+            )
+        )
+        if report_path is not None:
+            command.extend(("--report-path", str(report_path)))
+    else:
+        # Every other type carries its identity inside the JSON payload, which
+        # is the only way to move fields Orca has no typed flag for.
+        command.extend(
+            (
+                "--payload",
+                json.dumps(
+                    message_payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            )
+        )
+    orchestration_run_id = job["orchestration_run_id"]
+    command.extend(("--run", str(orchestration_run_id)))
     command.append("--json")
     completed = subprocess.run(
         tuple(command),
@@ -308,9 +358,17 @@ def _load_job(encoded: str) -> dict[str, object]:
         "preamble",
         "log_dir",
         "step_id",
+        "orchestration_run_id",
     }
     if not isinstance(value, dict) or set(value) != required:
         raise WorkerRunnerError("worker job schema mismatch")
+    if (
+        not isinstance(value["orchestration_run_id"], str)
+        or not value["orchestration_run_id"]
+    ):
+        raise WorkerRunnerError(
+            "orchestration_run_id must be a nonempty string"
+        )
     if (
         not isinstance(value["profile_command"], list)
         or not value["profile_command"]
@@ -380,6 +438,7 @@ def run_job(job: dict[str, object]) -> dict[str, object]:
             stderr=subprocess.PIPE,
             start_new_session=os.name != "nt",
             creationflags=creationflags,
+            env=_agent_environment(),
         )
     except OSError as exc:
         if _is_access_denied(exc):
@@ -458,11 +517,21 @@ def run_job(job: dict[str, object]) -> dict[str, object]:
                 f"artifact outbox write failed: {exc}"
             ) from exc
         digest = "sha256:" + hashlib.sha256(artifact_raw).hexdigest()
+        # Stage 1 carries everything a worker_done cannot: the schema version
+        # and the digest the coordinator cross-checks against its own hash.
+        _send(
+            job,
+            message_type="status",
+            subject="worker artifact ready",
+            payload={"artifactDigest": digest},
+            report_path=output_path,
+        )
+        # Stage 2 is the terminal settlement signal for the Dispatch.
         _send(
             job,
             message_type="worker_done",
             subject="worker completed artifact",
-            payload={"artifactDigest": digest},
+            payload={"outcome": "succeeded"},
             report_path=output_path,
         )
     except WorkerRunnerError as exc:
@@ -501,6 +570,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         paths = {} if evidence is None else evidence.paths()
         if job is not None:
             try:
+                # The escalation carries the reason and evidence, which a
+                # worker_done has no typed flags for; the worker_done that
+                # follows is what actually settles the Dispatch as failed.
                 _send(
                     job,
                     message_type="escalation",
@@ -516,6 +588,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                         ),
                         **paths,
                     },
+                    report_path=None,
+                )
+                _send(
+                    job,
+                    message_type="worker_done",
+                    subject="worker runner failed",
+                    payload={"outcome": "failed"},
                     report_path=None,
                 )
             except WorkerRunnerError as send_error:

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from dataclasses import replace
+
 import io
 import tempfile
 import unittest
@@ -150,11 +153,36 @@ class RoundTripTest(ManifestTestCase):
         with self.assertRaises(ManifestError):
             read_manifest(self.control)
 
-    def test_schema_version_is_enforced(self) -> None:
+    def test_unknown_schema_version_is_rejected(self) -> None:
         manifest = self.build()
         raw = serialize_manifest(manifest).decode("utf-8")
         with self.assertRaises(ManifestError):
-            parse_manifest(raw.replace('"schema_version": 1', '"schema_version": 9'))
+            parse_manifest(raw.replace('"schema_version": 2', '"schema_version": 9'))
+
+    def test_legacy_version_one_migrates_without_a_run_id(self) -> None:
+        # A run created before the Orca Run ID was persisted must stay
+        # readable, so its status and reports keep working; resume is what
+        # refuses it rather than guessing at a Run.
+        manifest = self.build()
+        raw = serialize_manifest(manifest).decode("utf-8")
+        legacy = json.loads(raw)
+        legacy["schema_version"] = 1
+        legacy.pop("orchestration_run_id", None)
+        migrated = parse_manifest(json.dumps(legacy))
+        self.assertEqual(2, migrated.schema_version)
+        self.assertIsNone(migrated.orchestration_run_id)
+
+    def test_orchestration_run_id_round_trips(self) -> None:
+        manifest = replace(self.build(), orchestration_run_id="run_abc")
+        reread = parse_manifest(serialize_manifest(manifest).decode("utf-8"))
+        self.assertEqual("run_abc", reread.orchestration_run_id)
+
+    def test_empty_orchestration_run_id_is_rejected(self) -> None:
+        raw = serialize_manifest(self.build()).decode("utf-8")
+        broken = json.loads(raw)
+        broken["orchestration_run_id"] = ""
+        with self.assertRaises(ManifestError):
+            parse_manifest(json.dumps(broken))
 
     def test_non_ascii_request_is_copied_verbatim(self) -> None:
         manifest = self.build()

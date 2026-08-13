@@ -34,6 +34,33 @@ class StepStage(StrEnum):
     TRANSITION_COMMITTED = "TRANSITION_COMMITTED"
 
 
+class MutationKind(StrEnum):
+    """Orca operations that change external state and must not be duplicated."""
+
+    RUN_CREATE = "RUN_CREATE"
+    RUN_USE = "RUN_USE"
+    TASK_CREATE = "TASK_CREATE"
+    DISPATCH = "DISPATCH"
+    SEND = "SEND"
+    GATE_CREATE = "GATE_CREATE"
+
+
+class MutationPhase(StrEnum):
+    INTENT = "INTENT"
+    APPLIED = "APPLIED"
+    COMMITTED = "COMMITTED"
+
+
+class InboxClassification(StrEnum):
+    """What the coordinator decided about one delivered message."""
+
+    ACCEPTED = "ACCEPTED"
+    DEFERRED = "DEFERRED"
+    DUPLICATE = "DUPLICATE"
+    QUARANTINED = "QUARANTINED"
+    CONFLICTING = "CONFLICTING"
+
+
 class FindingStatus(StrEnum):
     OPEN = "OPEN"
     CHANGE_REQUIRED = "CHANGE_REQUIRED"
@@ -242,6 +269,34 @@ class ResumeAction(StrEnum):
     USER_DECISION_REQUIRED = "USER_DECISION_REQUIRED"
 
 
+class ResumeOutcome(StrEnum):
+    """What authoritative Orca state says about an interrupted step.
+
+    The worker runs in its own terminal, so it does not die with the
+    coordinator process.  Re-running a step whose worker is still live would
+    put two editors in one worktree, which is what these outcomes prevent.
+    """
+
+    NO_ACTIVE_STEP = "NO_ACTIVE_STEP"
+    ADOPT_WAIT = "ADOPT_WAIT"
+    RECOVER_SETTLED = "RECOVER_SETTLED"
+    STOP_AND_RETRY = "STOP_AND_RETRY"
+    ABANDON_AND_BLOCK = "ABANDON_AND_BLOCK"
+
+
+@dataclass(frozen=True)
+class DispatchObservation:
+    """Authoritative Orca view of the Dispatch an interrupted step was on."""
+
+    dispatch_id: str
+    task_id: str
+    status: str
+    assignee_handle: str
+    assignee_alive: bool
+    failure_count: int
+    completed_at: str | None
+
+
 @dataclass(frozen=True)
 class AffectedFile:
     path: str
@@ -296,6 +351,74 @@ class PermissionFeasibilityReport:
     report_digest: str
     environment: PermissionEnvironment | None = None
     created_at: str | None = None
+
+
+@dataclass(frozen=True)
+class MutationRecord:
+    """One Orca mutation tracked across the crash window that surrounds it.
+
+    ``request_id`` is the value handed to ``--retry-request``.  Orca binds that
+    ID to the exact argv of the first attempt and replays the original effect
+    for a repeat, so a record that survives a crash is enough to recover the
+    result without creating a second Task, Dispatch, Gate, or message.
+    """
+
+    schema_version: int
+    request_id: str
+    kind: MutationKind
+    phase: MutationPhase
+    run_id: str
+    generation: int
+    step_id: str | None
+    canonical_argv: tuple[str, ...]
+    response_json: str | None = None
+    external_id: str | None = None
+
+
+@dataclass(frozen=True)
+class MutationStore:
+    schema_version: int
+    records: tuple[MutationRecord, ...]
+
+
+@dataclass(frozen=True)
+class MessageEnvelope:
+    """One delivered orchestration message, reduced to its trusted identity.
+
+    Orca puts the task and dispatch IDs only inside the payload JSON, so those
+    stay optional here and are validated against the envelope by the caller.
+    """
+
+    message_id: str
+    message_type: str
+    from_handle: str
+    run_id: str
+    task_id: str | None
+    dispatch_id: str | None
+    payload_json: str
+
+
+@dataclass(frozen=True)
+class DeliveryReceipt:
+    """A whole Orca Delivery, durable before it is acknowledged.
+
+    A bound Run replays the same Delivery until it is acknowledged, so the
+    receipt is what makes "process every message before acknowledging" a
+    property of the harness rather than of a single process staying alive.
+    """
+
+    schema_version: int
+    delivery_id: str
+    messages: tuple[MessageEnvelope, ...]
+    classifications: tuple[InboxClassification, ...]
+    acked: bool
+
+
+@dataclass(frozen=True)
+class InboxState:
+    schema_version: int
+    receipts: tuple[DeliveryReceipt, ...]
+    promoted_message_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -396,6 +519,7 @@ class Completion:
     task_id: str
     dispatch_id: str
     payload_json: str | None
+    delivery_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -830,6 +954,7 @@ class GateBinding:
     task_id: str
     report_digest: str
     gate_kind: GateKind
+    allowed_options: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -870,6 +995,9 @@ class CoordinatorState:
     test_policy_digest: str | None
     permission_report_digest: str
     history: tuple[StateHistoryEntry, ...]
+    # The Orca Run is the durable routing boundary.  Terminal handles are
+    # deliberately not used as a substitute for that identity.
+    orchestration_run_id: str | None = None
     gate_binding: GateBinding | None = None
     human_decision: HumanDecision | None = None
     destructive_approval: DestructiveApproval | None = None

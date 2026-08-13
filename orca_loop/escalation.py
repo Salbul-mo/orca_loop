@@ -16,6 +16,8 @@ from .contracts import (
 from .ledger import UNRESOLVED_STATUSES, unresolved_scope
 from .models import (
     AffectedFile,
+    MutationKind,
+    MutationRecord,
     AffectedFileOperation,
     ConsensusLedger,
     CoordinatorState,
@@ -35,7 +37,12 @@ from .models import (
     TestGateStatus,
     TransitionSignal,
 )
-from .orca_client import OrcaClient, OrcaProtocolError
+from .orca_client import (
+    OrcaClient,
+    OrcaProtocolError,
+    commit_mutation,
+    execute_mutation,
+)
 
 
 class DecisionReportError(RuntimeError):
@@ -356,28 +363,48 @@ def create_gate(
     question: str,
     options: tuple[str, ...],
     timeout_ms: int,
-) -> GateBinding:
+    control_dir: Path | None = None,
+    generation: int = 0,
+    run_id: str = "",
+    commit_after_binding: bool = True,
+) -> tuple[GateBinding, MutationRecord | None]:
     if not task_id or not question or not options:
         raise GateProtocolError(
             "gate task, question and options must be nonempty"
         )
-    response = client.call(
+    # gate-create takes no --run: the gate inherits its Run from --task, which
+    # the coordinator already created inside the bound Run.
+    argv = (
+        "orchestration",
+        "gate-create",
+        "--task",
+        task_id,
+        "--question",
         (
-            "orchestration",
-            "gate-create",
-            "--task",
-            task_id,
-            "--question",
-            (
-                f"{question} Review {report.path} for "
-                f"{','.join(report.finding_ids) or 'the final decision'}. "
-                f"Report digest: {report.digest}."
-            ),
-            "--options",
-            json.dumps(options, ensure_ascii=False),
+            f"{question} Review {report.path} for "
+            f"{','.join(report.finding_ids) or 'the final decision'}. "
+            f"Report digest: {report.digest}."
         ),
-        timeout_ms=timeout_ms,
+        "--options",
+        json.dumps(options, ensure_ascii=False),
     )
+    if control_dir is None:
+        response = client.call(argv, timeout_ms=timeout_ms)
+        mutation = None
+    else:
+        # A lost gate-create response would block the same task behind two
+        # gates, so the request ID replays the original one instead.
+        response, mutation = execute_mutation(
+            client,
+            control_dir,
+            kind=MutationKind.GATE_CREATE,
+            argv=argv,
+            timeout_ms=timeout_ms,
+            run_id=run_id,
+            generation=generation,
+            step_id="user-decision",
+            external_id_keys=("gate",),
+        )
     value = _result_object(response.result_json)
     nested_gate = value.get("gate")
     gate_value = nested_gate if isinstance(nested_gate, dict) else value
@@ -392,11 +419,21 @@ def create_gate(
         raise GateProtocolError("gate-create result has no gate ID")
     if returned_task is not None and returned_task != task_id:
         raise GateProtocolError("gate-create returned a foreign task ID")
-    return GateBinding(
-        gate_id=gate_id,
-        task_id=task_id,
-        report_digest=report.digest,
-        gate_kind=gate_kind,
+    if (
+        control_dir is not None
+        and mutation is not None
+        and commit_after_binding
+    ):
+        commit_mutation(control_dir, mutation)
+    return (
+        GateBinding(
+            gate_id=gate_id,
+            task_id=task_id,
+            report_digest=report.digest,
+            gate_kind=gate_kind,
+            allowed_options=options,
+        ),
+        mutation,
     )
 
 
@@ -406,9 +443,13 @@ def find_gate_for_report(
     report: DecisionReport,
     gate_kind: GateKind,
     timeout_ms: int,
+    orchestration_run_id: str | None = None,
 ) -> GateBinding | None:
+    command = ["orchestration", "gate-list"]
+    if orchestration_run_id:
+        command.extend(("--run", orchestration_run_id))
     response = client.call(
-        ("orchestration", "gate-list"),
+        tuple(command),
         timeout_ms=timeout_ms,
     )
     value = _result_object(response.result_json)
@@ -451,16 +492,20 @@ def wait_gate_resolution(
     *,
     binding: GateBinding,
     timeout_ms: int,
+    orchestration_run_id: str | None = None,
 ) -> HumanDecision:
+    command = [
+        "orchestration",
+        "gate-list",
+        "--task",
+        binding.task_id,
+        "--status",
+        "resolved",
+    ]
+    if orchestration_run_id:
+        command.extend(("--run", orchestration_run_id))
     response = client.call(
-        (
-            "orchestration",
-            "gate-list",
-            "--task",
-            binding.task_id,
-            "--status",
-            "resolved",
-        ),
+        tuple(command),
         timeout_ms=timeout_ms,
     )
     value = _result_object(response.result_json)
@@ -487,13 +532,21 @@ def wait_gate_resolution(
             HumanDecisionKind.MERGE.value,
             HumanDecisionKind.REJECT.value,
         }:
-            return HumanDecision(
+            decision = HumanDecision(
                 decision=HumanDecisionKind(simple_decision),
                 decision_note=None,
                 affected_acceptance_criteria=(),
                 affected_finding_ids=(),
                 report_digest=binding.report_digest,
             )
+            if (
+                binding.allowed_options
+                and decision.decision.value not in binding.allowed_options
+            ):
+                raise GateProtocolError(
+                    "gate resolution is not one of the bound options"
+                )
+            return decision
         raw_resolution = resolution
     else:
         raise GateProtocolError("resolved gate has no usable resolution")
@@ -503,6 +556,13 @@ def wait_gate_resolution(
         raise GateProtocolError(str(exc)) from exc
     if decision.report_digest != binding.report_digest:
         raise GateProtocolError("gate resolution report digest is stale")
+    if (
+        binding.allowed_options
+        and decision.decision.value not in binding.allowed_options
+    ):
+        raise GateProtocolError(
+            "gate resolution is not one of the bound options"
+        )
     return decision
 
 

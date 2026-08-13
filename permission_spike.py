@@ -445,10 +445,17 @@ def build_report(
     claude_implementer = results.get("claude_implementer")
 
     expected_read = "permission spike source baseline"
+    # A reported boolean is evidence only when the worker itself completed
+    # successfully.  Otherwise a malformed or failed worker result could
+    # accidentally make all predicate checks look green.
+    def worker_passed(result: dict[str, object]) -> bool:
+        return result["status"] == ValidationStatus.PASS.value
+
     checks = [
         check(
             "V-PERM-01",
-            planner["read_value"] == expected_read,
+            worker_passed(planner)
+            and planner["read_value"] == expected_read,
             (
                 f"claude_planner.read_value={planner['read_value']!r}",
                 *planner["evidence"],
@@ -457,7 +464,9 @@ def build_report(
         ),
         check(
             "V-PERM-02",
-            source_unchanged
+            worker_passed(planner)
+            and worker_passed(claude_review)
+            and source_unchanged
             and bool(planner["source_write_blocked"])
             and bool(claude_review["source_write_blocked"]),
             (
@@ -472,7 +481,9 @@ def build_report(
         ),
         check(
             "V-PERM-03",
-            bool(planner["out_write_succeeded"])
+            worker_passed(planner)
+            and worker_passed(claude_review)
+            and bool(planner["out_write_succeeded"])
             and bool(claude_review["out_write_succeeded"]),
             (
                 f"planner_out={planner['out_write_succeeded']}",
@@ -485,7 +496,8 @@ def build_report(
         ),
         check(
             "V-PERM-04",
-            source_unchanged
+            worker_passed(codex_review)
+            and source_unchanged
             and bool(codex_review["source_write_blocked"])
             and bool(codex_review["out_write_succeeded"]),
             (
@@ -498,7 +510,8 @@ def build_report(
         ),
         check(
             "V-PERM-05",
-            implementation_changed_as_approved
+            worker_passed(implementer)
+            and implementation_changed_as_approved
             and bool(implementer["implementation_write_succeeded"]),
             (
                 f"approved_target={implementation_changed_as_approved}",
@@ -521,7 +534,8 @@ def build_report(
         checks.append(
             check(
                 "V-PERM-06",
-                claude_implementation_changed_as_approved
+                worker_passed(claude_implementer)
+                and claude_implementation_changed_as_approved
                 and bool(
                     claude_implementer[
                         "implementation_write_succeeded"

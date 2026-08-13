@@ -152,7 +152,7 @@ class GateLifecycleTest(unittest.TestCase):
             "digest": digest,
             "finding_ids": (),
         })()
-        binding = create_gate(
+        binding, mutation = create_gate(
             client,
             task_id="task-1",
             report=report,
@@ -161,6 +161,7 @@ class GateLifecycleTest(unittest.TestCase):
             options=("merge", "reject", "revise_code", "revise_design"),
             timeout_ms=1000,
         )
+        self.assertIsNone(mutation)
         decision_value = wait_gate_resolution(
             client,
             binding=binding,

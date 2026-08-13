@@ -6,11 +6,19 @@ import platform
 import shutil
 import signal
 import subprocess
+import uuid
+from dataclasses import replace
 from pathlib import Path
 from typing import Mapping
 
 from .contracts import canonical_json_bytes
-from .models import OrcaResponse
+from .generation import unresolved_mutation, write_mutation
+from .models import (
+    MutationKind,
+    MutationPhase,
+    MutationRecord,
+    OrcaResponse,
+)
 
 
 MAX_ORCA_TIMEOUT_MS = 14_400_000
@@ -171,3 +179,94 @@ class OrcaClient:
             stdout=stdout,
             stderr=stderr,
         )
+
+
+def _mutation_response_id(result_json: str, keys: tuple[str, ...]) -> str | None:
+    try:
+        value = json.loads(result_json)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(value, dict):
+        return None
+    for key in keys:
+        nested = value.get(key)
+        candidate = nested if isinstance(nested, dict) else value
+        for name in ("id", f"{key}Id", f"{key}_id"):
+            found = candidate.get(name)
+            if isinstance(found, str) and found:
+                return found
+    return None
+
+
+def execute_mutation(
+    client: OrcaClient,
+    control_dir: Path,
+    *,
+    kind: MutationKind,
+    argv: tuple[str, ...],
+    timeout_ms: int,
+    run_id: str,
+    generation: int,
+    step_id: str | None = None,
+    external_id_keys: tuple[str, ...] = (),
+) -> tuple[OrcaResponse, MutationRecord]:
+    """Run one Orca mutation so a lost response can never duplicate its effect.
+
+    The durable INTENT is written before the call and the exact same
+    ``--retry-request`` argv is replayed after a crash, so Orca returns the
+    original object instead of creating a second one.  Orca binds the request
+    ID to the first attempt's argv and rejects a mismatched replay, so drifting
+    argv fails closed rather than silently forking state.
+    """
+    if any(item == "--retry-request" for item in argv):
+        raise OrcaCommandError("argv must not carry its own --retry-request")
+
+    pending = unresolved_mutation(control_dir, kind, step_id=step_id)
+    if pending is not None and pending.canonical_argv != argv:
+        raise OrcaCommandError(
+            f"unresolved {kind.value} mutation has different argv; "
+            "resolve it before issuing a new one"
+        )
+    if pending is None:
+        record = MutationRecord(
+            schema_version=1,
+            request_id=str(uuid.uuid4()),
+            kind=kind,
+            phase=MutationPhase.INTENT,
+            run_id=run_id,
+            generation=generation,
+            step_id=step_id,
+            canonical_argv=argv,
+        )
+        write_mutation(control_dir, record)
+    else:
+        record = pending
+
+    full_argv = (*argv, "--retry-request", record.request_id)
+    # A timeout leaves the effect unknown, so the INTENT stays on disk for the
+    # next process to replay rather than being cleared here.
+    response = client.call(full_argv, timeout_ms=timeout_ms)
+
+    external_id = (
+        _mutation_response_id(response.result_json, external_id_keys)
+        if external_id_keys
+        else None
+    )
+    applied = replace(
+        record,
+        phase=MutationPhase.APPLIED,
+        response_json=response.result_json,
+        external_id=external_id,
+    )
+    write_mutation(control_dir, applied)
+    return response, applied
+
+
+def commit_mutation(
+    control_dir: Path,
+    record: MutationRecord,
+) -> MutationRecord:
+    """Close a mutation once its result is durably part of local state."""
+    committed = replace(record, phase=MutationPhase.COMMITTED)
+    write_mutation(control_dir, committed)
+    return committed
