@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import tempfile
 import unittest
 from dataclasses import replace
@@ -11,16 +12,29 @@ from orca_loop.config import (
     PreflightError,
     PreflightResult,
     empty_test_policy,
+    parse_notice_channels,
     parse_run_arguments,
     permission_report_problem,
     prepare_agent_runtime,
 )
 from orca_loop.catalog import load_catalog
 from orca_loop.runspec import build_manifest, copy_request, write_manifest
-from orca_loop.escalation import ensure_user_decision_notice
+from orca_loop.escalation import (
+    ensure_user_decision_notice,
+    write_user_decision_notice_delivery,
+)
 from orca_loop.generation import commit_generation
 from orca_loop.ledger import empty_ledger
-from orca_loop.models import GateBinding, GateKind, LoopState, RunStatus
+from orca_loop.models import (
+    DEFAULT_NOTICE_CHANNELS,
+    GateBinding,
+    GateKind,
+    LoopState,
+    NoticeChannel,
+    NoticeChannelDelivery,
+    RunStatus,
+    UserDecisionNoticeDeliveryStatus,
+)
 from run_loop import (
     _expand_agent_shorthand,
     _resume_argv,
@@ -244,6 +258,132 @@ class StatusReportTest(ResumeArgvTest):
             ["merge", "reject", "revise_design"],
             pending["allowed_options"],
         )
+
+    def test_status_exposes_per_channel_delivery_evidence(self) -> None:
+        binding = GateBinding(
+            gate_id="gate-1",
+            task_id="task-1",
+            report_digest="sha256:" + "d" * 64,
+            gate_kind=GateKind.ESCALATION,
+            allowed_options=("merge", "reject"),
+        )
+        state = replace(
+            initial_state(),
+            state=LoopState.USER_DECISION_REQUIRED,
+            status=RunStatus.BLOCKED,
+            orchestration_run_id="orca-run-1",
+            gate_binding=binding,
+        )
+        commit_generation(self.control, state, empty_ledger("run-1"))
+        pending = ensure_user_decision_notice(
+            self.control,
+            state=state,
+            binding=binding,
+            report_path=self.root / "runs" / "run-1" / "user-decision.md",
+        )
+        write_user_decision_notice_delivery(
+            self.control,
+            request_id=pending.request_id,
+            channels=(
+                NoticeChannelDelivery(
+                    channel=NoticeChannel.OS_TOAST,
+                    status=UserDecisionNoticeDeliveryStatus.FAILED,
+                    attempted_at="2026-08-13T00:00:00+00:00",
+                    detail="toast emission timed out",
+                ),
+                NoticeChannelDelivery(
+                    channel=NoticeChannel.ORCA_BOARD,
+                    status=UserDecisionNoticeDeliveryStatus.DELIVERED,
+                    attempted_at="2026-08-13T00:00:00+00:00",
+                    detail=None,
+                ),
+            ),
+        )
+
+        report = _status_report(self.root, "run-1")
+
+        delivery = report["user_decision_notice_delivery"]
+        assert isinstance(delivery, dict)
+        self.assertEqual(pending.request_id, delivery["request_id"])
+        channels = delivery["channels"]
+        assert isinstance(channels, list)
+        # Channels report in declaration order, not in the order they were written.
+        self.assertEqual(
+            ["ORCA_BOARD", "OS_TOAST"],
+            [item["channel"] for item in channels],
+        )
+        self.assertEqual("FAILED", channels[1]["status"])
+        self.assertEqual("toast emission timed out", channels[1]["detail"])
+        self.assertNotIn("notice_problems", report)
+
+    def test_status_migrates_a_legacy_delivery_record(self) -> None:
+        binding = GateBinding(
+            gate_id="gate-1",
+            task_id="task-1",
+            report_digest="sha256:" + "d" * 64,
+            gate_kind=GateKind.ESCALATION,
+            allowed_options=("merge", "reject"),
+        )
+        state = replace(
+            initial_state(),
+            state=LoopState.USER_DECISION_REQUIRED,
+            status=RunStatus.BLOCKED,
+            orchestration_run_id="orca-run-1",
+            gate_binding=binding,
+        )
+        commit_generation(self.control, state, empty_ledger("run-1"))
+        pending = ensure_user_decision_notice(
+            self.control,
+            state=state,
+            binding=binding,
+            report_path=self.root / "runs" / "run-1" / "user-decision.md",
+        )
+        (self.control / "user-decision-notice-delivery.json").write_text(
+            json.dumps(
+                {
+                    "attempted_at": "2026-08-13T07:39:53.947899+00:00",
+                    "error": None,
+                    "request_id": pending.request_id,
+                    "schema_version": 1,
+                    "status": "DELIVERED",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        report = _status_report(self.root, "run-1")
+
+        delivery = report["user_decision_notice_delivery"]
+        assert isinstance(delivery, dict)
+        self.assertEqual(
+            [{"channel": "ORCA_BOARD", "status": "DELIVERED",
+              "attempted_at": "2026-08-13T07:39:53.947899+00:00",
+              "detail": None}],
+            delivery["channels"],
+        )
+        self.assertNotIn("notice_problems", report)
+
+
+class NoticeChannelConfigTest(unittest.TestCase):
+    def test_default_selection_is_every_channel(self) -> None:
+        self.assertEqual(DEFAULT_NOTICE_CHANNELS, parse_notice_channels(None))
+
+    def test_named_channels_keep_their_order_and_drop_repeats(self) -> None:
+        self.assertEqual(
+            (NoticeChannel.OS_TOAST, NoticeChannel.ORCA_BOARD),
+            parse_notice_channels("os-toast,board,os-toast"),
+        )
+
+    def test_none_disables_every_channel(self) -> None:
+        self.assertEqual((), parse_notice_channels("none"))
+
+    def test_unknown_channel_names_are_rejected(self) -> None:
+        with self.assertRaisesRegex(ConfigurationError, "unknown notice channel"):
+            parse_notice_channels("board,sms")
+
+    def test_empty_channel_names_are_rejected(self) -> None:
+        with self.assertRaisesRegex(ConfigurationError, "must not be empty"):
+            parse_notice_channels("board,,os-toast")
 
 
 class PermissionDiscoveryTest(unittest.TestCase):

@@ -69,8 +69,8 @@ from orca_loop.escalation import (
     read_user_decision_notice_delivery,
     resolve_user_decision_notice,
     wait_gate_resolution,
-    write_user_decision_notice_delivery,
 )
+from orca_loop.notify import NoticeAnnouncer, NoticeTarget
 from orca_loop.generation import (
     AtomicWriteError,
     GenerationError,
@@ -100,6 +100,7 @@ from orca_loop.models import (
     HumanDecisionKind,
     LaunchProfile,
     LoopCounters,
+    NoticeChannel,
     LoopState,
     PlanDocument,
     ResumeDecision,
@@ -117,7 +118,6 @@ from orca_loop.models import (
     TestGateStatus,
     TransitionSignal,
     UserDecisionNotice,
-    UserDecisionNoticeDeliveryStatus,
     WorkerKey,
     WorkerPool,
 )
@@ -1255,42 +1255,18 @@ def _notice_comment(notice: UserDecisionNotice) -> str:
     return " ".join(comment.split())[:500]
 
 
-def _record_worktree_metadata(
+def _notice_target(
     controller: GenerationController,
-    client: OrcaClient,
     *,
-    notice: UserDecisionNotice,
     workspace_status: str,
     comment: str,
-) -> None:
-    """Best-effort Orca board update; durable notice state remains authoritative."""
-    try:
-        client.call(
-            (
-                "worktree",
-                "set",
-                "--worktree",
-                controller.state.worktree_selector,
-                "--workspace-status",
-                workspace_status,
-                "--comment",
-                comment,
-            ),
-            timeout_ms=30_000,
-        )
-    except OrcaCommandError as exc:
-        write_user_decision_notice_delivery(
-            controller.workspace.control_dir,
-            request_id=notice.request_id,
-            status=UserDecisionNoticeDeliveryStatus.FAILED,
-            error=str(exc)[:2000],
-        )
-        return
-    write_user_decision_notice_delivery(
-        controller.workspace.control_dir,
-        request_id=notice.request_id,
-        status=UserDecisionNoticeDeliveryStatus.DELIVERED,
-        error=None,
+) -> NoticeTarget:
+    return NoticeTarget(
+        control_dir=controller.workspace.control_dir,
+        worktree_selector=controller.state.worktree_selector,
+        coordinator_handle=controller.state.coordinator_handle,
+        workspace_status=workspace_status,
+        comment=comment,
     )
 
 
@@ -1299,7 +1275,13 @@ def _publish_user_decision_notice(
     client: OrcaClient,
     *,
     report_path: Path,
+    channels: tuple[NoticeChannel, ...],
 ) -> UserDecisionNotice:
+    """Announce a pending decision once per request across every channel.
+
+    ``_resume_gate`` republishes on every resume, so the announcer's per-channel
+    idempotency is what keeps a long wait from repeatedly stealing focus.
+    """
     binding = controller.state.gate_binding
     if binding is None:
         raise OrcaLoopError("cannot publish a user decision notice without a gate")
@@ -1309,12 +1291,13 @@ def _publish_user_decision_notice(
         binding=binding,
         report_path=report_path,
     )
-    _record_worktree_metadata(
-        controller,
-        client,
-        notice=notice,
-        workspace_status="in-review",
-        comment=_notice_comment(notice),
+    NoticeAnnouncer(client, channels=channels).announce(
+        notice,
+        _notice_target(
+            controller,
+            workspace_status="in-review",
+            comment=_notice_comment(notice),
+        ),
     )
     return notice
 
@@ -1325,6 +1308,7 @@ def _close_user_decision_notice(
     *,
     binding: GateBinding,
 ) -> None:
+    """Settle the board only; re-alerting a decided gate would be noise."""
     notice = resolve_user_decision_notice(
         controller.workspace.control_dir,
         binding=binding,
@@ -1336,15 +1320,17 @@ def _close_user_decision_notice(
         if controller.state.state in {LoopState.READY_FOR_MERGE, LoopState.REJECTED}
         else "in-progress"
     )
-    _record_worktree_metadata(
-        controller,
-        client,
-        notice=notice,
-        workspace_status=workspace_status,
-        comment=(
-            "Orca Loop user decision recorded | "
-            f"run={notice.run_id} | state={controller.state.state.value}"
+    NoticeAnnouncer(client, channels=(NoticeChannel.ORCA_BOARD,)).announce(
+        notice,
+        _notice_target(
+            controller,
+            workspace_status=workspace_status,
+            comment=(
+                "Orca Loop user decision recorded | "
+                f"run={notice.run_id} | state={controller.state.state.value}"
+            ),
         ),
+        force=frozenset({NoticeChannel.ORCA_BOARD}),
     )
 
 
@@ -1411,6 +1397,7 @@ def _ensure_gate(
             controller,
             client,
             report_path=report.path,
+            channels=preflight.arguments.config.notice_channels,
         )
         return
     task_id, task_mutation = _create_decision_task(
@@ -1456,6 +1443,7 @@ def _ensure_gate(
         controller,
         client,
         report_path=report.path,
+        channels=preflight.arguments.config.notice_channels,
     )
 
 
@@ -1471,6 +1459,7 @@ def _resume_gate(
         controller,
         client,
         report_path=controller.workspace.root / "user-decision.md",
+        channels=preflight.arguments.config.notice_channels,
     )
     try:
         decision = wait_gate_resolution(
@@ -2027,11 +2016,22 @@ def _status_report(harness_root: Path, run_id: str) -> dict[str, object]:
                     notice_problems.append(
                         "user decision notice delivery does not match notice"
                     )
+                order = list(NoticeChannel)
                 value["user_decision_notice_delivery"] = {
                     "request_id": delivery.request_id,
-                    "status": delivery.status.value,
                     "attempted_at": delivery.attempted_at,
-                    "error": delivery.error,
+                    "channels": [
+                        {
+                            "channel": record.channel.value,
+                            "status": record.status.value,
+                            "attempted_at": record.attempted_at,
+                            "detail": record.detail,
+                        }
+                        for record in sorted(
+                            delivery.channels,
+                            key=lambda item: order.index(item.channel),
+                        )
+                    ],
                 }
         if notice_problems:
             value["notice_problems"] = notice_problems

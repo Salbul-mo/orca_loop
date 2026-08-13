@@ -194,6 +194,24 @@ class UserDecisionNoticeStatus(StrEnum):
 class UserDecisionNoticeDeliveryStatus(StrEnum):
     DELIVERED = "DELIVERED"
     FAILED = "FAILED"
+    SKIPPED = "SKIPPED"
+
+
+class NoticeChannel(StrEnum):
+    """One operator-facing delivery path for a pending decision notice."""
+
+    ORCA_BOARD = "ORCA_BOARD"
+    ORCA_FILE_OPEN = "ORCA_FILE_OPEN"
+    ORCA_TERMINAL_FOCUS = "ORCA_TERMINAL_FOCUS"
+    OS_TOAST = "OS_TOAST"
+
+
+DEFAULT_NOTICE_CHANNELS: tuple[NoticeChannel, ...] = (
+    NoticeChannel.ORCA_BOARD,
+    NoticeChannel.ORCA_FILE_OPEN,
+    NoticeChannel.ORCA_TERMINAL_FOCUS,
+    NoticeChannel.OS_TOAST,
+)
 
 
 class HumanDecisionKind(StrEnum):
@@ -988,14 +1006,27 @@ class UserDecisionNotice:
 
 
 @dataclass(frozen=True)
+class NoticeChannelDelivery:
+    """Outcome of one best-effort notification channel."""
+
+    channel: NoticeChannel
+    status: UserDecisionNoticeDeliveryStatus
+    attempted_at: str
+    detail: str | None
+
+
+@dataclass(frozen=True)
 class UserDecisionNoticeDelivery:
-    """Best-effort Orca worktree metadata delivery evidence."""
+    """Per-channel best-effort delivery evidence for one pending notice.
+
+    Delivery is advisory.  ``user-decision-request.json`` remains the sole
+    authority for whether a decision is still pending.
+    """
 
     schema_version: int
     request_id: str
-    status: UserDecisionNoticeDeliveryStatus
     attempted_at: str
-    error: str | None
+    channels: tuple[NoticeChannelDelivery, ...]
 
 
 @dataclass(frozen=True)
@@ -1081,3 +1112,4 @@ class LoopConfig:
     max_transition_count: int
     step_timeout_ms: int
     total_timeout_ms: int
+    notice_channels: tuple[NoticeChannel, ...] = DEFAULT_NOTICE_CHANNELS

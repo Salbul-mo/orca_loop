@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections.abc import Sequence
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +32,8 @@ from .models import (
     HumanDecision,
     HumanDecisionKind,
     LoopState,
+    NoticeChannel,
+    NoticeChannelDelivery,
     PlanDocument,
     ScopeManifest,
     Side,
@@ -61,6 +64,8 @@ class GateProtocolError(RuntimeError):
 
 
 USER_DECISION_NOTICE_SCHEMA_VERSION = 1
+USER_DECISION_NOTICE_DELIVERY_SCHEMA_VERSION = 2
+LEGACY_USER_DECISION_NOTICE_DELIVERY_SCHEMA_VERSION = 1
 USER_DECISION_NOTICE_NAME = "user-decision-request.json"
 USER_DECISION_NOTICE_DELIVERY_NAME = "user-decision-notice-delivery.json"
 
@@ -275,31 +280,128 @@ def resolve_user_decision_notice(
     return resolved
 
 
-def _parse_notice_delivery(path: Path) -> UserDecisionNoticeDelivery:
-    value = _strict_notice_object(path)
+def _validated_channel_detail(
+    status: UserDecisionNoticeDeliveryStatus,
+    detail: str | None,
+    channel: NoticeChannel,
+) -> str | None:
+    """Enforce the status/detail pairing shared by the reader and the writer."""
+    if status is UserDecisionNoticeDeliveryStatus.DELIVERED:
+        if detail is not None:
+            raise DecisionReportError(
+                f"delivered notice channel {channel.value} cannot carry detail"
+            )
+        return None
+    if not detail:
+        raise DecisionReportError(
+            f"notice channel {channel.value} in {status.value} requires detail"
+        )
+    return detail
+
+
+def _unique_channels(
+    channels: Sequence[NoticeChannelDelivery],
+) -> tuple[NoticeChannelDelivery, ...]:
+    seen: set[NoticeChannel] = set()
+    for item in channels:
+        if item.channel in seen:
+            raise DecisionReportError(
+                f"duplicate notice channel record: {item.channel.value}"
+            )
+        seen.add(item.channel)
+    return tuple(channels)
+
+
+def _parse_channel_delivery(value: object) -> NoticeChannelDelivery:
+    if not isinstance(value, dict):
+        raise DecisionReportError("notice channel record must be an object")
+    _exact_notice_fields(
+        value,
+        {"channel", "status", "attempted_at", "detail"},
+        "notice channel record",
+    )
+    try:
+        channel = NoticeChannel(value["channel"])
+        status = UserDecisionNoticeDeliveryStatus(value["status"])
+    except (TypeError, ValueError) as exc:
+        raise DecisionReportError("notice channel record has invalid enum") from exc
+    return NoticeChannelDelivery(
+        channel=channel,
+        status=status,
+        attempted_at=_notice_timestamp(value["attempted_at"], "attempted_at"),
+        detail=_validated_channel_detail(
+            status,
+            _notice_string(value["detail"], "detail", allow_none=True),
+            channel,
+        ),
+    )
+
+
+def _migrated_legacy_delivery(
+    value: dict[str, object],
+) -> UserDecisionNoticeDelivery:
+    """Promote a schema 1 flat record into a single ``ORCA_BOARD`` channel.
+
+    Schema 1 predates multi-channel delivery and only ever described the
+    ``worktree set`` board update, so that is the channel it maps onto.
+    """
     _exact_notice_fields(
         value,
         {"schema_version", "request_id", "status", "attempted_at", "error"},
         "user decision notice delivery",
     )
-    if value["schema_version"] != USER_DECISION_NOTICE_SCHEMA_VERSION:
-        raise DecisionReportError("unsupported user decision notice delivery schema")
     try:
         status = UserDecisionNoticeDeliveryStatus(value["status"])
     except (TypeError, ValueError) as exc:
-        raise DecisionReportError("user decision notice delivery has invalid status") from exc
+        raise DecisionReportError(
+            "user decision notice delivery has invalid status"
+        ) from exc
+    if status is UserDecisionNoticeDeliveryStatus.SKIPPED:
+        raise DecisionReportError("legacy notice delivery cannot be SKIPPED")
     attempted_at = _notice_timestamp(value["attempted_at"], "attempted_at")
     error = _notice_string(value["error"], "error", allow_none=True)
-    if status is UserDecisionNoticeDeliveryStatus.DELIVERED and error is not None:
-        raise DecisionReportError("delivered user decision notice has error")
-    if status is UserDecisionNoticeDeliveryStatus.FAILED and error is None:
-        raise DecisionReportError("failed user decision notice lacks error")
+    detail = (
+        None
+        if status is UserDecisionNoticeDeliveryStatus.DELIVERED
+        else (error or "legacy delivery failure")
+    )
     return UserDecisionNoticeDelivery(
-        schema_version=USER_DECISION_NOTICE_SCHEMA_VERSION,
+        schema_version=USER_DECISION_NOTICE_DELIVERY_SCHEMA_VERSION,
         request_id=_notice_string(value["request_id"], "request_id") or "",
-        status=status,
         attempted_at=attempted_at,
-        error=error,
+        channels=(
+            NoticeChannelDelivery(
+                channel=NoticeChannel.ORCA_BOARD,
+                status=status,
+                attempted_at=attempted_at,
+                detail=detail,
+            ),
+        ),
+    )
+
+
+def _parse_notice_delivery(path: Path) -> UserDecisionNoticeDelivery:
+    value = _strict_notice_object(path)
+    version = value.get("schema_version")
+    if version == LEGACY_USER_DECISION_NOTICE_DELIVERY_SCHEMA_VERSION:
+        return _migrated_legacy_delivery(value)
+    if version != USER_DECISION_NOTICE_DELIVERY_SCHEMA_VERSION:
+        raise DecisionReportError("unsupported user decision notice delivery schema")
+    _exact_notice_fields(
+        value,
+        {"schema_version", "request_id", "attempted_at", "channels"},
+        "user decision notice delivery",
+    )
+    raw_channels = value["channels"]
+    if not isinstance(raw_channels, list):
+        raise DecisionReportError("notice delivery channels must be an array")
+    return UserDecisionNoticeDelivery(
+        schema_version=USER_DECISION_NOTICE_DELIVERY_SCHEMA_VERSION,
+        request_id=_notice_string(value["request_id"], "request_id") or "",
+        attempted_at=_notice_timestamp(value["attempted_at"], "attempted_at"),
+        channels=_unique_channels(
+            [_parse_channel_delivery(item) for item in raw_channels]
+        ),
     )
 
 
@@ -314,21 +416,28 @@ def write_user_decision_notice_delivery(
     control_dir: Path,
     *,
     request_id: str,
-    status: UserDecisionNoticeDeliveryStatus,
-    error: str | None,
+    channels: Sequence[NoticeChannelDelivery],
 ) -> UserDecisionNoticeDelivery:
     if not request_id:
         raise DecisionReportError("user decision notice delivery requires request_id")
-    if status is UserDecisionNoticeDeliveryStatus.DELIVERED and error is not None:
-        raise DecisionReportError("delivered user decision notice cannot contain error")
-    if status is UserDecisionNoticeDeliveryStatus.FAILED and not error:
-        raise DecisionReportError("failed user decision notice requires error")
+    validated = _unique_channels(
+        [
+            replace(
+                item,
+                detail=_validated_channel_detail(
+                    item.status,
+                    item.detail,
+                    item.channel,
+                ),
+            )
+            for item in channels
+        ]
+    )
     delivery = UserDecisionNoticeDelivery(
-        schema_version=USER_DECISION_NOTICE_SCHEMA_VERSION,
+        schema_version=USER_DECISION_NOTICE_DELIVERY_SCHEMA_VERSION,
         request_id=request_id,
-        status=status,
         attempted_at=_utc_now(),
-        error=error,
+        channels=validated,
     )
     _write_notice(_notice_delivery_path(control_dir), delivery)
     return delivery

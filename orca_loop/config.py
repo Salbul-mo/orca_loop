@@ -9,7 +9,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, Sequence, TextIO
+from typing import Callable, Mapping, Sequence, TextIO
 
 from .catalog import (
     AgentCatalog,
@@ -44,7 +44,9 @@ from .models import (
     AgentProvider,
     AgentRuntimeConfig,
     AgentRuntimeOptions,
+    DEFAULT_NOTICE_CHANNELS,
     LoopConfig,
+    NoticeChannel,
     PermissionFeasibilityReport,
     PermissionStrategy,
     TestExecutionPolicy,
@@ -821,6 +823,40 @@ def load_test_policy(path: Path | None) -> TestExecutionPolicy:
     return parse_test_policy(raw)
 
 
+NOTICE_CHANNEL_ALIASES: Mapping[str, NoticeChannel] = {
+    "board": NoticeChannel.ORCA_BOARD,
+    "file-open": NoticeChannel.ORCA_FILE_OPEN,
+    "terminal-focus": NoticeChannel.ORCA_TERMINAL_FOCUS,
+    "os-toast": NoticeChannel.OS_TOAST,
+}
+
+
+def parse_notice_channels(value: str | None) -> tuple[NoticeChannel, ...]:
+    """Resolve the ``--notice-channels`` flag into an ordered channel tuple."""
+    if value is None:
+        return DEFAULT_NOTICE_CHANNELS
+    normalized = value.strip().lower()
+    if normalized == "none":
+        return ()
+    selected: list[NoticeChannel] = []
+    for token in normalized.split(","):
+        name = token.strip()
+        if not name:
+            raise ConfigurationError(
+                "notice channel names must not be empty; "
+                f"valid names are {sorted(NOTICE_CHANNEL_ALIASES)} or none"
+            )
+        channel = NOTICE_CHANNEL_ALIASES.get(name)
+        if channel is None:
+            raise ConfigurationError(
+                f"unknown notice channel: {name}; "
+                f"valid names are {sorted(NOTICE_CHANNEL_ALIASES)} or none"
+            )
+        if channel not in selected:
+            selected.append(channel)
+    return tuple(selected)
+
+
 def validate_loop_config(config: LoopConfig) -> LoopConfig:
     if not config.worktree_path.is_absolute():
         raise ConfigurationError("worktree_path must be absolute")
@@ -828,6 +864,8 @@ def validate_loop_config(config: LoopConfig) -> LoopConfig:
         raise ConfigurationError("request_path must be absolute")
     if not config.coordinator_handle:
         raise ConfigurationError("coordinator_handle must be nonempty")
+    if len(set(config.notice_channels)) != len(config.notice_channels):
+        raise ConfigurationError("notice_channels must not repeat a channel")
     if config.plan_consensus_round_limit != 5:
         raise ConfigurationError(
             "plan_consensus_round_limit must remain the approved value 5"
@@ -941,6 +979,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_TOTAL_TIMEOUT_MS,
     )
+    parser.add_argument(
+        "--notice-channels",
+        help=(
+            "Comma-separated user decision notification channels: "
+            f"{', '.join(sorted(NOTICE_CHANNEL_ALIASES))}, or none. "
+            "Defaults to every channel."
+        ),
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
@@ -1001,6 +1047,9 @@ def parse_run_arguments(
             max_transition_count=namespace.max_transition_count,
             step_timeout_ms=namespace.step_timeout_ms,
             total_timeout_ms=namespace.total_timeout_ms,
+            notice_channels=parse_notice_channels(
+                getattr(namespace, "notice_channels", None)
+            ),
         )
     )
     return RunArguments(

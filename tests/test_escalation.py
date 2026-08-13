@@ -33,6 +33,8 @@ from orca_loop.models import (
     GateBinding,
     GateKind,
     HumanDecision,
+    NoticeChannel,
+    NoticeChannelDelivery,
     HumanDecisionKind,
     LoopCounters,
     LoopState,
@@ -120,20 +122,121 @@ class UserDecisionNoticeTest(unittest.TestCase):
             delivery = write_user_decision_notice_delivery(
                 control,
                 request_id="notice-1",
-                status=UserDecisionNoticeDeliveryStatus.DELIVERED,
-                error=None,
+                channels=(
+                    NoticeChannelDelivery(
+                        channel=NoticeChannel.ORCA_BOARD,
+                        status=UserDecisionNoticeDeliveryStatus.DELIVERED,
+                        attempted_at="2026-08-13T00:00:00+00:00",
+                        detail=None,
+                    ),
+                    NoticeChannelDelivery(
+                        channel=NoticeChannel.OS_TOAST,
+                        status=UserDecisionNoticeDeliveryStatus.SKIPPED,
+                        attempted_at="2026-08-13T00:00:00+00:00",
+                        detail="platform does not support OS toast",
+                    ),
+                ),
             )
+            self.assertEqual(2, len(delivery.channels))
             self.assertEqual(
                 delivery,
                 read_user_decision_notice_delivery(control),
             )
-            with self.assertRaisesRegex(Exception, "requires error"):
+            with self.assertRaisesRegex(Exception, "requires detail"):
                 write_user_decision_notice_delivery(
                     control,
                     request_id="notice-1",
-                    status=UserDecisionNoticeDeliveryStatus.FAILED,
-                    error=None,
+                    channels=(
+                        NoticeChannelDelivery(
+                            channel=NoticeChannel.ORCA_BOARD,
+                            status=UserDecisionNoticeDeliveryStatus.FAILED,
+                            attempted_at="2026-08-13T00:00:00+00:00",
+                            detail=None,
+                        ),
+                    ),
                 )
+            with self.assertRaisesRegex(Exception, "duplicate notice channel"):
+                write_user_decision_notice_delivery(
+                    control,
+                    request_id="notice-1",
+                    channels=(
+                        NoticeChannelDelivery(
+                            channel=NoticeChannel.ORCA_BOARD,
+                            status=UserDecisionNoticeDeliveryStatus.DELIVERED,
+                            attempted_at="2026-08-13T00:00:00+00:00",
+                            detail=None,
+                        ),
+                        NoticeChannelDelivery(
+                            channel=NoticeChannel.ORCA_BOARD,
+                            status=UserDecisionNoticeDeliveryStatus.DELIVERED,
+                            attempted_at="2026-08-13T00:00:00+00:00",
+                            detail=None,
+                        ),
+                    ),
+                )
+
+    def test_legacy_delivery_record_migrates_to_the_board_channel(self) -> None:
+        """Schema 1 files exist on disk, so the reader must promote them."""
+        with tempfile.TemporaryDirectory() as directory:
+            control = Path(directory).resolve()
+            (control / "user-decision-notice-delivery.json").write_text(
+                json.dumps(
+                    {
+                        "attempted_at": "2026-08-13T07:39:53.947899+00:00",
+                        "error": None,
+                        "request_id": "notice-c45f93eaef1a23c72bdc02b8",
+                        "schema_version": 1,
+                        "status": "DELIVERED",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            delivery = read_user_decision_notice_delivery(control)
+
+            self.assertIsNotNone(delivery)
+            assert delivery is not None
+            self.assertEqual(2, delivery.schema_version)
+            self.assertEqual("notice-c45f93eaef1a23c72bdc02b8", delivery.request_id)
+            self.assertEqual(1, len(delivery.channels))
+            channel = delivery.channels[0]
+            self.assertEqual(NoticeChannel.ORCA_BOARD, channel.channel)
+            self.assertEqual(
+                UserDecisionNoticeDeliveryStatus.DELIVERED,
+                channel.status,
+            )
+            self.assertIsNone(channel.detail)
+
+    def test_legacy_failed_delivery_keeps_its_error_as_detail(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            control = Path(directory).resolve()
+            (control / "user-decision-notice-delivery.json").write_text(
+                json.dumps(
+                    {
+                        "attempted_at": "2026-08-13T07:39:53.947899+00:00",
+                        "error": "metadata unavailable",
+                        "request_id": "notice-1",
+                        "schema_version": 1,
+                        "status": "FAILED",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            delivery = read_user_decision_notice_delivery(control)
+
+            assert delivery is not None
+            self.assertEqual("metadata unavailable", delivery.channels[0].detail)
+
+    def test_unsupported_delivery_schema_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            control = Path(directory).resolve()
+            (control / "user-decision-notice-delivery.json").write_text(
+                json.dumps({"schema_version": 3}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(Exception, "unsupported"):
+                read_user_decision_notice_delivery(control)
 
 
 def ledger_with_unresolved(evidence_path: str) -> ConsensusLedger:
