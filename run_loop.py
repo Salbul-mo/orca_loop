@@ -938,11 +938,38 @@ def _profile_root(
 ) -> Path:
     if role is Role.IMPLEMENTER:
         return preflight.arguments.config.worktree_path
-    return prepare_readonly_mirror(
+    review_root = _readonly_mirror_root(
         preflight.arguments.config.worktree_path,
         controller.workspace.review_dir,
+        controller.state.run_id,
+    )
+    return prepare_readonly_mirror(
+        preflight.arguments.config.worktree_path,
+        review_root,
         controller.state.generation + 1,
     )
+
+
+def _readonly_mirror_root(
+    worktree: Path,
+    preferred_root: Path,
+    run_id: str,
+) -> Path:
+    """Choose a mirror parent that can never be nested in its source.
+
+    Normal runs store reviewer mirrors under the harness run directory.  When
+    the harness documents or reviews itself, that directory is inside the
+    target worktree and ``prepare_readonly_mirror`` correctly refuses it.
+    Keep that guard intact and relocate only this self-target case to a stable
+    sibling directory keyed by the durable run ID.
+    """
+    source = worktree.resolve()
+    candidate = preferred_root.resolve()
+    try:
+        candidate.relative_to(source)
+    except ValueError:
+        return candidate
+    return source.parent / ".orca-loop-review" / run_id
 
 
 def _execute_worker(

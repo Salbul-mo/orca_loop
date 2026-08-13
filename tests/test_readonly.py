@@ -7,9 +7,24 @@ import unittest
 from pathlib import Path
 
 from orca_loop.readonly import ReadOnlyMirrorError, prepare_readonly_mirror
+from run_loop import _readonly_mirror_root
 
 
 class ReadOnlyMirrorTest(unittest.TestCase):
+    def test_self_target_uses_an_external_mirror_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            target = root / "harness"
+            target.mkdir()
+            preferred = target / "runs" / "run-1" / "review"
+
+            result = _readonly_mirror_root(target, preferred, "run-1")
+
+            self.assertEqual(
+                root / ".orca-loop-review" / "run-1",
+                result,
+            )
+
     def test_mirror_excludes_git_runs_and_copies_source(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
