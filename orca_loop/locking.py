@@ -77,6 +77,75 @@ def pid_alive(pid: int) -> bool:
     return True
 
 
+# 100-nanosecond intervals between the Windows FILETIME epoch (1601-01-01) and
+# the Unix epoch, used to bring GetProcessTimes onto time.time_ns()'s scale.
+_FILETIME_EPOCH_DELTA_100NS = 116_444_736_000_000_000
+
+# A lock is written moments after its owner starts, but the two clocks are read
+# through different APIs.  Only treat the owner as a different process when it
+# started comfortably after the lock was recorded.
+PID_REUSE_TOLERANCE_NS = 2_000_000_000
+
+
+def process_started_at_ns(pid: int) -> int | None:
+    """Return the process creation time, or ``None`` when it is unknowable.
+
+    Only Windows is answered precisely here.  Every other platform returns
+    ``None`` so the caller falls back to bare liveness rather than acting on a
+    guess.
+    """
+    if pid <= 0 or os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle = kernel32.OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION,
+        False,
+        pid,
+    )
+    if not handle:
+        return None
+    try:
+        creation = wintypes.FILETIME()
+        exited = wintypes.FILETIME()
+        kernel = wintypes.FILETIME()
+        user = wintypes.FILETIME()
+        ok = kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(creation),
+            ctypes.byref(exited),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        )
+    finally:
+        kernel32.CloseHandle(handle)
+    if not ok:
+        return None
+    filetime = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+    return (filetime - _FILETIME_EPOCH_DELTA_100NS) * 100
+
+
+def _owner_alive(pid: int | None, started_at_ns: int | None) -> bool:
+    """Judge lock ownership, treating a reused PID as a dead owner.
+
+    ``pid_alive`` alone cannot tell the original coordinator from an unrelated
+    process that later inherited its PID, which would strand the lock forever.
+    """
+    if pid is None:
+        return True
+    if not pid_alive(pid):
+        return False
+    if started_at_ns is None:
+        return True
+    owner_started = process_started_at_ns(pid)
+    if owner_started is None:
+        return True
+    return owner_started <= started_at_ns + PID_REUSE_TOLERANCE_NS
+
+
 def inspect_lock(harness_root: Path, worktree: Path) -> LockInfo | None:
     """Describe the lock currently held for ``worktree``, if any."""
     path = lock_path(harness_root, worktree)
@@ -103,8 +172,13 @@ def inspect_lock(harness_root: Path, worktree: Path) -> LockInfo | None:
     raw_pid = value.get("pid")
     pid = raw_pid if isinstance(raw_pid, int) and not isinstance(raw_pid, bool) else None
     started = value.get("started_at_ns")
-    if isinstance(started, int) and not isinstance(started, bool):
-        age = max(0.0, (time.time_ns() - started) / 1_000_000_000)
+    started_at_ns = (
+        started
+        if isinstance(started, int) and not isinstance(started, bool)
+        else None
+    )
+    if started_at_ns is not None:
+        age = max(0.0, (time.time_ns() - started_at_ns) / 1_000_000_000)
     else:
         try:
             age = max(0.0, time.time() - path.stat().st_mtime)
@@ -117,7 +191,7 @@ def inspect_lock(harness_root: Path, worktree: Path) -> LockInfo | None:
         readable=True,
         run_id=run_id if isinstance(run_id, str) else None,
         pid=pid,
-        alive=True if pid is None else pid_alive(pid),
+        alive=_owner_alive(pid, started_at_ns),
         age_seconds=age,
         worktree=(
             worktree_value if isinstance(worktree_value, str) else None

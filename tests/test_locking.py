@@ -7,14 +7,17 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from orca_loop.locking import (
     LockInfo,
     RunLockError,
+    _owner_alive,
     acquire_run_lock,
     inspect_lock,
     lock_path,
     pid_alive,
+    process_started_at_ns,
     release_run_lock,
 )
 
@@ -37,6 +40,88 @@ class PidLivenessTest(unittest.TestCase):
 
     def test_exited_process_is_not_alive(self) -> None:
         self.assertFalse(pid_alive(_dead_pid()))
+
+
+class ProcessIdentityTest(unittest.TestCase):
+    def test_this_process_reports_a_plausible_start_time(self) -> None:
+        import os
+
+        started = process_started_at_ns(os.getpid())
+
+        if os.name != "nt":
+            self.assertIsNone(started)
+            return
+        self.assertIsNotNone(started)
+        assert started is not None
+        self.assertGreater(started, 0)
+        self.assertLessEqual(started, time.time_ns())
+
+    def test_a_live_owner_that_predates_its_lock_is_still_the_owner(self) -> None:
+        import os
+
+        lock_written = time.time_ns()
+        with mock.patch(
+            "orca_loop.locking.process_started_at_ns",
+            return_value=lock_written - 5_000_000_000,
+        ):
+            self.assertTrue(_owner_alive(os.getpid(), lock_written))
+
+    def test_an_owner_started_after_its_lock_is_a_reused_pid(self) -> None:
+        import os
+
+        lock_written = time.time_ns()
+        with mock.patch(
+            "orca_loop.locking.process_started_at_ns",
+            return_value=lock_written + 60_000_000_000,
+        ):
+            self.assertFalse(_owner_alive(os.getpid(), lock_written))
+
+    def test_unknowable_start_time_keeps_the_conservative_answer(self) -> None:
+        """Refusing a run is safe; allowing two coordinators is not."""
+        import os
+
+        with mock.patch(
+            "orca_loop.locking.process_started_at_ns",
+            return_value=None,
+        ):
+            self.assertTrue(_owner_alive(os.getpid(), time.time_ns()))
+
+    def test_a_dead_pid_stays_dead_regardless_of_start_time(self) -> None:
+        self.assertFalse(_owner_alive(_dead_pid(), time.time_ns()))
+
+    def test_inspect_lock_reports_a_reused_pid_as_not_alive(self) -> None:
+        import os
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            worktree = root / "tree"
+            worktree.mkdir()
+            path = lock_path(root, worktree)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            lock_written = time.time_ns()
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "token": "t",
+                        "run_id": "run-1",
+                        "pid": os.getpid(),
+                        "started_at_ns": lock_written,
+                        "worktree": str(worktree),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch(
+                "orca_loop.locking.process_started_at_ns",
+                return_value=lock_written + 60_000_000_000,
+            ):
+                info = inspect_lock(root, worktree)
+
+            self.assertIsNotNone(info)
+            assert info is not None
+            self.assertFalse(info.alive)
 
     def test_non_positive_pid_is_not_alive(self) -> None:
         self.assertFalse(pid_alive(0))
