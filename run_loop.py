@@ -74,6 +74,7 @@ from orca_loop.notify import NoticeAnnouncer, NoticeTarget
 from orca_loop.failure import (
     FORCE_FAIL_EVENT_KIND,
     STOP_REASON_LIMIT,
+    BudgetExhausted,
     StopClass,
     StopEvent,
     classify_stop,
@@ -1601,15 +1602,10 @@ def _run_loop(
     transitions = 0
     while transitions < config.max_transition_count:
         if (time.monotonic() - started) * 1000 >= config.total_timeout_ms:
-            controller.commit(
-                stage=StepStage.TRANSITION_COMMITTED,
-                active=None,
-                reason="total coordinator timeout exceeded",
-                signal=SignalKind.ABORT,
-                state_value=LoopState.FAILED,
-                status=RunStatus.FAILED,
+            return _stop_for_budget(
+                controller,
+                "total coordinator timeout exceeded",
             )
-            return controller.state
         state = controller.state.state
         if state in {LoopState.HUMAN_GATE, LoopState.USER_DECISION_REQUIRED}:
             if controller.state.gate_binding is not None:
@@ -1718,15 +1714,36 @@ def _run_loop(
             )
             commit_step_transition(controller, retry, config)
             transitions += 1
-    controller.commit(
+    return _stop_for_budget(controller, "maximum transition count exceeded")
+
+
+def _stop_for_budget(
+    controller: GenerationController,
+    reason: str,
+) -> CoordinatorState:
+    """Stop the run because this process ran out of budget, not because it broke.
+
+    The budget bounds one coordinator process; a run that merely took longer
+    than that is still sound work in progress, so it keeps its state and stays
+    resumable. The active step is preserved rather than cleared, so a resume
+    still fences whatever worker was bound to it.
+    """
+    state = controller.commit(
         stage=StepStage.TRANSITION_COMMITTED,
-        active=None,
-        reason="maximum transition count exceeded",
-        signal=SignalKind.ABORT,
-        state_value=LoopState.FAILED,
-        status=RunStatus.FAILED,
+        active=controller.state.active,
+        reason=reason,
+        signal=SignalKind.OPERATIONAL_RETRY,
+        status=RunStatus.BLOCKED,
     )
-    return controller.state
+    record_stop_event(
+        controller.workspace.control_dir,
+        exc=BudgetExhausted(reason),
+        classification=StopClass.INTERRUPTED,
+        generation=state.generation,
+        state=state.state,
+        state_committed=True,
+    )
+    return state
 
 
 def run_coordinator(

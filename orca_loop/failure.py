@@ -37,6 +37,14 @@ FORCE_FAIL_EVENT_KIND = "force_failed"
 STOP_REASON_LIMIT = 2_000
 
 
+class BudgetExhausted(RuntimeError):
+    """Raised in name only when a run outlives its time or transition budget.
+
+    Running long is not a broken contract, so this classifies as interrupted
+    and the run stays resumable. The budget still bounds a single process.
+    """
+
+
 class StopClass(StrEnum):
     """Whether a stopped run can be resumed, and whether it can be retried."""
 

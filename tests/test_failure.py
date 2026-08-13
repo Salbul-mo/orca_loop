@@ -21,6 +21,7 @@ from orca_loop.failure import (
     STOP_EVENT_KIND,
     STOP_REASON_LIMIT,
     TERMINAL_EXCEPTIONS,
+    BudgetExhausted,
     StopClass,
     classify_stop,
     read_latest_stop_event,
@@ -34,7 +35,7 @@ from orca_loop.generation import (
 from orca_loop.guards import GuardPathBoundaryError, GuardScopeViolationError
 from orca_loop.ledger import InvalidRoundError, LedgerIntegrityError
 from orca_loop.locking import RunLockError
-from orca_loop.models import LoopState
+from orca_loop.models import LoopState, RunStatus
 from orca_loop.notify import NoticeDeliveryError
 from orca_loop.orca_client import (
     OrcaCommandError,
@@ -438,6 +439,74 @@ class OuterBoundaryTest(unittest.TestCase):
             self.assertEqual("ReadOnlyMirrorError", event.exception)
             self.assertEqual(-1, event.generation)
             self.assertEqual(INTERRUPTED, event.classification)
+
+
+class BudgetStopTest(unittest.TestCase):
+    """Exhausting the budget stops the process, not the run."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.control = Path(self.temporary.name).resolve() / "control"
+        self.control.mkdir(parents=True)
+
+    def stop(self, active: object = None):
+        import run_loop
+
+        controller = mock.Mock()
+        controller.workspace.control_dir = self.control
+        controller.state.active = active
+        committed = mock.Mock()
+        committed.generation = 9
+        committed.state = LoopState.IMPLEMENT
+        controller.commit.return_value = committed
+        result = run_loop._stop_for_budget(controller, "budget spent")
+        return controller, result
+
+    def test_the_run_is_blocked_rather_than_failed(self) -> None:
+        controller, _ = self.stop()
+
+        kwargs = controller.commit.call_args.kwargs
+        self.assertEqual(RunStatus.BLOCKED, kwargs["status"])
+        # No state_value: running long does not change what the run was doing.
+        self.assertNotIn("state_value", kwargs)
+
+    def test_the_active_step_is_preserved_for_fencing(self) -> None:
+        """Clearing it would let a resume re-dispatch alongside a live worker."""
+        active = object()
+
+        controller, _ = self.stop(active=active)
+
+        self.assertIs(active, controller.commit.call_args.kwargs["active"])
+
+    def test_the_stop_is_recorded_as_resumable(self) -> None:
+        self.stop()
+
+        event = read_latest_stop_event(self.control)
+        assert event is not None
+        self.assertEqual("BudgetExhausted", event.exception)
+        self.assertEqual(INTERRUPTED, event.classification)
+        self.assertTrue(event.resumable)
+        self.assertTrue(event.state_committed)
+        self.assertEqual(9, event.generation)
+
+    def test_budget_exhaustion_classifies_as_interrupted(self) -> None:
+        self.assertEqual(
+            INTERRUPTED,
+            classify_stop(BudgetExhausted("total coordinator timeout exceeded")),
+        )
+
+    def test_a_budget_stop_asks_for_a_human_rather_than_reporting_a_crash(
+        self,
+    ) -> None:
+        import run_loop
+        from dataclasses import replace
+
+        from tests.test_coordinator import initial_state
+
+        blocked = replace(initial_state(), status=RunStatus.BLOCKED)
+
+        self.assertEqual(run_loop.EXIT_USER_REQUIRED, run_loop.exit_code(blocked))
 
 
 class RetryRoutingTest(unittest.TestCase):
