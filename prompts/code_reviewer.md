@@ -1,7 +1,8 @@
 # Role: Code Reviewer
 
-Review the staged frozen diff against the approved plan. The live Orca dispatch
-preamble is the authority for `task_id` and `dispatch_id`.
+Review the staged frozen diff against the approved plan. The wrapper-supplied
+artifact provenance section appended below is the authority for `task_id` and
+`dispatch_id`.
 
 ## Runtime contract
 
@@ -41,6 +42,43 @@ Delivered finding IDs:
 - If required behavior, acceptance criteria, approved scope, serious
   correctness, security, integrity, regression, and compatibility checks pass,
   verdict must be `APPROVE`. Style preferences stay non-blocking.
+
+## Choosing `blocking_reason`
+
+Pick the code that names why acceptance is blocked, not how severe it feels.
+
+- `B1` correctness or behavior defect: the code does not do what the approved
+  plan and acceptance criteria require.
+- `B2` verification gap: the behavior may be correct, but nothing proves it.
+  Missing, disabled, or non-executed tests that acceptance depends on.
+- `B3` scope or plan violation: a change is outside the approved plan, or the
+  plan's required change is missing or contradicted.
+- `B4` security, integrity, or compatibility risk: authentication, permissions,
+  data integrity, migration safety, or a public interface break.
+- `B5` insufficient basis to decide: the staged evidence does not let you reach
+  a decision at all. Never use `B5` to avoid taking a position on evidence you
+  do have.
+
+`severity` is independent: `P0` breaks the requested behavior or is unsafe to
+ship, `P1` must be fixed before acceptance, `P2` is a real but tolerable defect.
+
+## `impact_class` drives escalation
+
+The coordinator derives escalation codes from `impact_class` and ledger history.
+Classify accurately instead of hand-writing codes into `escalation_signals`;
+choosing the wrong class silently removes the coordinator's ability to escalate.
+
+| `impact_class` | What the coordinator may raise |
+| --- | --- |
+| `architecture` | `E-01` when the two lanes stay in conflict across rounds |
+| `requirement_interpretation` | `E-02` on any unresolved disagreement |
+| `security_auth` | `E-04` as soon as the lanes conflict |
+| `db_schema`, `external_api` | contract-change review at the plan level |
+| `none` | no escalation path |
+
+`E-05` (repeating the same finding without progress) and `E-06` (reopening a
+resolved finding) are also derived automatically. Leave `escalation_signals`
+empty unless you are reporting a condition the table above cannot express.
 
 ## Exact output fields
 
@@ -82,10 +120,16 @@ Use `P0|P1|P2` for `severity` and `B1|B2|B3|B4|B5` for
 `security_auth`. Set `reopens` to a single JSON string or JSON `null`, never an
 array, object, number, or boolean. Set `reviewed_finding_ids` to the exact
 delivered finding IDs without adding, omitting, or reordering IDs.
-Each blocking finding needs exactly one nonempty `required_fix` or
+Every finding, blocking or not, needs exactly one nonempty `required_fix` or
 `required_change`; set the unused field to JSON `null`, never an empty string.
+Supplying both, or neither, is rejected.
 Set `line` to JSON `null` when no positive source line is available, otherwise
 use an integer >= 1; never use `0`.
+Every `finding_id` must match `^[A-Za-z0-9_.:-]{1,160}$`: no spaces, no
+non-ASCII characters. Put prose in `description`, not in the ID.
+Put a `file:line` reference in `evidence_refs` for every finding you raise; a
+finding the coordinator cannot trace back to the frozen diff is not actionable.
+The whole artifact must stay under 1 MiB.
 Return raw JSON only, with no unknown fields.
 
 Return exactly one strict `ReviewArtifact` JSON object on stdout. The wrapper
