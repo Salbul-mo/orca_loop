@@ -891,7 +891,8 @@ def wait_gate_resolution(
     binding: GateBinding,
     timeout_ms: int,
     orchestration_run_id: str | None = None,
-) -> HumanDecision:
+) -> HumanDecision | None:
+    """Read the bound gate's decision, or ``None`` while it is still pending."""
     command = [
         "orchestration",
         "gate-list",
@@ -917,9 +918,15 @@ def wait_gate_resolution(
         and _first_string(item, "id", "gateId", "gate_id")
         == binding.gate_id
     ]
+    if not matches:
+        # Not an error: the operator has simply not decided yet.  Returning
+        # None keeps a pending gate distinguishable from a gate whose identity
+        # is ambiguous, which must never be mistaken for "still waiting".
+        return None
     if len(matches) != 1:
         raise GateProtocolError(
-            "expected exactly one resolved gate for the binding"
+            f"expected at most one resolved gate for the binding, "
+            f"found {len(matches)}"
         )
     resolution = matches[0].get("resolution")
     if isinstance(resolution, dict):

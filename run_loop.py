@@ -1461,17 +1461,14 @@ def _resume_gate(
         report_path=controller.workspace.root / "user-decision.md",
         channels=preflight.arguments.config.notice_channels,
     )
-    try:
-        decision = wait_gate_resolution(
-            client,
-            binding=binding,
-            timeout_ms=30_000,
-            orchestration_run_id=controller.state.orchestration_run_id,
-        )
-    except GateProtocolError as exc:
-        if "exactly one resolved gate" in str(exc):
-            return False
-        raise
+    decision = wait_gate_resolution(
+        client,
+        binding=binding,
+        timeout_ms=30_000,
+        orchestration_run_id=controller.state.orchestration_run_id,
+    )
+    if decision is None:
+        return False
     if controller.state.state is LoopState.HUMAN_GATE:
         result = execute_human_gate(
             controller.ledger,

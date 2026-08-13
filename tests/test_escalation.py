@@ -445,6 +445,35 @@ class GateLifecycleTest(unittest.TestCase):
                 timeout_ms=1000,
             )
 
+    def test_unresolved_gate_reads_as_pending_rather_than_an_error(self) -> None:
+        client = FakeOrcaClient(lambda _argv, _timeout: {"gates": []})
+
+        decision_value = wait_gate_resolution(
+            client,
+            binding=create_binding("sha256:" + "d" * 64),
+            timeout_ms=1000,
+        )
+
+        self.assertIsNone(decision_value)
+
+    def test_ambiguous_gate_identity_is_not_mistaken_for_pending(self) -> None:
+        """Two resolved gates for one binding must surface, not read as waiting."""
+        client = FakeOrcaClient(
+            lambda _argv, _timeout: {
+                "gates": [
+                    {"id": "gate-1", "resolution": "merge"},
+                    {"id": "gate-1", "resolution": "reject"},
+                ]
+            }
+        )
+
+        with self.assertRaisesRegex(GateProtocolError, "found 2"):
+            wait_gate_resolution(
+                client,
+                binding=create_binding("sha256:" + "d" * 64),
+                timeout_ms=1000,
+            )
+
     def test_simple_terminal_gate_options_use_bound_report_digest(self) -> None:
         digest = "sha256:" + "d" * 64
         binding = create_binding(digest)
