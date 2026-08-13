@@ -42,7 +42,6 @@ class EvidenceTestCase(unittest.TestCase):
             "worker_handle": "term-worker",
             "orca_executable": "orca",
             "timeout_ms": 10_000,
-            "preamble": "unused",
             "log_dir": str(self.logs),
             "step_id": "g0004-plan",
         }

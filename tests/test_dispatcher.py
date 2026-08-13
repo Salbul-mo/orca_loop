@@ -491,7 +491,6 @@ class WorkerRunnerExtractionTest(unittest.TestCase):
                 "worker_handle": "term-worker",
                 "orca_executable": "orca",
                 "timeout_ms": 10_000,
-                "preamble": "agent must send worker_done",
             }
             captured_input: list[bytes] = []
 
@@ -547,7 +546,6 @@ class WorkerRunnerExtractionTest(unittest.TestCase):
                 "worker_handle": "term-worker",
                 "orca_executable": "orca",
                 "timeout_ms": 10_000,
-                "preamble": "unused",
             }
             with patch("worker_runner.subprocess.Popen", return_value=process):
                 with patch("worker_runner._send") as send:
@@ -588,7 +586,6 @@ class WorkerRunnerExtractionTest(unittest.TestCase):
                 "worker_handle": "term-worker",
                 "orca_executable": "orca",
                 "timeout_ms": 10_000,
-                "preamble": "unused",
             }
             with patch("worker_runner.subprocess.Popen", return_value=process):
                 with patch("worker_runner._send"):
@@ -722,7 +719,6 @@ class WorkerRunnerExtractionTest(unittest.TestCase):
                 "worker_handle": "term-worker",
                 "orca_executable": "orca",
                 "timeout_ms": 10_000,
-                "preamble": "unused",
                 "log_dir": str(root / "logs"),
                 "step_id": "g0001-plan",
                 "orchestration_run_id": "run-orca-1",

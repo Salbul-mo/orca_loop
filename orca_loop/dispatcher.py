@@ -395,9 +395,14 @@ def prepare_task(
     )
 
 
-def _dispatch_value(
-    result: Mapping[str, object],
-) -> tuple[str, str]:
+def _dispatch_value(result: Mapping[str, object]) -> str:
+    """Read the Dispatch ID.
+
+    ``--return-preamble`` stays on the dispatch argv because the journalled
+    mutation replays that exact argv, but the preamble itself is not consumed:
+    this harness dispatches without ``--inject`` and delivers the contract over
+    the runner's stdin, so the wrapper owns lifecycle signalling.
+    """
     dispatch = result.get("dispatch")
     if not isinstance(dispatch, dict):
         raise DispatchProvenanceError(
@@ -406,10 +411,7 @@ def _dispatch_value(
     dispatch_id = dispatch.get("id")
     if not isinstance(dispatch_id, str) or not dispatch_id:
         raise DispatchProvenanceError("dispatch ID is missing")
-    preamble = result.get("preamble", "")
-    if not isinstance(preamble, str):
-        preamble = ""
-    return dispatch_id, preamble
+    return dispatch_id
 
 
 def _powershell_quote(value: str) -> str:
@@ -689,7 +691,7 @@ def dispatch_and_wait(
         step_id=step.step_id,
         external_id_keys=("dispatch",),
     )
-    dispatch_id, preamble = _dispatch_value(_result(response))
+    dispatch_id = _dispatch_value(_result(response))
     handle = DispatchHandle(
         step_id=prepared.step_id,
         task_id=prepared.task_id,
@@ -726,7 +728,6 @@ def dispatch_and_wait(
         "worker_handle": prepared.worker.terminal_handle,
         "orca_executable": orca_executable,
         "timeout_ms": step_timeout_ms,
-        "preamble": preamble,
         # runs/<run-id>/logs; the runner persists the agent command line and
         # both output streams there whatever the exit code turns out to be.
         "log_dir": str((step.root.parents[1] / "logs").resolve()),

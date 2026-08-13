@@ -355,7 +355,6 @@ def _load_job(encoded: str) -> dict[str, object]:
         "worker_handle",
         "orca_executable",
         "timeout_ms",
-        "preamble",
         "log_dir",
         "step_id",
         "orchestration_run_id",
