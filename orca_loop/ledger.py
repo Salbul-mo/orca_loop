@@ -6,6 +6,7 @@ import unicodedata
 from dataclasses import replace
 
 from .models import (
+    BlockingReason,
     ConsensusKind,
     ConsensusLedger,
     DecisionValue,
@@ -605,6 +606,23 @@ def commit_round(
                     ),
                 )
             )
+        if (
+            record.finding.blocking_reason is BlockingReason.B5
+            and len(history) >= 2
+        ):
+            escalations.append(
+                EscalationTrigger(
+                    code=EscalationCode.E05,
+                    reason=(
+                        "reviewer reported insufficient basis to decide "
+                        "in two valid rounds"
+                    ),
+                    evidence_refs=record.finding.evidence_refs,
+                    deduplication_key=(
+                        f"E-05:B5:{record.finding.finding_id}"
+                    ),
+                )
+            )
         if record.finding.impact_class is ImpactClass.REQUIREMENT_INTERPRETATION:
             escalations.append(
                 EscalationTrigger(
@@ -628,7 +646,10 @@ def commit_round(
                 )
             )
         if (
-            record.finding.impact_class is ImpactClass.SECURITY_AUTH
+            (
+                record.finding.impact_class is ImpactClass.SECURITY_AUTH
+                or record.finding.blocking_reason is BlockingReason.B4
+            )
             and _conflicting_sides(record, next_round)
         ):
             escalations.append(
@@ -637,6 +658,21 @@ def commit_round(
                     reason="security or authentication policy disagreement",
                     evidence_refs=record.finding.evidence_refs,
                     deduplication_key=f"E-04:{record.finding.finding_id}",
+                )
+            )
+        if record.finding.impact_class in {
+            ImpactClass.DB_SCHEMA,
+            ImpactClass.EXTERNAL_API,
+        }:
+            escalations.append(
+                EscalationTrigger(
+                    code=EscalationCode.E03,
+                    reason=(
+                        "data, API, or schema contract change requires "
+                        "user approval"
+                    ),
+                    evidence_refs=record.finding.evidence_refs,
+                    deduplication_key=f"E-03:{record.finding.finding_id}",
                 )
             )
         records.append(current_record)

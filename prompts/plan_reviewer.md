@@ -75,8 +75,12 @@ Pick the code that names why the plan cannot be approved as written.
   work the request requires.
 - `B4` security, integrity, or compatibility risk: authentication, permissions,
   data integrity, migration safety, or a public interface break.
+  A `B4` finding reaches the user as `E-04` as soon as the two lanes disagree
+  about it, whatever `impact_class` you assigned.
 - `B5` insufficient basis to decide: the document is too incomplete to judge.
-  This is the code for gaps you must not fill by designing.
+  This is the code for gaps you must not fill by designing. The planner gets one
+  revision to close the gap; a `B5` finding still unresolved after a second valid
+  round reaches the user as `E-05`, whether or not you reworded it.
 
 `severity` is independent: `P0` makes the plan unsafe to implement, `P1` must be
 fixed before approval, `P2` is a real but tolerable weakness.
@@ -98,9 +102,11 @@ the wrong class silently removes the coordinator's ability to escalate.
 A plan whose `data_api_schema_changes` is non-empty, or whose `affected_files`
 contain `delete` or `rename`, already routes to a user approval gate. Do not
 block such a plan merely because it needs approval; judge it on its merits.
-`E-05` (no progress across rounds) and `E-06` (reopened finding) are derived
-automatically. Leave `escalation_signals` empty unless you are reporting a
-condition the table above cannot express.
+`E-03` fires on the finding alone, with no disagreement required: a contract
+change is something the user approves, not something the two lanes settle.
+`E-05` (no progress across rounds, or a `B5` that survives two rounds) and
+`E-06` (reopened finding) are derived automatically. Leave `escalation_signals`
+empty unless you are reporting a condition the table above cannot express.
 
 ## Exact output fields
 
@@ -151,6 +157,8 @@ Every `finding_id` must match `^[A-Za-z0-9_.:-]{1,160}$`: no spaces, no
 non-ASCII characters. Put prose in `description`, not in the ID.
 Cite the plan section, or the `file:line` you read to disprove a claim, in
 `evidence_refs` for every finding you raise.
+A finding with both `acceptance_criteria_ids` and `evidence_refs` empty is
+rejected and the whole artifact is returned to you.
 The whole artifact must stay under 1 MiB.
 Return raw JSON only, with no unknown fields.
 

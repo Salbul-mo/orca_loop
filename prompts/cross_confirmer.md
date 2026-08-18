@@ -51,10 +51,14 @@ Pick the code that names why acceptance is blocked, not how severe it feels.
 - `B2` verification gap: the behavior may be correct, but nothing proves it.
 - `B3` scope or plan violation: a change is outside the approved plan, or the
   plan's required change is missing or contradicted.
-- `B4` security, integrity, or compatibility risk.
+- `B4` security, integrity, or compatibility risk. A `B4` finding reaches the
+  user as `E-04` as soon as the two lanes disagree about it, whatever
+  `impact_class` you assigned.
 - `B5` insufficient basis to decide. You share the prior reviewer's frozen diff
   and snapshot, so `B5` means the staged evidence itself is inadequate, never
-  that you chose not to look.
+  that you chose not to look. A `B5` finding still unresolved after a second
+  valid round reaches the user as `E-05`, whether or not you reworded it —
+  revising the code cannot supply evidence you were never given.
 
 `severity` is independent: `P0` breaks the requested behavior or is unsafe to
 ship, `P1` must be fixed before acceptance, `P2` is a real but tolerable defect.
@@ -69,15 +73,18 @@ Classify accurately instead of hand-writing codes into `escalation_signals`.
 | `architecture` | `E-01` when the two lanes stay in conflict across rounds |
 | `requirement_interpretation` | `E-02` on any unresolved disagreement |
 | `security_auth` | `E-04` as soon as the lanes conflict |
-| `db_schema`, `external_api` | contract-change review at the plan level |
+| `db_schema`, `external_api` | `E-03` user approval for the contract change |
 | `none` | no escalation path |
 
 Your lane is `CODEX`. A conflict between your decision and the prior `CLAUDE`
 decision on the same finding is what makes `E-01` and `E-04` reachable, so
 record a genuine disagreement rather than softening it into a suggestion.
-`E-05` (no progress across rounds) and `E-06` (reopened finding) are derived
-automatically. Leave `escalation_signals` empty unless you are reporting a
-condition the table above cannot express.
+`E-03` is the exception: it fires on the finding alone, with no disagreement
+required, because a contract change is something the user approves rather than
+something the two lanes settle.
+`E-05` (no progress across rounds, or a `B5` that survives two rounds) and
+`E-06` (reopened finding) are derived automatically. Leave `escalation_signals`
+empty unless you are reporting a condition the table above cannot express.
 
 ## Exact output fields
 
@@ -127,6 +134,8 @@ use an integer >= 1; never use `0`.
 Every `finding_id` must match `^[A-Za-z0-9_.:-]{1,160}$`: no spaces, no
 non-ASCII characters. Put prose in `description`, not in the ID.
 Put a `file:line` reference in `evidence_refs` for every finding you raise.
+A finding with both `acceptance_criteria_ids` and `evidence_refs` empty is
+rejected and the whole artifact is returned to you.
 The whole artifact must stay under 1 MiB.
 Return raw JSON only, with no unknown fields.
 

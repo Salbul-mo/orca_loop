@@ -870,6 +870,14 @@ def _parse_finding(value: object, context: str) -> Finding:
         raise ContractViolationError(
             f"{context} must have exactly one required action"
         )
+    grounds = _strings(
+        raw["acceptance_criteria_ids"],
+        f"{context}.acceptance_criteria_ids",
+    ) + _strings(raw["evidence_refs"], f"{context}.evidence_refs")
+    if not grounds:
+        raise ContractViolationError(
+            f"{context} must cite acceptance_criteria_ids or evidence_refs"
+        )
     line_value = raw["line"]
     line = (
         None

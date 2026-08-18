@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 
 from orca_loop.ledger import (
     apply_review_artifact,
@@ -13,12 +14,15 @@ from orca_loop.models import (
     BlockingReason,
     CodeReviewVerdict,
     ConsensusKind,
+    ConsensusLedger,
     DecisionValue,
+    EscalationCode,
     Finding,
     FindingDecision,
     FindingRecord,
     FindingStatus,
     ImpactClass,
+    LedgerUpdate,
     PlanReviewVerdict,
     ReviewArtifact,
     Role,
@@ -36,15 +40,18 @@ def finding(
     finding_id: str = "F-1",
     *,
     depends_on: tuple[str, ...] = (),
+    blocking_reason: BlockingReason = BlockingReason.B1,
+    impact_class: ImpactClass = ImpactClass.NONE,
+    root_cause: str = "The state transition is missing.",
 ) -> Finding:
     return Finding(
         finding_id=finding_id,
         severity=Severity.P1,
-        blocking_reason=BlockingReason.B1,
-        impact_class=ImpactClass.NONE,
+        blocking_reason=blocking_reason,
+        impact_class=impact_class,
         file="src/example.py",
         line=1,
-        root_cause="The state transition is missing.",
+        root_cause=root_cause,
         description="The requested transition is not implemented.",
         required_fix="Implement the transition.",
         required_change=None,
@@ -116,6 +123,69 @@ def review(
             True if kind is ArtifactKind.CROSS_REVIEW else None
         ),
     )
+
+
+def commit_plan(ledger: ConsensusLedger, round_value: int) -> LedgerUpdate:
+    return commit_round(
+        ledger,
+        RoundEvidence(
+            ConsensusKind.PLAN,
+            round_value,
+            1,
+            None,
+            (DIGEST_A, DIGEST_B),
+            False,
+            True,
+        ),
+        plan_limit=5,
+        code_limit=5,
+        expected_plan_version=1,
+    )
+
+
+def opened_ledger(
+    item: Finding,
+    *,
+    claude_decision: DecisionValue | None = None,
+) -> ConsensusLedger:
+    ledger = apply_review_artifact(
+        empty_ledger("run-1"),
+        review(
+            side=Side.CODEX,
+            findings=(item,),
+            decisions=(
+                decision(
+                    item.finding_id,
+                    Side.CODEX,
+                    DecisionValue.CHANGE_REQUIRED,
+                    1,
+                ),
+            ),
+        ),
+        Side.CODEX,
+    ).ledger
+    if claude_decision is None:
+        return ledger
+    return apply_review_artifact(
+        ledger,
+        review(
+            side=Side.CLAUDE,
+            reviewed=(item.finding_id,),
+            decisions=(
+                decision(
+                    item.finding_id,
+                    Side.CLAUDE,
+                    claude_decision,
+                    1,
+                ),
+            ),
+        ),
+        Side.CLAUDE,
+    ).ledger
+
+
+def keys(update: LedgerUpdate) -> tuple[str, ...]:
+    return tuple(item.deduplication_key for item in update.escalations)
 
 
 class LedgerLifecycleTest(unittest.TestCase):
@@ -269,6 +339,90 @@ class LedgerLifecycleTest(unittest.TestCase):
         scope = unresolved_scope(ledger)
         self.assertEqual(("F-A",), scope.finding_ids)
         self.assertEqual(("AC-1",), scope.acceptance_criteria_ids)
+
+
+class LedgerEscalationTest(unittest.TestCase):
+    def test_b5_finding_escalates_after_two_rounds(self) -> None:
+        ledger = opened_ledger(finding(blocking_reason=BlockingReason.B5))
+        first = commit_plan(ledger, 1)
+        self.assertTrue(first.committed_round)
+        self.assertNotIn("E-05:B5:F-1", keys(first))
+        second = commit_plan(first.ledger, 2)
+        self.assertIn("E-05:B5:F-1", keys(second))
+        self.assertEqual(
+            {EscalationCode.E05},
+            {item.code for item in second.escalations},
+        )
+
+    def test_b5_escalation_survives_root_cause_rewording(self) -> None:
+        ledger = opened_ledger(finding(blocking_reason=BlockingReason.B5))
+        first = commit_plan(ledger, 1)
+        record = first.ledger.findings[0]
+        reworded = replace(
+            first.ledger,
+            findings=(
+                replace(
+                    record,
+                    finding=replace(
+                        record.finding,
+                        root_cause=(
+                            "Still undecidable, now for another reason."
+                        ),
+                    ),
+                ),
+            ),
+        )
+        second = commit_plan(reworded, 2)
+        self.assertEqual(("E-05:B5:F-1",), keys(second))
+
+    def test_b1_finding_does_not_trigger_b5_escalation(self) -> None:
+        first = commit_plan(opened_ledger(finding()), 1)
+        second = commit_plan(first.ledger, 2)
+        self.assertNotIn("E-05:B5:F-1", keys(second))
+        self.assertTrue(
+            any(item.startswith("E-05:F-1:") for item in keys(second))
+        )
+
+    def test_b4_finding_escalates_e04_without_security_impact_class(
+        self,
+    ) -> None:
+        ledger = opened_ledger(
+            finding(blocking_reason=BlockingReason.B4),
+            claude_decision=DecisionValue.APPROVE,
+        )
+        update = commit_plan(ledger, 1)
+        self.assertEqual(("E-04:F-1",), keys(update))
+        self.assertEqual(
+            ImpactClass.NONE,
+            update.ledger.findings[0].finding.impact_class,
+        )
+
+    def test_b4_finding_without_conflict_does_not_escalate(self) -> None:
+        ledger = opened_ledger(
+            finding(blocking_reason=BlockingReason.B4),
+            claude_decision=DecisionValue.CHANGE_REQUIRED,
+        )
+        self.assertEqual((), keys(commit_plan(ledger, 1)))
+
+    def test_security_auth_escalation_is_unchanged(self) -> None:
+        ledger = opened_ledger(
+            finding(impact_class=ImpactClass.SECURITY_AUTH),
+            claude_decision=DecisionValue.APPROVE,
+        )
+        self.assertEqual(("E-04:F-1",), keys(commit_plan(ledger, 1)))
+
+    def test_contract_impact_class_escalates_e03(self) -> None:
+        for value in (ImpactClass.DB_SCHEMA, ImpactClass.EXTERNAL_API):
+            with self.subTest(impact_class=value.value):
+                update = commit_plan(
+                    opened_ledger(finding(impact_class=value)),
+                    1,
+                )
+                self.assertEqual(("E-03:F-1",), keys(update))
+                self.assertEqual(
+                    EscalationCode.E03,
+                    update.escalations[0].code,
+                )
 
 
 if __name__ == "__main__":
