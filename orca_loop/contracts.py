@@ -10,7 +10,10 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, TypeVar
 
 from .models import (
+    AcceptanceEvaluation,
     AcceptanceCriterion,
+    AdjudicationArtifact,
+    AdjudicationDecision,
     AddressedFinding,
     AgentAccessMode,
     AgentProvider,
@@ -21,6 +24,9 @@ from .models import (
     AffectedFileOperation,
     ArtifactKind,
     BlockingReason,
+    BlindReviewArtifact,
+    CandidateDecision,
+    CodeReviewRoundContext,
     CodeReviewVerdict,
     DecisionValue,
     EscalationCode,
@@ -28,6 +34,7 @@ from .models import (
     ExpectedProvenance,
     Finding,
     FindingDecision,
+    FileEvaluation,
     HumanDecision,
     HumanDecisionKind,
     ImpactClass,
@@ -39,17 +46,29 @@ from .models import (
     PermissionFeasibilityReport,
     PermissionStrategy,
     PlanDocument,
+    PlanVerification,
+    PlanVerificationCategory,
     PlanReviewVerdict,
     ProviderCapability,
     ReviewArtifact,
+    ReviewComparison,
+    ReviewComparisonStatus,
+    ReviewConflictCandidate,
+    ReviewConflictKind,
+    ReviewLane,
     Role,
     Severity,
     Side,
     TestCommand,
+    TestCommandEvidence,
     TestContract,
+    TestEvidence,
+    TestEvaluation,
     TestExecutionPolicy,
     TestFailureAttribution,
     TestKind,
+    TestGateStatus,
+    TestPolicyViolation,
     ValidationStatus,
     WorkerKey,
     WorkerDonePayload,
@@ -108,6 +127,16 @@ def canonical_json_bytes(value: object) -> bytes:
 
 def digest_value(value: object) -> str:
     return "sha256:" + hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def self_digest(value: Mapping[str, object], field_name: str) -> str:
+    if field_name not in value:
+        raise ContractViolationError(
+            f"self-digested object is missing {field_name}"
+        )
+    digest_input = dict(value)
+    digest_input.pop(field_name)
+    return digest_value(digest_input)
 
 
 def _decode(raw_text: str) -> dict[str, object]:
@@ -999,6 +1028,730 @@ def _parse_informational(
     )
 
 
+def _parse_acceptance_evaluation(
+    value: object,
+    context: str,
+) -> AcceptanceEvaluation:
+    raw = _exact(
+        _object(value, context),
+        {"criterion_id", "decision", "evidence_refs"},
+        context=context,
+    )
+    result = AcceptanceEvaluation(
+        criterion_id=_identifier(raw["criterion_id"], f"{context}.criterion_id"),
+        decision=_enum(DecisionValue, raw["decision"], f"{context}.decision"),
+        evidence_refs=_strings(raw["evidence_refs"], f"{context}.evidence_refs"),
+    )
+    if result.decision is DecisionValue.APPROVE and not result.evidence_refs:
+        raise ContractViolationError(f"{context} APPROVE requires evidence")
+    return result
+
+
+def _parse_file_evaluation(value: object, context: str) -> FileEvaluation:
+    raw = _exact(
+        _object(value, context),
+        {"path", "operation", "rename_from", "decision", "evidence_refs"},
+        context=context,
+    )
+    result = FileEvaluation(
+        path=_string(raw["path"], f"{context}.path"),
+        operation=_enum(
+            AffectedFileOperation,
+            raw["operation"],
+            f"{context}.operation",
+        ),
+        rename_from=_optional_string(raw["rename_from"], f"{context}.rename_from"),
+        decision=_enum(DecisionValue, raw["decision"], f"{context}.decision"),
+        evidence_refs=_strings(raw["evidence_refs"], f"{context}.evidence_refs"),
+    )
+    if result.decision is DecisionValue.APPROVE and not result.evidence_refs:
+        raise ContractViolationError(f"{context} APPROVE requires evidence")
+    return result
+
+
+def _parse_test_evaluation(value: object, context: str) -> TestEvaluation:
+    raw = _exact(
+        _object(value, context),
+        {"test_id", "test_gate_status", "decision", "evidence_refs"},
+        context=context,
+    )
+    status = _enum(
+        TestGateStatus,
+        raw["test_gate_status"],
+        f"{context}.test_gate_status",
+    )
+    if status not in {TestGateStatus.PASS, TestGateStatus.NOT_RUN}:
+        raise ContractViolationError(
+            f"{context}.test_gate_status must be PASS or NOT_RUN"
+        )
+    result = TestEvaluation(
+        test_id=_identifier(raw["test_id"], f"{context}.test_id"),
+        test_gate_status=status,
+        decision=_enum(DecisionValue, raw["decision"], f"{context}.decision"),
+        evidence_refs=_strings(raw["evidence_refs"], f"{context}.evidence_refs"),
+    )
+    if result.decision is DecisionValue.APPROVE and not result.evidence_refs:
+        raise ContractViolationError(f"{context} APPROVE requires evidence")
+    return result
+
+
+def _parse_plan_verification(value: object, context: str) -> PlanVerification:
+    raw = _exact(
+        _object(value, context),
+        {"category", "decision", "evidence_refs"},
+        context=context,
+    )
+    result = PlanVerification(
+        category=_enum(
+            PlanVerificationCategory,
+            raw["category"],
+            f"{context}.category",
+        ),
+        decision=_enum(DecisionValue, raw["decision"], f"{context}.decision"),
+        evidence_refs=_strings(raw["evidence_refs"], f"{context}.evidence_refs"),
+    )
+    if result.decision is DecisionValue.APPROVE and not result.evidence_refs:
+        raise ContractViolationError(f"{context} APPROVE requires evidence")
+    return result
+
+
+def _parse_test_policy_violation(
+    value: object,
+    context: str,
+) -> TestPolicyViolation:
+    raw = _exact(
+        _object(value, context),
+        {"code", "command_index", "detail"},
+        context=context,
+    )
+    index_value = raw["command_index"]
+    return TestPolicyViolation(
+        code=_string(raw["code"], f"{context}.code"),
+        command_index=(
+            None
+            if index_value is None
+            else _integer(index_value, f"{context}.command_index", minimum=0)
+        ),
+        detail=_string(raw["detail"], f"{context}.detail"),
+    )
+
+
+def _parse_test_command_evidence(
+    value: object,
+    context: str,
+) -> TestCommandEvidence:
+    raw = _exact(
+        _object(value, context),
+        {
+            "command_index",
+            "command",
+            "return_code",
+            "timed_out",
+            "stdout_tail_digest",
+            "stderr_tail_digest",
+        },
+        context=context,
+    )
+    return_code = raw["return_code"]
+    return TestCommandEvidence(
+        command_index=_integer(
+            raw["command_index"],
+            f"{context}.command_index",
+            minimum=0,
+        ),
+        command=_parse_test_command(raw["command"], f"{context}.command"),
+        return_code=(
+            None
+            if return_code is None
+            else _integer(return_code, f"{context}.return_code")
+        ),
+        timed_out=_boolean(raw["timed_out"], f"{context}.timed_out"),
+        stdout_tail_digest=_digest(
+            raw["stdout_tail_digest"],
+            f"{context}.stdout_tail_digest",
+        ),
+        stderr_tail_digest=_digest(
+            raw["stderr_tail_digest"],
+            f"{context}.stderr_tail_digest",
+        ),
+    )
+
+
+def parse_test_evidence(raw_text: str) -> TestEvidence:
+    raw = _exact(
+        _strict_json_object(raw_text, "test_evidence"),
+        {
+            "schema_version",
+            "run_id",
+            "plan_version",
+            "consensus_round",
+            "test_gate_status",
+            "test_policy_digest",
+            "commands",
+            "policy_violations",
+            "before_snapshot_digest",
+            "after_snapshot_digest",
+            "authoritative_snapshot_digest",
+            "test_ids",
+            "attribution",
+            "artifact_digest",
+        },
+        context="test_evidence",
+    )
+    _schema(raw, "test_evidence")
+    supplied_digest = _digest(
+        raw["artifact_digest"],
+        "test_evidence.artifact_digest",
+    )
+    if supplied_digest != self_digest(raw, "artifact_digest"):
+        raise ProvenanceError("test evidence self-digest mismatch")
+    status = _enum(
+        TestGateStatus,
+        raw["test_gate_status"],
+        "test_evidence.test_gate_status",
+    )
+    before = _digest(
+        raw["before_snapshot_digest"],
+        "test_evidence.before_snapshot_digest",
+    )
+    after = (
+        None
+        if raw["after_snapshot_digest"] is None
+        else _digest(
+            raw["after_snapshot_digest"],
+            "test_evidence.after_snapshot_digest",
+        )
+    )
+    authoritative = _digest(
+        raw["authoritative_snapshot_digest"],
+        "test_evidence.authoritative_snapshot_digest",
+    )
+    expected_authoritative = after if status is TestGateStatus.PASS else before
+    if status is TestGateStatus.PASS and after is None:
+        raise ContractViolationError("PASS test evidence requires after snapshot")
+    if status is TestGateStatus.NOT_RUN and after is not None:
+        raise ContractViolationError("NOT_RUN test evidence cannot have after snapshot")
+    if authoritative != expected_authoritative:
+        raise ProvenanceError("test evidence authoritative snapshot mismatch")
+    return TestEvidence(
+        schema_version=SCHEMA_VERSION,
+        run_id=_identifier(raw["run_id"], "test_evidence.run_id"),
+        plan_version=_integer(raw["plan_version"], "test_evidence.plan_version", minimum=1),
+        consensus_round=_integer(
+            raw["consensus_round"],
+            "test_evidence.consensus_round",
+            minimum=1,
+        ),
+        test_gate_status=status,
+        test_policy_digest=_digest(
+            raw["test_policy_digest"],
+            "test_evidence.test_policy_digest",
+        ),
+        commands=_tuple(
+            raw["commands"],
+            _parse_test_command_evidence,
+            "test_evidence.commands",
+        ),
+        policy_violations=_tuple(
+            raw["policy_violations"],
+            _parse_test_policy_violation,
+            "test_evidence.policy_violations",
+        ),
+        before_snapshot_digest=before,
+        after_snapshot_digest=after,
+        authoritative_snapshot_digest=authoritative,
+        test_ids=_strings(raw["test_ids"], "test_evidence.test_ids"),
+        attribution=_enum(
+            TestFailureAttribution,
+            raw["attribution"],
+            "test_evidence.attribution",
+        ),
+        artifact_digest=supplied_digest,
+    )
+
+
+def parse_review_context(raw_text: str) -> CodeReviewRoundContext:
+    raw = _exact(
+        _strict_json_object(raw_text, "review_context"),
+        {
+            "schema_version",
+            "run_id",
+            "consensus_round",
+            "plan_version",
+            "snapshot_digest",
+            "implementation_artifact_digest",
+            "test_evidence_digest",
+            "frozen_diff_digest",
+            "scope_manifest_digest",
+            "readonly_mirror_digest",
+            "baseline_finding_ids",
+            "acceptance_criteria_ids",
+            "affected_files",
+            "test_ids",
+            "context_digest",
+        },
+        context="review_context",
+    )
+    _schema(raw, "review_context")
+    supplied_digest = _digest(raw["context_digest"], "review_context.context_digest")
+    if supplied_digest != self_digest(raw, "context_digest"):
+        raise ProvenanceError("review context self-digest mismatch")
+    return CodeReviewRoundContext(
+        schema_version=SCHEMA_VERSION,
+        run_id=_identifier(raw["run_id"], "review_context.run_id"),
+        consensus_round=_integer(
+            raw["consensus_round"],
+            "review_context.consensus_round",
+            minimum=1,
+        ),
+        plan_version=_integer(raw["plan_version"], "review_context.plan_version", minimum=1),
+        snapshot_digest=_digest(raw["snapshot_digest"], "review_context.snapshot_digest"),
+        implementation_artifact_digest=_digest(
+            raw["implementation_artifact_digest"],
+            "review_context.implementation_artifact_digest",
+        ),
+        test_evidence_digest=_digest(
+            raw["test_evidence_digest"],
+            "review_context.test_evidence_digest",
+        ),
+        frozen_diff_digest=_digest(
+            raw["frozen_diff_digest"],
+            "review_context.frozen_diff_digest",
+        ),
+        scope_manifest_digest=_digest(
+            raw["scope_manifest_digest"],
+            "review_context.scope_manifest_digest",
+        ),
+        readonly_mirror_digest=_digest(
+            raw["readonly_mirror_digest"],
+            "review_context.readonly_mirror_digest",
+        ),
+        baseline_finding_ids=_strings(
+            raw["baseline_finding_ids"],
+            "review_context.baseline_finding_ids",
+        ),
+        acceptance_criteria_ids=_strings(
+            raw["acceptance_criteria_ids"],
+            "review_context.acceptance_criteria_ids",
+        ),
+        affected_files=_tuple(
+            raw["affected_files"],
+            _parse_affected,
+            "review_context.affected_files",
+        ),
+        test_ids=_strings(raw["test_ids"], "review_context.test_ids"),
+        context_digest=supplied_digest,
+    )
+
+
+def parse_blind_review_artifact(
+    raw_text: str,
+    expected_kind: ArtifactKind,
+    expected: ExpectedProvenance,
+    *,
+    expected_plan_version: int,
+    expected_context_digest: str,
+    expected_reviewed_artifact_digest: str,
+    delivered_finding_ids: tuple[str, ...],
+    acceptance_criteria_ids: tuple[str, ...],
+    affected_files: tuple[AffectedFile, ...],
+    test_ids: tuple[str, ...],
+    test_gate_status: TestGateStatus,
+) -> BlindReviewArtifact:
+    if expected_kind not in {ArtifactKind.CODE_REVIEW_A, ArtifactKind.CODE_REVIEW_B}:
+        raise ContractViolationError("invalid blind review artifact kind")
+    raw = _exact(
+        _strict_json_object(raw_text, "blind_review"),
+        {
+            "schema_version",
+            "artifact_kind",
+            "run_id",
+            "task_id",
+            "dispatch_id",
+            "consensus_round",
+            "plan_version",
+            "snapshot_digest",
+            "review_context_digest",
+            "role",
+            "lane",
+            "verdict",
+            "reviewed_artifact_digest",
+            "reviewed_finding_ids",
+            "acceptance_evaluations",
+            "file_evaluations",
+            "test_evaluations",
+            "review_summary",
+            "finding_decisions",
+            "findings",
+            "non_blocking_suggestions",
+            "escalation_signals",
+        },
+        context="blind_review",
+    )
+    _schema(raw, "blind_review")
+    _validate_provenance(raw, expected)
+    artifact_kind = _enum(
+        ArtifactKind,
+        raw["artifact_kind"],
+        "blind_review.artifact_kind",
+    )
+    if artifact_kind is not expected_kind:
+        raise ContractViolationError("blind review artifact_kind mismatch")
+    expected_lane = ReviewLane.A if expected_kind is ArtifactKind.CODE_REVIEW_A else ReviewLane.B
+    expected_role = Role.CODE_REVIEWER if expected_lane is ReviewLane.A else Role.CROSS_CONFIRMER
+    lane = _enum(ReviewLane, raw["lane"], "blind_review.lane")
+    role = _enum(Role, raw["role"], "blind_review.role")
+    if lane is not expected_lane or role is not expected_role:
+        raise ContractViolationError("blind review lane, role, and kind mismatch")
+    if raw["plan_version"] != expected_plan_version:
+        raise ProvenanceError("blind review plan version mismatch")
+    context_digest = _digest(
+        raw["review_context_digest"],
+        "blind_review.review_context_digest",
+    )
+    if context_digest != expected_context_digest:
+        raise ProvenanceError("blind review context digest mismatch")
+    reviewed_digest = _digest(
+        raw["reviewed_artifact_digest"],
+        "blind_review.reviewed_artifact_digest",
+    )
+    if reviewed_digest != expected_reviewed_artifact_digest:
+        raise ProvenanceError("blind review implementation digest mismatch")
+    reviewed_ids = _strings(raw["reviewed_finding_ids"], "blind_review.reviewed_finding_ids")
+    if reviewed_ids != delivered_finding_ids:
+        raise ContractViolationError("blind reviewed finding IDs must equal baseline IDs")
+    acceptance = _tuple(
+        raw["acceptance_evaluations"],
+        _parse_acceptance_evaluation,
+        "blind_review.acceptance_evaluations",
+    )
+    if tuple(item.criterion_id for item in acceptance) != acceptance_criteria_ids:
+        raise ContractViolationError("blind acceptance coverage mismatch")
+    files = _tuple(
+        raw["file_evaluations"],
+        _parse_file_evaluation,
+        "blind_review.file_evaluations",
+    )
+    expected_files = tuple((item.path, item.operation, item.rename_from) for item in affected_files)
+    actual_files = tuple((item.path, item.operation, item.rename_from) for item in files)
+    if actual_files != expected_files:
+        raise ContractViolationError("blind file coverage mismatch")
+    tests = _tuple(
+        raw["test_evaluations"],
+        _parse_test_evaluation,
+        "blind_review.test_evaluations",
+    )
+    if tuple(item.test_id for item in tests) != test_ids:
+        raise ContractViolationError("blind test coverage mismatch")
+    if any(item.test_gate_status is not test_gate_status for item in tests):
+        raise ProvenanceError("blind test status does not match test evidence")
+    findings = _tuple(raw["findings"], _parse_finding, "blind_review.findings")
+    uncovered_acceptance = {
+        item.criterion_id
+        for item in acceptance
+        if item.decision is not DecisionValue.APPROVE
+        and not any(
+            item.criterion_id in finding.acceptance_criteria_ids
+            for finding in findings
+        )
+    }
+    uncovered_files = {
+        item.path
+        for item in files
+        if item.decision is not DecisionValue.APPROVE
+        and not any(item.path in finding.affected_files for finding in findings)
+    }
+    uncovered_tests = {
+        item.test_id
+        for item in tests
+        if item.decision is not DecisionValue.APPROVE
+        and not any(item.test_id in finding.test_ids for finding in findings)
+    }
+    if uncovered_acceptance or uncovered_files or uncovered_tests:
+        raise ContractViolationError(
+            "non-approve blind evaluations require actionable findings: "
+            f"acceptance={sorted(uncovered_acceptance)}, "
+            f"files={sorted(uncovered_files)}, tests={sorted(uncovered_tests)}"
+        )
+    decisions = _tuple(
+        raw["finding_decisions"],
+        _parse_decision,
+        "blind_review.finding_decisions",
+    )
+    obligated = set(reviewed_ids) | {item.finding_id for item in findings}
+    decision_ids = {item.finding_id for item in decisions}
+    if decision_ids != obligated or len(decisions) != len(obligated):
+        raise ContractViolationError("blind finding decisions are incomplete or duplicated")
+    expected_side = Side.CLAUDE if lane is ReviewLane.A else Side.CODEX
+    if any(
+        item.side is not expected_side
+        or item.snapshot_digest != expected.snapshot_digest
+        or item.round != expected.consensus_round
+        for item in decisions
+    ):
+        raise ProvenanceError("blind finding decision provenance mismatch")
+    verdict = _enum(CodeReviewVerdict, raw["verdict"], "blind_review.verdict")
+    evaluation_decisions = tuple(item.decision for item in (*acceptance, *files, *tests))
+    blocking = any(item.decision is not DecisionValue.APPROVE for item in decisions)
+    if verdict is CodeReviewVerdict.APPROVE and (
+        findings
+        or blocking
+        or any(item is not DecisionValue.APPROVE for item in evaluation_decisions)
+    ):
+        raise ContractViolationError("blind APPROVE has an unmet approval obligation")
+    if verdict is CodeReviewVerdict.CHANGES_REQUESTED and not (
+        findings
+        or blocking
+        or any(item is not DecisionValue.APPROVE for item in evaluation_decisions)
+    ):
+        raise ContractViolationError("blind changes verdict has no actionable basis")
+    return BlindReviewArtifact(
+        schema_version=SCHEMA_VERSION,
+        artifact_kind=artifact_kind,
+        run_id=_identifier(raw["run_id"], "blind_review.run_id"),
+        task_id=_identifier(raw["task_id"], "blind_review.task_id"),
+        dispatch_id=_identifier(raw["dispatch_id"], "blind_review.dispatch_id"),
+        consensus_round=_integer(raw["consensus_round"], "blind_review.consensus_round", minimum=1),
+        plan_version=_integer(raw["plan_version"], "blind_review.plan_version", minimum=1),
+        snapshot_digest=_digest(raw["snapshot_digest"], "blind_review.snapshot_digest"),
+        review_context_digest=context_digest,
+        role=role,
+        lane=lane,
+        verdict=verdict,
+        reviewed_artifact_digest=reviewed_digest,
+        reviewed_finding_ids=reviewed_ids,
+        acceptance_evaluations=acceptance,
+        file_evaluations=files,
+        test_evaluations=tests,
+        review_summary=_string(raw["review_summary"], "blind_review.review_summary"),
+        finding_decisions=decisions,
+        findings=findings,
+        non_blocking_suggestions=_tuple(
+            raw["non_blocking_suggestions"],
+            _parse_informational,
+            "blind_review.non_blocking_suggestions",
+        ),
+        escalation_signals=_tuple(
+            raw["escalation_signals"],
+            _parse_escalation,
+            "blind_review.escalation_signals",
+        ),
+    )
+
+
+def _parse_review_candidate(value: object, context: str) -> ReviewConflictCandidate:
+    raw = _exact(
+        _object(value, context),
+        {
+            "candidate_id",
+            "kind",
+            "finding_ids",
+            "acceptance_criteria_ids",
+            "affected_files",
+            "test_ids",
+            "blind_a_decision",
+            "blind_b_decision",
+            "normalized_signature",
+            "evidence_refs",
+        },
+        context=context,
+    )
+    return ReviewConflictCandidate(
+        candidate_id=_identifier(raw["candidate_id"], f"{context}.candidate_id"),
+        kind=_enum(ReviewConflictKind, raw["kind"], f"{context}.kind"),
+        finding_ids=_strings(raw["finding_ids"], f"{context}.finding_ids"),
+        acceptance_criteria_ids=_strings(
+            raw["acceptance_criteria_ids"],
+            f"{context}.acceptance_criteria_ids",
+        ),
+        affected_files=_strings(raw["affected_files"], f"{context}.affected_files"),
+        test_ids=_strings(raw["test_ids"], f"{context}.test_ids"),
+        blind_a_decision=(
+            None
+            if raw["blind_a_decision"] is None
+            else _enum(DecisionValue, raw["blind_a_decision"], f"{context}.blind_a_decision")
+        ),
+        blind_b_decision=(
+            None
+            if raw["blind_b_decision"] is None
+            else _enum(DecisionValue, raw["blind_b_decision"], f"{context}.blind_b_decision")
+        ),
+        normalized_signature=_string(
+            raw["normalized_signature"],
+            f"{context}.normalized_signature",
+        ),
+        evidence_refs=_strings(raw["evidence_refs"], f"{context}.evidence_refs"),
+    )
+
+
+def parse_review_comparison(raw_text: str) -> ReviewComparison:
+    raw = _exact(
+        _strict_json_object(raw_text, "review_comparison"),
+        {
+            "schema_version",
+            "run_id",
+            "consensus_round",
+            "snapshot_digest",
+            "review_context_digest",
+            "pre_round_ledger_digest",
+            "blind_a_artifact_digest",
+            "blind_b_artifact_digest",
+            "status",
+            "agreed_finding_ids",
+            "candidates",
+            "comparison_digest",
+        },
+        context="review_comparison",
+    )
+    _schema(raw, "review_comparison")
+    supplied_digest = _digest(raw["comparison_digest"], "review_comparison.comparison_digest")
+    if supplied_digest != self_digest(raw, "comparison_digest"):
+        raise ProvenanceError("review comparison self-digest mismatch")
+    candidates = _tuple(raw["candidates"], _parse_review_candidate, "review_comparison.candidates")
+    candidate_ids = tuple(item.candidate_id for item in candidates)
+    if candidate_ids != tuple(sorted(set(candidate_ids), key=lambda item: item.encode("utf-8"))):
+        raise ContractViolationError("review comparison candidate IDs must be unique and sorted")
+    status = _enum(ReviewComparisonStatus, raw["status"], "review_comparison.status")
+    if (status is ReviewComparisonStatus.AGREED) != (not candidates):
+        raise ContractViolationError("review comparison status conflicts with candidates")
+    return ReviewComparison(
+        schema_version=SCHEMA_VERSION,
+        run_id=_identifier(raw["run_id"], "review_comparison.run_id"),
+        consensus_round=_integer(raw["consensus_round"], "review_comparison.consensus_round", minimum=1),
+        snapshot_digest=_digest(raw["snapshot_digest"], "review_comparison.snapshot_digest"),
+        review_context_digest=_digest(raw["review_context_digest"], "review_comparison.review_context_digest"),
+        pre_round_ledger_digest=_digest(raw["pre_round_ledger_digest"], "review_comparison.pre_round_ledger_digest"),
+        blind_a_artifact_digest=_digest(raw["blind_a_artifact_digest"], "review_comparison.blind_a_artifact_digest"),
+        blind_b_artifact_digest=_digest(raw["blind_b_artifact_digest"], "review_comparison.blind_b_artifact_digest"),
+        status=status,
+        agreed_finding_ids=_strings(raw["agreed_finding_ids"], "review_comparison.agreed_finding_ids"),
+        candidates=candidates,
+        comparison_digest=supplied_digest,
+    )
+
+
+def _parse_candidate_decision(value: object, context: str) -> CandidateDecision:
+    raw = _exact(
+        _object(value, context),
+        {
+            "candidate_id",
+            "decision",
+            "duplicate_of",
+            "root_cause_assessment",
+            "required_action",
+            "evidence_refs",
+        },
+        context=context,
+    )
+    decision = _enum(AdjudicationDecision, raw["decision"], f"{context}.decision")
+    duplicate_of = _optional_string(raw["duplicate_of"], f"{context}.duplicate_of")
+    required_action = _optional_string(raw["required_action"], f"{context}.required_action")
+    evidence = _strings(raw["evidence_refs"], f"{context}.evidence_refs")
+    if not evidence:
+        raise ContractViolationError(f"{context} requires evidence")
+    if decision is AdjudicationDecision.DUPLICATE and duplicate_of is None:
+        raise ContractViolationError(f"{context} DUPLICATE requires duplicate_of")
+    if decision is not AdjudicationDecision.DUPLICATE and duplicate_of is not None:
+        raise ContractViolationError(f"{context} duplicate_of is only valid for DUPLICATE")
+    if decision is AdjudicationDecision.CONFIRM and required_action is None:
+        raise ContractViolationError(f"{context} CONFIRM requires required_action")
+    return CandidateDecision(
+        candidate_id=_identifier(raw["candidate_id"], f"{context}.candidate_id"),
+        decision=decision,
+        duplicate_of=duplicate_of,
+        root_cause_assessment=_string(
+            raw["root_cause_assessment"],
+            f"{context}.root_cause_assessment",
+        ),
+        required_action=required_action,
+        evidence_refs=evidence,
+    )
+
+
+def parse_adjudication_artifact(
+    raw_text: str,
+    expected_kind: ArtifactKind,
+    expected: ExpectedProvenance,
+    *,
+    expected_context_digest: str,
+    comparison: ReviewComparison,
+    valid_duplicate_targets: tuple[str, ...],
+) -> AdjudicationArtifact:
+    if expected_kind not in {
+        ArtifactKind.REVIEW_ADJUDICATION_A,
+        ArtifactKind.REVIEW_ADJUDICATION_B,
+    }:
+        raise ContractViolationError("invalid adjudication artifact kind")
+    raw = _exact(
+        _strict_json_object(raw_text, "adjudication"),
+        {
+            "schema_version",
+            "artifact_kind",
+            "run_id",
+            "task_id",
+            "dispatch_id",
+            "consensus_round",
+            "snapshot_digest",
+            "review_context_digest",
+            "comparison_digest",
+            "role",
+            "lane",
+            "candidate_decisions",
+        },
+        context="adjudication",
+    )
+    _schema(raw, "adjudication")
+    _validate_provenance(raw, expected)
+    artifact_kind = _enum(ArtifactKind, raw["artifact_kind"], "adjudication.artifact_kind")
+    if artifact_kind is not expected_kind:
+        raise ContractViolationError("adjudication artifact_kind mismatch")
+    expected_lane = ReviewLane.A if expected_kind is ArtifactKind.REVIEW_ADJUDICATION_A else ReviewLane.B
+    expected_role = Role.CODE_REVIEWER if expected_lane is ReviewLane.A else Role.CROSS_CONFIRMER
+    lane = _enum(ReviewLane, raw["lane"], "adjudication.lane")
+    role = _enum(Role, raw["role"], "adjudication.role")
+    if lane is not expected_lane or role is not expected_role:
+        raise ContractViolationError("adjudication lane, role, and kind mismatch")
+    context_digest = _digest(raw["review_context_digest"], "adjudication.review_context_digest")
+    if context_digest != expected_context_digest:
+        raise ProvenanceError("adjudication context digest mismatch")
+    comparison_digest = _digest(raw["comparison_digest"], "adjudication.comparison_digest")
+    if comparison_digest != comparison.comparison_digest:
+        raise ProvenanceError("adjudication comparison digest mismatch")
+    decisions = _tuple(
+        raw["candidate_decisions"],
+        _parse_candidate_decision,
+        "adjudication.candidate_decisions",
+    )
+    expected_ids = tuple(item.candidate_id for item in comparison.candidates)
+    if tuple(item.candidate_id for item in decisions) != expected_ids:
+        raise ContractViolationError("adjudication candidate coverage mismatch")
+    allowed_duplicates = set(valid_duplicate_targets) | {
+        finding_id
+        for candidate in comparison.candidates
+        for finding_id in candidate.finding_ids
+    }
+    if any(
+        item.decision is AdjudicationDecision.DUPLICATE
+        and item.duplicate_of not in allowed_duplicates
+        for item in decisions
+    ):
+        raise ContractViolationError("adjudication duplicate target is invalid")
+    return AdjudicationArtifact(
+        schema_version=SCHEMA_VERSION,
+        artifact_kind=artifact_kind,
+        run_id=_identifier(raw["run_id"], "adjudication.run_id"),
+        task_id=_identifier(raw["task_id"], "adjudication.task_id"),
+        dispatch_id=_identifier(raw["dispatch_id"], "adjudication.dispatch_id"),
+        consensus_round=_integer(raw["consensus_round"], "adjudication.consensus_round", minimum=1),
+        snapshot_digest=_digest(raw["snapshot_digest"], "adjudication.snapshot_digest"),
+        review_context_digest=context_digest,
+        comparison_digest=comparison_digest,
+        role=role,
+        lane=lane,
+        candidate_decisions=decisions,
+    )
+
+
 def _validate_provenance(
     raw: Mapping[str, object],
     expected: ExpectedProvenance,
@@ -1025,6 +1778,7 @@ def parse_review_artifact(
     expected: ExpectedProvenance,
     *,
     delivered_finding_ids: tuple[str, ...],
+    require_plan_verifications: bool = False,
 ) -> ReviewArtifact:
     if expected_kind not in {
         ArtifactKind.PLAN_REVIEW,
@@ -1034,27 +1788,39 @@ def parse_review_artifact(
         raise ContractViolationError(
             f"invalid review artifact kind: {expected_kind.value}"
         )
+    decoded = _decode(raw_text)
+    review_fields = {
+        "schema_version",
+        "artifact_kind",
+        "run_id",
+        "task_id",
+        "dispatch_id",
+        "consensus_round",
+        "snapshot_digest",
+        "role",
+        "verdict",
+        "reviewed_plan_version",
+        "reviewed_artifact_digest",
+        "reviewed_finding_ids",
+        "finding_decisions",
+        "findings",
+        "non_blocking_suggestions",
+        "escalation_signals",
+        "agrees_with_reviewer",
+    }
+    if "plan_verifications" in decoded:
+        review_fields.add("plan_verifications")
+    if (
+        expected_kind is ArtifactKind.PLAN_REVIEW
+        and require_plan_verifications
+        and "plan_verifications" not in decoded
+    ):
+        raise ContractViolationError(
+            "new plan review requires plan_verifications"
+        )
     raw = _exact(
-        _decode(raw_text),
-        {
-            "schema_version",
-            "artifact_kind",
-            "run_id",
-            "task_id",
-            "dispatch_id",
-            "consensus_round",
-            "snapshot_digest",
-            "role",
-            "verdict",
-            "reviewed_plan_version",
-            "reviewed_artifact_digest",
-            "reviewed_finding_ids",
-            "finding_decisions",
-            "findings",
-            "non_blocking_suggestions",
-            "escalation_signals",
-            "agrees_with_reviewer",
-        },
+        decoded,
+        review_fields,
         context="review",
     )
     _schema(raw, "review")
@@ -1137,12 +1903,37 @@ def parse_review_artifact(
         item.decision is not DecisionValue.APPROVE
         for item in decisions
     )
-    if approval and (findings or has_blocking_decision):
+    plan_verifications = (
+        _tuple(
+            raw["plan_verifications"],
+            _parse_plan_verification,
+            "review.plan_verifications",
+        )
+        if artifact_kind is ArtifactKind.PLAN_REVIEW
+        and "plan_verifications" in raw
+        else ()
+    )
+    if artifact_kind is ArtifactKind.PLAN_REVIEW and plan_verifications:
+        expected_categories = tuple(PlanVerificationCategory)
+        if tuple(item.category for item in plan_verifications) != expected_categories:
+            raise ContractViolationError(
+                "plan review verification categories must be complete and ordered"
+            )
+    verification_blocking = any(
+        item.decision is not DecisionValue.APPROVE
+        for item in plan_verifications
+    )
+    if approval and (findings or has_blocking_decision or verification_blocking):
         raise ContractViolationError(
             "approval_obligation: APPROVE cannot carry blocking findings "
             "or non-APPROVE decisions"
         )
-    if not approval and not findings and not has_blocking_decision:
+    if (
+        not approval
+        and not findings
+        and not has_blocking_decision
+        and not verification_blocking
+    ):
         raise ContractViolationError(
             "approval_obligation: change verdict requires an actionable "
             "finding or non-APPROVE decision"
@@ -1208,6 +1999,7 @@ def parse_review_artifact(
             "review.escalation_signals",
         ),
         agrees_with_reviewer=agrees,
+        plan_verifications=plan_verifications,
     )
 
 

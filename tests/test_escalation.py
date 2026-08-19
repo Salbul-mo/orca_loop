@@ -13,6 +13,7 @@ from orca_loop.escalation import (
     destructive_gate,
     ensure_user_decision_notice,
     find_gate_for_report,
+    invalidate_user_decision_notice,
     read_user_decision_notice,
     read_user_decision_notice_delivery,
     resolve_user_decision_notice,
@@ -78,6 +79,37 @@ def state() -> CoordinatorState:
 
 
 class UserDecisionNoticeTest(unittest.TestCase):
+    def test_invalidated_notice_cannot_be_resolved_as_a_stale_gate(self) -> None:
+        binding = GateBinding(
+            gate_id="gate-1",
+            task_id="task-1",
+            report_digest="sha256:" + "d" * 64,
+            gate_kind=GateKind.FINAL,
+            allowed_options=("merge", "reject", "revise_code"),
+        )
+        current = replace(
+            state(),
+            orchestration_run_id="orca-run-1",
+            gate_binding=binding,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            control = Path(directory).resolve()
+            ensure_user_decision_notice(
+                control,
+                state=current,
+                binding=binding,
+                report_path=control.parent / "user-decision.md",
+            )
+            invalidated = invalidate_user_decision_notice(
+                control,
+                reason="snapshot drift",
+            )
+            assert invalidated is not None
+            self.assertIs(UserDecisionNoticeStatus.INVALIDATED, invalidated.status)
+            self.assertEqual("snapshot drift", invalidated.invalidation_reason)
+            with self.assertRaisesRegex(Exception, "cannot be resolved"):
+                resolve_user_decision_notice(control, binding=binding)
+
     def test_pending_notice_is_durable_idempotent_and_resolvable(self) -> None:
         binding = GateBinding(
             gate_id="gate-1",

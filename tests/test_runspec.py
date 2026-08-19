@@ -17,6 +17,8 @@ from orca_loop.config import (
 )
 from orca_loop.models import (
     AgentProvider,
+    ConsensusIndependence,
+    ConsensusProviderPolicy,
     PermissionCheck,
     PermissionFeasibilityReport,
     PermissionStrategy,
@@ -141,6 +143,15 @@ class RoundTripTest(ManifestTestCase):
         write_manifest(self.control, manifest)
         loaded = read_manifest(self.control)
         self.assertEqual(manifest, loaded)
+        assert loaded is not None
+        self.assertIs(
+            ConsensusProviderPolicy.DIVERSE,
+            loaded.consensus_provider_policy,
+        )
+        self.assertIs(
+            ConsensusIndependence.FULL,
+            loaded.consensus_independence,
+        )
 
     def test_missing_manifest_returns_none(self) -> None:
         self.assertIsNone(read_manifest(self.control))
@@ -157,7 +168,7 @@ class RoundTripTest(ManifestTestCase):
         manifest = self.build()
         raw = serialize_manifest(manifest).decode("utf-8")
         with self.assertRaises(ManifestError):
-            parse_manifest(raw.replace('"schema_version": 2', '"schema_version": 9'))
+            parse_manifest(raw.replace('"schema_version": 3', '"schema_version": 9'))
 
     def test_legacy_version_one_migrates_without_a_run_id(self) -> None:
         # A run created before the Orca Run ID was persisted must stay
@@ -169,7 +180,24 @@ class RoundTripTest(ManifestTestCase):
         legacy["schema_version"] = 1
         legacy.pop("orchestration_run_id", None)
         migrated = parse_manifest(json.dumps(legacy))
-        self.assertEqual(2, migrated.schema_version)
+        self.assertEqual(3, migrated.schema_version)
+
+    def test_legacy_same_provider_migrates_as_degraded(self) -> None:
+        manifest = self.build()
+        legacy = json.loads(serialize_manifest(manifest).decode("utf-8"))
+        legacy["schema_version"] = 2
+        legacy.pop("consensus_provider_policy")
+        legacy.pop("consensus_independence")
+        legacy["agents"]["claude_code_review"]["provider"] = "codex"
+        migrated = parse_manifest(json.dumps(legacy))
+        self.assertIs(
+            ConsensusProviderPolicy.LEGACY_UNSPECIFIED,
+            migrated.consensus_provider_policy,
+        )
+        self.assertIs(
+            ConsensusIndependence.DEGRADED,
+            migrated.consensus_independence,
+        )
         self.assertIsNone(migrated.orchestration_run_id)
 
     def test_orchestration_run_id_round_trips(self) -> None:

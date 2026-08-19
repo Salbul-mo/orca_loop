@@ -451,6 +451,36 @@ class DriftResumeTest(ResumeHarness):
         self.assertNotEqual(recorded, controller.state.snapshot_digest)
         self.assertEqual(LoopState.IMPLEMENT, controller.state.state)
 
+    def test_validation_state_drift_blocks_then_rolls_back_to_test_gate(self) -> None:
+        self.controller.commit(
+            stage=StepStage.TRANSITION_COMMITTED,
+            active=None,
+            reason="human gate for test",
+            state_value=LoopState.HUMAN_GATE,
+        )
+        self._dirty()
+        with self.assertRaisesRegex(ResumeBlockedError, "cannot be relabeled"):
+            self.resume()
+        controller, _ = self.resume("--accept-worktree-drift")
+        self.assertIs(LoopState.TEST_GATE, controller.state.state)
+        self.assertIsNone(controller.state.pending_review)
+        self.assertIsNone(
+            controller.state.validation_lineage.test_gate_snapshot_digest
+        )
+
+    def test_plan_review_drift_requires_acceptance_and_returns_to_revision(self) -> None:
+        self.controller.commit(
+            stage=StepStage.TRANSITION_COMMITTED,
+            active=None,
+            reason="plan review for test",
+            state_value=LoopState.PLAN_REVIEW,
+        )
+        self._dirty()
+        with self.assertRaises(ResumeBlockedError):
+            self.resume()
+        controller, _ = self.resume("--accept-worktree-drift")
+        self.assertIs(LoopState.PLAN_REVISE, controller.state.state)
+
     def test_unchanged_worktree_does_not_rebaseline(self) -> None:
         recorded = self.controller.state.snapshot_digest
         controller, _ = self.resume()

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import hashlib
+import json
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,7 +24,14 @@ from orca_loop.coordinator import (
     operational_retry_result,
     reconcile_resume,
 )
-from orca_loop.contracts import ContractViolationError
+from orca_loop.contracts import (
+    ContractViolationError,
+    digest_value,
+    parse_review_comparison,
+    parse_review_context,
+    parse_test_evidence,
+    serialize_json,
+)
 from orca_loop.ledger import empty_ledger
 from orca_loop.models import (
     AcceptanceCriterion,
@@ -46,6 +56,7 @@ from orca_loop.models import (
     SignalKind,
     StepStage,
     TestContract,
+    ValidationLineage,
     Violation,
     WorkerHandle,
     WorkerKey,
@@ -53,7 +64,8 @@ from orca_loop.models import (
 from tests.test_ledger import DIGEST_B, review, finding, decision
 from orca_loop.ledger import apply_review_artifact, commit_round
 from orca_loop.models import DecisionValue, Side
-from run_loop import _user_scope
+from run_loop import _qualify_merge, _step_inputs, _user_scope
+from orca_loop.snapshot import capture_snapshot
 
 
 DIGEST_A = "sha256:" + "a" * 64
@@ -225,6 +237,230 @@ def config(root: Path) -> LoopConfig:
 
 
 class CoordinatorCoreTest(unittest.TestCase):
+    def test_blind_b_input_allowlist_excludes_peer_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            artifacts = root / "artifacts"
+            review_dir = root / "review"
+            round_dir = review_dir / "round-1"
+            artifacts.mkdir()
+            round_dir.mkdir(parents=True)
+            request = root / "request.md"
+            request.write_text("request", encoding="utf-8")
+            for name in ("plan.json", "plan_review.json", "implementation.json"):
+                (artifacts / name).write_text("{}\n", encoding="utf-8")
+            (artifacts / "code_review_a.json").write_text("peer\n", encoding="utf-8")
+            (artifacts / "test_evidence.json").write_text("{}\n", encoding="utf-8")
+            (round_dir / "frozen.diff").write_text("diff\n", encoding="utf-8")
+            (round_dir / "scope-manifest.json").write_text("{}\n", encoding="utf-8")
+
+            def file_digest(path: Path) -> str:
+                return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+            context_value = {
+                "schema_version": 1,
+                "run_id": "run-1",
+                "consensus_round": 1,
+                "plan_version": 1,
+                "snapshot_digest": DIGEST_A,
+                "implementation_artifact_digest": file_digest(
+                    artifacts / "implementation.json"
+                ),
+                "test_evidence_digest": file_digest(
+                    artifacts / "test_evidence.json"
+                ),
+                "frozen_diff_digest": file_digest(round_dir / "frozen.diff"),
+                "scope_manifest_digest": file_digest(
+                    round_dir / "scope-manifest.json"
+                ),
+                "readonly_mirror_digest": DIGEST_A,
+                "baseline_finding_ids": [],
+                "acceptance_criteria_ids": [],
+                "affected_files": [],
+                "test_ids": [],
+            }
+            context_value["context_digest"] = digest_value(context_value)
+            context = parse_review_context(json.dumps(context_value))
+            (artifacts / "review_context.json").write_text(
+                serialize_json(context) + "\n",
+                encoding="utf-8",
+            )
+            controller = SimpleNamespace(
+                state=SimpleNamespace(state=LoopState.CODE_REVIEW_B),
+                ledger=SimpleNamespace(code_round=0),
+                workspace=SimpleNamespace(
+                    artifact_dir=artifacts,
+                    review_dir=review_dir,
+                ),
+            )
+            preflight = SimpleNamespace(
+                arguments=SimpleNamespace(
+                    config=SimpleNamespace(request_path=request)
+                )
+            )
+            names = tuple(
+                item.name
+                for item in _step_inputs(
+                    controller,
+                    preflight,
+                    Role.CROSS_CONFIRMER,
+                )
+            )
+            self.assertEqual(
+                (
+                    "request.md",
+                    "plan.json",
+                    "plan_review.json",
+                    "implementation.json",
+                    "test-evidence.json",
+                    "review-context.json",
+                    "frozen.diff",
+                    "scope-manifest.json",
+                ),
+                names,
+            )
+            self.assertNotIn("code_review_a.json", names)
+
+    def test_merge_qualification_rejects_live_snapshot_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            subprocess.run(("git", "init"), cwd=root, check=True, capture_output=True)
+            subprocess.run(
+                ("git", "config", "user.email", "test@example.com"),
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ("git", "config", "user.name", "Test"),
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            (root / "source.txt").write_text("baseline", encoding="utf-8")
+            (root / ".gitignore").write_text("evidence/\n", encoding="utf-8")
+            subprocess.run(
+                ("git", "add", "source.txt", ".gitignore"),
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ("git", "commit", "-m", "fixture"),
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            snapshot = capture_snapshot(root).snapshot_digest
+            artifacts = root / "evidence"
+            artifacts.mkdir()
+            test_value = {
+                "schema_version": 1,
+                "run_id": "run-1",
+                "plan_version": 1,
+                "consensus_round": 1,
+                "test_gate_status": "NOT_RUN",
+                "test_policy_digest": DIGEST_A,
+                "commands": [],
+                "policy_violations": [],
+                "before_snapshot_digest": snapshot,
+                "after_snapshot_digest": None,
+                "authoritative_snapshot_digest": snapshot,
+                "test_ids": [],
+                "attribution": "none",
+            }
+            test_value["artifact_digest"] = digest_value(test_value)
+            test_evidence = parse_test_evidence(json.dumps(test_value))
+            (artifacts / "test_evidence.json").write_text(
+                serialize_json(test_evidence) + "\n",
+                encoding="utf-8",
+            )
+            context_value = {
+                "schema_version": 1,
+                "run_id": "run-1",
+                "consensus_round": 1,
+                "plan_version": 1,
+                "snapshot_digest": snapshot,
+                "implementation_artifact_digest": DIGEST_A,
+                "test_evidence_digest": DIGEST_A,
+                "frozen_diff_digest": DIGEST_A,
+                "scope_manifest_digest": DIGEST_A,
+                "readonly_mirror_digest": DIGEST_A,
+                "baseline_finding_ids": [],
+                "acceptance_criteria_ids": [],
+                "affected_files": [],
+                "test_ids": [],
+            }
+            context_value["context_digest"] = digest_value(context_value)
+            context = parse_review_context(json.dumps(context_value))
+            (artifacts / "review_context.json").write_text(
+                serialize_json(context) + "\n",
+                encoding="utf-8",
+            )
+            blind_digests = []
+            for lane in ("a", "b"):
+                path = artifacts / f"code_review_{lane}.json"
+                path.write_text("{}\n", encoding="utf-8")
+                blind_digests.append(
+                    "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+                )
+            comparison_value = {
+                "schema_version": 1,
+                "run_id": "run-1",
+                "consensus_round": 1,
+                "snapshot_digest": snapshot,
+                "review_context_digest": context.context_digest,
+                "pre_round_ledger_digest": DIGEST_A,
+                "blind_a_artifact_digest": blind_digests[0],
+                "blind_b_artifact_digest": blind_digests[1],
+                "status": "AGREED",
+                "agreed_finding_ids": [],
+                "candidates": [],
+            }
+            comparison_value["comparison_digest"] = digest_value(comparison_value)
+            comparison = parse_review_comparison(json.dumps(comparison_value))
+            (artifacts / "review_comparison.json").write_text(
+                serialize_json(comparison) + "\n",
+                encoding="utf-8",
+            )
+            lineage = ValidationLineage(
+                test_gate_snapshot_digest=snapshot,
+                test_evidence_digest=test_evidence.artifact_digest,
+                review_context_snapshot_digest=snapshot,
+                review_context_digest=context.context_digest,
+                blind_review_a_snapshot_digest=snapshot,
+                blind_review_a_artifact_digest=blind_digests[0],
+                blind_review_b_snapshot_digest=snapshot,
+                blind_review_b_artifact_digest=blind_digests[1],
+                review_comparison_digest=comparison.comparison_digest,
+                consensus_snapshot_digest=snapshot,
+            )
+            controller = SimpleNamespace(
+                state=replace(
+                    initial_state(),
+                    snapshot_digest=snapshot,
+                    validation_lineage=lineage,
+                ),
+                workspace=SimpleNamespace(artifact_dir=artifacts),
+            )
+            self.assertTrue(_qualify_merge(controller, root).qualified)
+            (root / "source.txt").write_text("drift", encoding="utf-8")
+            with self.assertRaisesRegex(Exception, "snapshot lineage"):
+                _qualify_merge(controller, root)
+
+    def test_code_evaluate_only_reads_atomically_committed_round(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger = replace(empty_ledger("run-1"), code_round=1)
+            result = execute_evaluate(
+                state=LoopState.CONSENSUS_EVALUATE,
+                ledger=ledger,
+                evidence=None,
+                config=config(Path(temporary).resolve()),
+                plan=None,
+                destructive_approval=None,
+            )
+            self.assertEqual(1, result.ledger.code_round)
+            self.assertIs(SignalKind.UNRESOLVED_ZERO, result.signal.kind)
+
     def test_merge_decision_delivers_full_approved_plan_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()

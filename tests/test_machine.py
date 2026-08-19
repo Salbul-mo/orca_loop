@@ -77,7 +77,7 @@ class MachineTest(unittest.TestCase):
             LedgerView(0, 0, 0, ()),
             LoopCounters(2, 1),
         )
-        self.assertEqual(LoopState.CODE_REVIEW, result.next_state)
+        self.assertEqual(LoopState.REVIEW_CONTEXT_PREPARE, result.next_state)
         self.assertEqual(LoopCounters(0, 1), result.counters_after)
 
     def test_terminal_state_rejects_input(self) -> None:
@@ -110,10 +110,16 @@ class MachineTest(unittest.TestCase):
                     LoopState.IMPLEMENT,
                     LoopState.FIX,
                     LoopState.PLAN_REVIEW,
-                    LoopState.CODE_REVIEW,
-                    LoopState.CROSS_CONFIRM,
+                    LoopState.CODE_REVIEW_A,
+                    LoopState.CODE_REVIEW_B,
+                    LoopState.ADJUDICATE_A,
+                    LoopState.ADJUDICATE_B,
                 }:
                     kind = SignalKind.ARTIFACT_OK
+                elif state is LoopState.REVIEW_CONTEXT_PREPARE:
+                    kind = SignalKind.CONTEXT_PREPARED
+                elif state is LoopState.REVIEW_COMPARE:
+                    kind = SignalKind.AGREED
                 elif state is LoopState.PLAN_CONSENSUS_EVALUATE:
                     unresolved = 0 if plan_round >= seed % 3 else 1
                     if unresolved:
@@ -162,6 +168,21 @@ class MachineTest(unittest.TestCase):
                 state = result.next_state
                 counters = result.counters_after
             self.assertIn(state, TERMINAL_STATES)
+
+    def test_review_conflict_visits_both_adjudicators(self) -> None:
+        ledger = LedgerView(1, 0, 0, ())
+        counters = LoopCounters(0, 0)
+        cases = (
+            (LoopState.REVIEW_COMPARE, SignalKind.CONFLICT, LoopState.ADJUDICATE_A),
+            (LoopState.ADJUDICATE_A, SignalKind.ARTIFACT_OK, LoopState.ADJUDICATE_B),
+            (LoopState.ADJUDICATE_B, SignalKind.ARTIFACT_OK, LoopState.REVIEW_COMPARE),
+            (LoopState.REVIEW_COMPARE, SignalKind.AGREED, LoopState.CONSENSUS_EVALUATE),
+        )
+        for current, kind, expected in cases:
+            self.assertEqual(
+                expected,
+                transition(current, signal(kind), ledger, counters).next_state,
+            )
 
 
 if __name__ == "__main__":

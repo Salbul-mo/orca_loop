@@ -6,9 +6,10 @@ mediate file access at all: it creates terminals and routes orchestration
 messages, while the read-only guarantee comes from the OS ACL that
 ``readonly.py`` applies and the launch flags that ``profiles.py`` builds.
 
-This module pins those instead. Agent CLI versions are compared at
-major.minor granularity: a patch release does not change how a process is
-denied write access, but a minor release plausibly could.
+This module blocks only platform and enforcement-code drift. Agent CLI
+availability or version drift is reported as an informational note; a typed
+permission failure observed during a real worker step separately creates the
+refresh marker that blocks subsequent launches.
 """
 
 from __future__ import annotations
@@ -85,20 +86,13 @@ def capture_environment(harness_root: Path) -> PermissionEnvironment:
     )
 
 
-def _minor(version: str | None) -> str | None:
-    if version is None:
-        return None
-    parts = version.split(".")
-    return ".".join(parts[:2])
-
-
 def compare_environment(
     recorded: PermissionEnvironment,
     current: PermissionEnvironment,
     *,
     strict: bool = False,
 ) -> tuple[str, ...]:
-    """Report every difference that invalidates the recorded proof."""
+    """Report platform or enforcement drift that invalidates the proof."""
     problems: list[str] = []
     if recorded.platform != current.platform:
         problems.append(

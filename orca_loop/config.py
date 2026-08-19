@@ -44,6 +44,8 @@ from .models import (
     AgentProvider,
     AgentRuntimeConfig,
     AgentRuntimeOptions,
+    ConsensusIndependence,
+    ConsensusProviderPolicy,
     DEFAULT_NOTICE_CHANNELS,
     LoopConfig,
     NoticeChannel,
@@ -87,6 +89,8 @@ class RunArguments:
     strict_agent_runtime: bool = False
     accept_worktree_drift: bool = False
     force_unlock: bool = False
+    allow_same_provider_consensus: bool = False
+    consensus_provider_policy: ConsensusProviderPolicy | None = None
 
 
 @dataclass(frozen=True)
@@ -116,6 +120,8 @@ class PreflightResult:
     base_head: str
     agent_runtime: AgentRuntimeConfig | None = None
     agent_resolutions: tuple[AgentResolution, ...] = ()
+    consensus_independence: ConsensusIndependence | None = None
+    consensus_provider_policy: ConsensusProviderPolicy | None = None
 
 
 @dataclass(frozen=True)
@@ -770,6 +776,49 @@ def prepare_agent_runtime(
                 "a migration snapshot will be created.",
                 file=output,
             )
+    agents_by_worker = {
+        item.worker_key: item
+        for item in resolved.agents
+    }
+    try:
+        primary = agents_by_worker[WorkerKey.CLAUDE_CODE_REVIEW]
+        secondary = agents_by_worker[WorkerKey.CODEX_REVIEW]
+    except KeyError as exc:
+        raise PreflightError(
+            "agent runtime must configure both code-review workers"
+        ) from exc
+    providers_differ = primary.provider is not secondary.provider
+    persisted_policy = arguments.consensus_provider_policy
+    if persisted_policy is ConsensusProviderPolicy.DIVERSE:
+        if not providers_differ:
+            raise PreflightError(
+                "persisted diverse consensus policy requires different "
+                "providers for the two code-review workers"
+            )
+        provider_policy = persisted_policy
+    elif persisted_policy is ConsensusProviderPolicy.EXPLICIT_SAME_PROVIDER:
+        if providers_differ:
+            raise PreflightError(
+                "persisted same-provider policy conflicts with review providers"
+            )
+        provider_policy = persisted_policy
+    elif persisted_policy is ConsensusProviderPolicy.LEGACY_UNSPECIFIED:
+        provider_policy = persisted_policy
+    elif providers_differ:
+        provider_policy = ConsensusProviderPolicy.DIVERSE
+    elif arguments.allow_same_provider_consensus:
+        provider_policy = ConsensusProviderPolicy.EXPLICIT_SAME_PROVIDER
+    else:
+        raise PreflightError(
+            "the two code-review workers resolve to the same provider; "
+            "use --allow-same-provider-consensus to accept degraded "
+            "consensus explicitly"
+        )
+    independence = (
+        ConsensusIndependence.FULL
+        if providers_differ
+        else ConsensusIndependence.DEGRADED
+    )
     capabilities = permission_capabilities(preflight.permission_report)
     for item in resolved.agents:
         access_mode = (
@@ -803,6 +852,8 @@ def prepare_agent_runtime(
         preflight,
         agent_runtime=resolved,
         agent_resolutions=resolutions,
+        consensus_independence=independence,
+        consensus_provider_policy=provider_policy,
     )
 
 
@@ -943,6 +994,19 @@ def build_argument_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--allow-same-provider-consensus",
+        action="store_true",
+        help=(
+            "Permit both code-review workers to use the same provider and "
+            "record the run as degraded consensus."
+        ),
+    )
+    parser.add_argument(
+        "--consensus-provider-policy",
+        choices=tuple(item.value for item in ConsensusProviderPolicy),
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--plan-consensus-round-limit",
         type=int,
         default=DEFAULT_PLAN_ROUND_LIMIT,
@@ -1014,6 +1078,10 @@ def parse_run_arguments(
     harness_root: Path,
 ) -> RunArguments:
     namespace = build_argument_parser().parse_args(argv)
+    if namespace.consensus_provider_policy is not None and not namespace.resume:
+        raise ConfigurationError(
+            "--consensus-provider-policy is reserved for manifest resume"
+        )
     root = harness_root.resolve()
     request = Path(namespace.request).resolve()
     worktree = Path(namespace.worktree).resolve()
@@ -1071,6 +1139,16 @@ def parse_run_arguments(
             False,
         ),
         force_unlock=getattr(namespace, "force_unlock", False),
+        allow_same_provider_consensus=getattr(
+            namespace,
+            "allow_same_provider_consensus",
+            False,
+        ),
+        consensus_provider_policy=(
+            None
+            if namespace.consensus_provider_policy is None
+            else ConsensusProviderPolicy(namespace.consensus_provider_policy)
+        ),
     )
 
 

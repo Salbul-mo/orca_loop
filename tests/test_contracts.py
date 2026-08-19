@@ -13,6 +13,7 @@ from orca_loop.contracts import (
     digest_value,
     parse_agent_runtime_config,
     parse_agent_runtime_snapshot,
+    parse_blind_review_artifact,
     parse_human_decision,
     parse_permission_report,
     parse_plan_document,
@@ -321,6 +322,138 @@ class ArtifactContractTest(unittest.TestCase):
             delivered_finding_ids=("F-1",),
         )
         self.assertTrue(parsed.agrees_with_reviewer)
+
+    def test_blind_review_has_complete_coverage_and_no_peer_field(self) -> None:
+        plan = parse_plan_document(json.dumps(plan_value()))
+        value = {
+            "schema_version": 1,
+            "artifact_kind": "code_review_b",
+            "run_id": "run-1",
+            "task_id": "task-1",
+            "dispatch_id": "dispatch-1",
+            "consensus_round": 1,
+            "plan_version": 1,
+            "snapshot_digest": DIGEST_A,
+            "review_context_digest": DIGEST_B,
+            "role": "cross_confirmer",
+            "lane": "B",
+            "verdict": "APPROVE",
+            "reviewed_artifact_digest": DIGEST_A,
+            "reviewed_finding_ids": [],
+            "acceptance_evaluations": [
+                {
+                    "criterion_id": "AC-1",
+                    "decision": "APPROVE",
+                    "evidence_refs": ["plan.json:acceptance_criteria"],
+                }
+            ],
+            "file_evaluations": [
+                {
+                    "path": "src/example.py",
+                    "operation": "modify",
+                    "rename_from": None,
+                    "decision": "APPROVE",
+                    "evidence_refs": ["frozen.diff:1"],
+                }
+            ],
+            "test_evaluations": [
+                {
+                    "test_id": "T-1",
+                    "test_gate_status": "PASS",
+                    "decision": "APPROVE",
+                    "evidence_refs": ["test-evidence.json"],
+                }
+            ],
+            "review_summary": "Independent review passed.",
+            "finding_decisions": [],
+            "findings": [],
+            "non_blocking_suggestions": [],
+            "escalation_signals": [],
+        }
+        parsed = parse_blind_review_artifact(
+            json.dumps(value),
+            ArtifactKind.CODE_REVIEW_B,
+            self.expected,
+            expected_plan_version=1,
+            expected_context_digest=DIGEST_B,
+            expected_reviewed_artifact_digest=DIGEST_A,
+            delivered_finding_ids=(),
+            acceptance_criteria_ids=("AC-1",),
+            affected_files=plan.affected_files,
+            test_ids=("T-1",),
+            test_gate_status=TestGateStatus.PASS,
+        )
+        self.assertEqual("B", parsed.lane.value)
+        uncovered = json.loads(json.dumps(value))
+        uncovered["verdict"] = "CHANGES_REQUESTED"
+        uncovered["test_evaluations"][0]["decision"] = "CHANGE_REQUIRED"
+        with self.assertRaisesRegex(
+            ContractViolationError,
+            "require actionable findings",
+        ):
+            parse_blind_review_artifact(
+                json.dumps(uncovered),
+                ArtifactKind.CODE_REVIEW_B,
+                self.expected,
+                expected_plan_version=1,
+                expected_context_digest=DIGEST_B,
+                expected_reviewed_artifact_digest=DIGEST_A,
+                delivered_finding_ids=(),
+                acceptance_criteria_ids=("AC-1",),
+                affected_files=plan.affected_files,
+                test_ids=("T-1",),
+                test_gate_status=TestGateStatus.PASS,
+            )
+        value["agrees_with_reviewer"] = True
+        with self.assertRaisesRegex(ContractViolationError, "unknown fields"):
+            parse_blind_review_artifact(
+                json.dumps(value),
+                ArtifactKind.CODE_REVIEW_B,
+                self.expected,
+                expected_plan_version=1,
+                expected_context_digest=DIGEST_B,
+                expected_reviewed_artifact_digest=DIGEST_A,
+                delivered_finding_ids=(),
+                acceptance_criteria_ids=("AC-1",),
+                affected_files=plan.affected_files,
+                test_ids=("T-1",),
+                test_gate_status=TestGateStatus.PASS,
+            )
+
+    def test_plan_review_requires_bounded_verification_matrix(self) -> None:
+        value = review_value()
+        with self.assertRaisesRegex(ContractViolationError, "plan_verifications"):
+            parse_review_artifact(
+                json.dumps(value),
+                ArtifactKind.PLAN_REVIEW,
+                self.expected,
+                delivered_finding_ids=("F-1",),
+                require_plan_verifications=True,
+            )
+        value["plan_verifications"] = [
+            {
+                "category": category,
+                "decision": "APPROVE",
+                "evidence_refs": [f"repository:{category}"],
+            }
+            for category in (
+                "affected_files",
+                "integration_points",
+                "public_interfaces",
+                "acceptance_verifiability",
+                "test_contract",
+                "repository_facts",
+                "security_and_contract_impact",
+            )
+        ]
+        parsed = parse_review_artifact(
+            json.dumps(value),
+            ArtifactKind.PLAN_REVIEW,
+            self.expected,
+            delivered_finding_ids=("F-1",),
+            require_plan_verifications=True,
+        )
+        self.assertEqual(7, len(parsed.plan_verifications))
 
     def test_oversized_artifact_is_rejected(self) -> None:
         with self.assertRaisesRegex(ContractViolationError, "artifact size"):

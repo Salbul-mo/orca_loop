@@ -305,11 +305,20 @@ def load_committed(
         raise AtomicWriteError("committed state digest mismatch")
     if _digest(ledger_raw) != manifest.ledger_digest:
         raise AtomicWriteError("committed ledger digest mismatch")
-    state = _decode(
-        CoordinatorState,
-        _load_json(state_path),
-        "state",
+    state_value = _load_json(state_path)
+    state_schema = state_value.get("schema_version")
+    if state_schema not in {1, 2}:
+        raise AtomicWriteError(
+            f"unsupported coordinator state schema_version: {state_schema!r}"
+        )
+    legacy_state = (
+        state_schema == 1
+        and "validation_lineage" not in state_value
+        and "pending_review" not in state_value
     )
+    state = _decode(CoordinatorState, state_value, "state")
+    if legacy_state:
+        state = replace(state, schema_version=2)
     ledger = _decode(
         ConsensusLedger,
         _load_json(ledger_path),

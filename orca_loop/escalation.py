@@ -157,16 +157,18 @@ def _notice_timestamp(value: object, name: str) -> str:
 
 def _parse_notice(path: Path) -> UserDecisionNotice:
     value = _strict_notice_object(path)
-    _exact_notice_fields(
-        value,
-        {
-            "schema_version", "request_id", "status", "run_id",
-            "orchestration_run_id", "gate_id", "gate_kind", "blocked_state",
-            "report_path", "report_digest", "allowed_options", "reason",
-            "created_at", "resolved_at",
-        },
-        "user decision notice",
-    )
+    legacy_fields = {
+        "schema_version", "request_id", "status", "run_id",
+        "orchestration_run_id", "gate_id", "gate_kind", "blocked_state",
+        "report_path", "report_digest", "allowed_options", "reason",
+        "created_at", "resolved_at",
+    }
+    current_fields = legacy_fields | {"invalidated_at", "invalidation_reason"}
+    if frozenset(value) not in {
+        frozenset(legacy_fields),
+        frozenset(current_fields),
+    }:
+        _exact_notice_fields(value, current_fields, "user decision notice")
     if value["schema_version"] != USER_DECISION_NOTICE_SCHEMA_VERSION:
         raise DecisionReportError("unsupported user decision notice schema")
     try:
@@ -181,10 +183,33 @@ def _parse_notice(path: Path) -> UserDecisionNotice:
         if value["resolved_at"] is None
         else _notice_timestamp(value["resolved_at"], "resolved_at")
     )
+    invalidated_at_value = value.get("invalidated_at")
+    invalidated_at = (
+        None
+        if invalidated_at_value is None
+        else _notice_timestamp(invalidated_at_value, "invalidated_at")
+    )
+    invalidation_reason = _notice_string(
+        value.get("invalidation_reason"),
+        "invalidation_reason",
+        allow_none=True,
+    )
     if status is UserDecisionNoticeStatus.PENDING and resolved_at is not None:
         raise DecisionReportError("pending user decision notice has resolved_at")
     if status is UserDecisionNoticeStatus.RESOLVED and resolved_at is None:
         raise DecisionReportError("resolved user decision notice lacks resolved_at")
+    if status is UserDecisionNoticeStatus.INVALIDATED and (
+        invalidated_at is None or invalidation_reason is None
+    ):
+        raise DecisionReportError(
+            "invalidated user decision notice lacks invalidation evidence"
+        )
+    if status is not UserDecisionNoticeStatus.INVALIDATED and (
+        invalidated_at is not None or invalidation_reason is not None
+    ):
+        raise DecisionReportError(
+            "active user decision notice contains invalidation evidence"
+        )
     return UserDecisionNotice(
         schema_version=USER_DECISION_NOTICE_SCHEMA_VERSION,
         request_id=_notice_string(value["request_id"], "request_id") or "",
@@ -203,6 +228,8 @@ def _parse_notice(path: Path) -> UserDecisionNotice:
         reason=_notice_string(value["reason"], "reason") or "",
         created_at=created_at,
         resolved_at=resolved_at,
+        invalidated_at=invalidated_at,
+        invalidation_reason=invalidation_reason,
     )
 
 
@@ -271,6 +298,10 @@ def resolve_user_decision_notice(
         raise DecisionReportError("user decision notice does not match gate binding")
     if notice.status is UserDecisionNoticeStatus.RESOLVED:
         return notice
+    if notice.status is UserDecisionNoticeStatus.INVALIDATED:
+        raise DecisionReportError(
+            "invalidated user decision notice cannot be resolved"
+        )
     resolved = replace(
         notice,
         status=UserDecisionNoticeStatus.RESOLVED,
@@ -278,6 +309,28 @@ def resolve_user_decision_notice(
     )
     _write_notice(_notice_path(control_dir), resolved)
     return resolved
+
+
+def invalidate_user_decision_notice(
+    control_dir: Path,
+    *,
+    reason: str,
+) -> UserDecisionNotice | None:
+    notice = read_user_decision_notice(control_dir)
+    if notice is None or notice.status is UserDecisionNoticeStatus.INVALIDATED:
+        return notice
+    if notice.status is UserDecisionNoticeStatus.RESOLVED:
+        raise DecisionReportError(
+            "resolved user decision notice cannot be invalidated"
+        )
+    invalidated = replace(
+        notice,
+        status=UserDecisionNoticeStatus.INVALIDATED,
+        invalidated_at=_utc_now(),
+        invalidation_reason=reason,
+    )
+    _write_notice(_notice_path(control_dir), invalidated)
+    return invalidated
 
 
 def _validated_channel_detail(

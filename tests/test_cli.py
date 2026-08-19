@@ -5,6 +5,7 @@ import json
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -31,6 +32,8 @@ from orca_loop.contracts import (
 )
 from orca_loop.models import (
     AgentProvider,
+    ConsensusIndependence,
+    ConsensusProviderPolicy,
     AgentRuntimeOptions,
     LoopState,
     PermissionCheck,
@@ -353,6 +356,54 @@ class CliConfigurationTest(unittest.TestCase):
                 for item in prepared.agent_runtime.agents
             }[WorkerKey.CODEX_IMPLEMENTER]
             self.assertEqual(AgentProvider.CLAUDE, implementer.provider)
+
+    def test_same_provider_review_requires_explicit_degraded_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            common = (
+                "--agent-provider",
+                "claude_code_review=codex",
+                "--agent-model",
+                "claude_code_review=inherit",
+                "--agent-effort",
+                "claude_code_review=inherit",
+            )
+            base = PreflightResult(
+                self.arguments(root, *common),
+                empty_test_policy(),
+                passing_permission_report(root),
+                "1.4.159",
+                "a" * 40,
+            )
+            with self.assertRaisesRegex(PreflightError, "same provider"):
+                prepare_agent_runtime(
+                    base,
+                    interactive=False,
+                    stderr=io.StringIO(),
+                    catalog=self.static_catalog(root),
+                )
+            approved = replace(
+                base,
+                arguments=self.arguments(
+                    root,
+                    *common,
+                    "--allow-same-provider-consensus",
+                ),
+            )
+            prepared = prepare_agent_runtime(
+                approved,
+                interactive=False,
+                stderr=io.StringIO(),
+                catalog=self.static_catalog(root),
+            )
+            self.assertIs(
+                ConsensusProviderPolicy.EXPLICIT_SAME_PROVIDER,
+                prepared.consensus_provider_policy,
+            )
+            self.assertIs(
+                ConsensusIndependence.DEGRADED,
+                prepared.consensus_independence,
+            )
 
     def test_wizard_can_create_a_new_strict_config(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

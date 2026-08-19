@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -7,10 +8,17 @@ from typing import Callable
 
 from .contracts import (
     ContractViolationError,
+    digest_value,
+    parse_adjudication_artifact,
+    parse_blind_review_artifact,
+    parse_review_comparison,
+    parse_review_context,
+    parse_test_evidence,
     parse_implementation_artifact,
     parse_plan_document,
     parse_review_artifact,
     parse_worker_done,
+    serialize_json,
 )
 from .dispatcher import (
     acknowledge_delivery,
@@ -19,7 +27,7 @@ from .dispatcher import (
     prepare_task,
     worker_for_role,
 )
-from .generation import commit_generation
+from .generation import commit_generation, write_atomic_bytes
 from .guards import capture_file_state, guard_repository_delta
 from .ledger import (
     InvalidRoundError,
@@ -34,6 +42,9 @@ from .models import (
     DispatchObservation,
     ActiveStep,
     ArtifactKind,
+    AdjudicationArtifact,
+    BlindReviewArtifact,
+    CodeReviewRoundContext,
     CompletionKind,
     ConsensusKind,
     ConsensusLedger,
@@ -52,10 +63,13 @@ from .models import (
     LoopConfig,
     LoopState,
     PlanDocument,
+    PendingReviewRound,
+    PendingReviewStage,
     RenderedContract,
     ResumeAction,
     ResumeDecision,
     Role,
+    ReviewComparison,
     RoundEvidence,
     RunStatus,
     RunWorkspace,
@@ -68,8 +82,10 @@ from .models import (
     StepWorkspace,
     StagedInput,
     TestExecutionPolicy,
+    TestEvidence,
     TestGateStatus,
     TransitionSignal,
+    ValidationLineage,
     Violation,
     WorkerPool,
 )
@@ -149,8 +165,10 @@ WORKER_STATES = {
     LoopState.PLAN_REVIEW,
     LoopState.IMPLEMENT,
     LoopState.FIX,
-    LoopState.CODE_REVIEW,
-    LoopState.CROSS_CONFIRM,
+    LoopState.CODE_REVIEW_A,
+    LoopState.CODE_REVIEW_B,
+    LoopState.ADJUDICATE_A,
+    LoopState.ADJUDICATE_B,
 }
 EVALUATE_STATES = {
     LoopState.PLAN_CONSENSUS_EVALUATE,
@@ -162,8 +180,10 @@ ROLE_BY_STATE = {
     LoopState.PLAN_REVIEW: Role.PLAN_REVIEWER,
     LoopState.IMPLEMENT: Role.IMPLEMENTER,
     LoopState.FIX: Role.IMPLEMENTER,
-    LoopState.CODE_REVIEW: Role.CODE_REVIEWER,
-    LoopState.CROSS_CONFIRM: Role.CROSS_CONFIRMER,
+    LoopState.CODE_REVIEW_A: Role.CODE_REVIEWER,
+    LoopState.CODE_REVIEW_B: Role.CROSS_CONFIRMER,
+    LoopState.ADJUDICATE_A: Role.CODE_REVIEWER,
+    LoopState.ADJUDICATE_B: Role.CROSS_CONFIRMER,
 }
 ARTIFACT_BY_ROLE = {
     Role.PLANNER: ArtifactKind.PLAN,
@@ -197,8 +217,10 @@ def consensus_round(state: LoopState, ledger: ConsensusLedger) -> int:
     if state in {
         LoopState.IMPLEMENT,
         LoopState.FIX,
-        LoopState.CODE_REVIEW,
-        LoopState.CROSS_CONFIRM,
+        LoopState.CODE_REVIEW_A,
+        LoopState.CODE_REVIEW_B,
+        LoopState.ADJUDICATE_A,
+        LoopState.ADJUDICATE_B,
     }:
         return max(1, ledger.code_round + 1)
     raise CoordinatorContractError(
@@ -253,6 +275,7 @@ def _parser_and_handler(
             kind,
             expected,
             delivered_finding_ids=delivered_finding_ids,
+            require_plan_verifications=(role is Role.PLAN_REVIEWER),
         )
         side = (
             Side.CLAUDE
@@ -315,8 +338,11 @@ class GenerationController:
         destructive_approval=None,
         blocked_from_state: LoopState | None = None,
         pending_escalations: tuple[EscalationTrigger, ...] | None = None,
+        pending_review: PendingReviewRound | None = None,
+        validation_lineage: ValidationLineage | None = None,
         clear_gate: bool = False,
         clear_blocked_context: bool = False,
+        clear_pending_review: bool = False,
     ) -> CoordinatorState:
         next_generation = self.state.generation + 1
         next_ledger = replace(
@@ -397,6 +423,20 @@ class GenerationController:
                     else pending_escalations
                 )
             ),
+            pending_review=(
+                None
+                if clear_pending_review
+                else (
+                    self.state.pending_review
+                    if pending_review is None
+                    else pending_review
+                )
+            ),
+            validation_lineage=(
+                self.state.validation_lineage
+                if validation_lineage is None
+                else validation_lineage
+            ),
             history=history,
         )
         commit_generation(
@@ -435,9 +475,23 @@ def execute_worker_step(
     orca_executable: str,
     step_timeout_ms: int,
     validate_artifact: Callable[[object], None] | None = None,
+    artifact_kind_override: ArtifactKind | None = None,
+    artifact_parser: Callable[[str], object] | None = None,
+    artifact_handler: Callable[[ConsensusLedger, object], LedgerUpdate] | None = None,
 ) -> tuple[StepExecutionResult, object | None]:
     loop_state = controller.state.state
     role = role_for_state(loop_state)
+    state_artifact_kinds = {
+        LoopState.CODE_REVIEW_A: ArtifactKind.CODE_REVIEW_A,
+        LoopState.CODE_REVIEW_B: ArtifactKind.CODE_REVIEW_B,
+        LoopState.ADJUDICATE_A: ArtifactKind.REVIEW_ADJUDICATION_A,
+        LoopState.ADJUDICATE_B: ArtifactKind.REVIEW_ADJUDICATION_B,
+    }
+    effective_artifact_kind = (
+        artifact_kind_override
+        if artifact_kind_override is not None
+        else state_artifact_kinds.get(loop_state)
+    )
     worker = worker_for_role(pool, role)
     before_snapshot = capture_snapshot(worktree)
     before_files = capture_file_state(worktree)
@@ -484,7 +538,11 @@ def execute_worker_step(
         orca_executable=orca_executable,
         runner_path=runner_path,
         step_timeout_ms=step_timeout_ms,
-        artifact_filename=ARTIFACT_FILENAMES[role],
+        artifact_filename=(
+            f"{effective_artifact_kind.value}.json"
+            if effective_artifact_kind is not None
+            else ARTIFACT_FILENAMES[role]
+        ),
         commit_dispatched=commit_dispatched,
     )
     active = ActiveStep(
@@ -579,11 +637,70 @@ def execute_worker_step(
         snapshot_digest=controller.state.snapshot_digest,
     )
     payload = parse_worker_done(completion.payload_json, expected)
-    artifact_kind, parser, handler = _parser_and_handler(
-        role,
-        expected=expected,
-        delivered_finding_ids=scope.finding_ids,
-    )
+    if effective_artifact_kind is None:
+        artifact_kind, parser, handler = _parser_and_handler(
+            role,
+            expected=expected,
+            delivered_finding_ids=scope.finding_ids,
+        )
+    else:
+        artifact_kind = effective_artifact_kind
+        context_path = controller.workspace.artifact_dir / "review_context.json"
+        if not context_path.is_file():
+            raise CoordinatorContractError("review context artifact is missing")
+        context = parse_review_context(context_path.read_text(encoding="utf-8"))
+        pending = controller.state.pending_review
+        if pending is None:
+            raise CoordinatorContractError("review worker has no pending round")
+        if context.context_digest != pending.review_context_digest:
+            raise CoordinatorContractError("pending review context digest mismatch")
+        if loop_state in {LoopState.CODE_REVIEW_A, LoopState.CODE_REVIEW_B}:
+            test_path = controller.workspace.artifact_dir / "test_evidence.json"
+            if not test_path.is_file():
+                raise CoordinatorContractError("test evidence artifact is missing")
+            test_evidence = parse_test_evidence(test_path.read_text(encoding="utf-8"))
+            parser = lambda raw: parse_blind_review_artifact(
+                raw,
+                artifact_kind,
+                expected,
+                expected_plan_version=context.plan_version,
+                expected_context_digest=context.context_digest,
+                expected_reviewed_artifact_digest=(
+                    context.implementation_artifact_digest
+                ),
+                delivered_finding_ids=context.baseline_finding_ids,
+                acceptance_criteria_ids=context.acceptance_criteria_ids,
+                affected_files=context.affected_files,
+                test_ids=context.test_ids,
+                test_gate_status=test_evidence.test_gate_status,
+            )
+        else:
+            comparison_path = (
+                controller.workspace.artifact_dir / "review_comparison.json"
+            )
+            if not comparison_path.is_file():
+                raise CoordinatorContractError("review comparison artifact is missing")
+            comparison = parse_review_comparison(
+                comparison_path.read_text(encoding="utf-8")
+            )
+            parser = lambda raw: parse_adjudication_artifact(
+                raw,
+                artifact_kind,
+                expected,
+                expected_context_digest=context.context_digest,
+                comparison=comparison,
+                valid_duplicate_targets=tuple(
+                    item.finding.finding_id
+                    for item in controller.ledger.findings
+                ),
+            )
+        if artifact_parser is not None:
+            parser = artifact_parser
+        handler = (
+            artifact_handler
+            if artifact_handler is not None
+            else lambda current, artifact: LedgerUpdate(current, (), False)
+        )
     promoted = promote_artifact(
         payload,
         handle,
@@ -634,6 +751,75 @@ def execute_worker_step(
         if isinstance(artifact, PlanDocument)
         else controller.state.plan_version
     )
+    pending_review = controller.state.pending_review
+    validation_lineage = controller.state.validation_lineage
+    logical_manifest_digest = digest_value(
+        [
+            {"path": item.path, "digest": item.digest}
+            for item in manifest.entries
+            if item.path != "contract.md"
+        ]
+    )
+    if loop_state is LoopState.CODE_REVIEW_A:
+        if pending_review is None:
+            raise CoordinatorContractError("blind A has no pending review round")
+        pending_review = replace(
+            pending_review,
+            stage=PendingReviewStage.BLIND_A_READY,
+            blind_a_input_manifest_digest=logical_manifest_digest,
+            blind_a_artifact_digest=promoted.artifact_digest,
+        )
+        validation_lineage = replace(
+            validation_lineage,
+            blind_review_a_snapshot_digest=after_snapshot.snapshot_digest,
+            blind_review_a_artifact_digest=promoted.artifact_digest,
+        )
+    elif loop_state is LoopState.CODE_REVIEW_B:
+        if (
+            pending_review is None
+            or pending_review.blind_a_input_manifest_digest
+            != logical_manifest_digest
+        ):
+            raise CoordinatorContractError(
+                "blind review logical input manifests differ"
+            )
+        pending_review = replace(
+            pending_review,
+            stage=PendingReviewStage.BLIND_PAIR_READY,
+            blind_b_input_manifest_digest=logical_manifest_digest,
+            blind_b_artifact_digest=promoted.artifact_digest,
+        )
+        validation_lineage = replace(
+            validation_lineage,
+            blind_review_b_snapshot_digest=after_snapshot.snapshot_digest,
+            blind_review_b_artifact_digest=promoted.artifact_digest,
+        )
+    elif loop_state is LoopState.ADJUDICATE_A:
+        if pending_review is None:
+            raise CoordinatorContractError("adjudication A has no pending round")
+        pending_review = replace(
+            pending_review,
+            stage=PendingReviewStage.ADJUDICATION_A_READY,
+            adjudication_a_artifact_digest=promoted.artifact_digest,
+        )
+        validation_lineage = replace(
+            validation_lineage,
+            adjudication_a_snapshot_digest=after_snapshot.snapshot_digest,
+            adjudication_a_artifact_digest=promoted.artifact_digest,
+        )
+    elif loop_state is LoopState.ADJUDICATE_B:
+        if pending_review is None:
+            raise CoordinatorContractError("adjudication B has no pending round")
+        pending_review = replace(
+            pending_review,
+            stage=PendingReviewStage.ADJUDICATION_PAIR_READY,
+            adjudication_b_artifact_digest=promoted.artifact_digest,
+        )
+        validation_lineage = replace(
+            validation_lineage,
+            adjudication_b_snapshot_digest=after_snapshot.snapshot_digest,
+            adjudication_b_artifact_digest=promoted.artifact_digest,
+        )
     controller.commit(
         stage=StepStage.ARTIFACT_VERIFIED,
         active=active,
@@ -641,6 +827,8 @@ def execute_worker_step(
         ledger=update.ledger,
         plan_version=plan_version,
         snapshot_digest=after_snapshot.snapshot_digest,
+        pending_review=pending_review,
+        validation_lineage=validation_lineage,
     )
     signal = TransitionSignal(
         (
@@ -670,7 +858,7 @@ def execute_evaluate(
     *,
     state: LoopState,
     ledger: ConsensusLedger,
-    evidence: RoundEvidence,
+    evidence: RoundEvidence | None,
     config: LoopConfig,
     plan: PlanDocument | None,
     destructive_approval: DestructiveApproval | None,
@@ -684,16 +872,24 @@ def execute_evaluate(
         if state is LoopState.PLAN_CONSENSUS_EVALUATE
         else ConsensusKind.CODE
     )
-    update = commit_round(
-        ledger,
-        evidence,
-        plan_limit=config.plan_consensus_round_limit,
-        code_limit=config.code_consensus_round_limit,
-        expected_plan_version=(
-            None if plan is None else plan.plan_version
-        ),
-        expected_snapshot_digest=evidence.reviewed_snapshot_digest,
-    )
+    if kind is ConsensusKind.PLAN:
+        if evidence is None:
+            raise CoordinatorContractError("plan consensus evidence is required")
+        update = commit_round(
+            ledger,
+            evidence,
+            plan_limit=config.plan_consensus_round_limit,
+            code_limit=config.code_consensus_round_limit,
+            expected_plan_version=(
+                None if plan is None else plan.plan_version
+            ),
+        )
+    else:
+        if ledger.code_round < 1:
+            raise CoordinatorContractError(
+                "code consensus evaluation requires an atomically committed round"
+            )
+        update = LedgerUpdate(ledger, (), True)
     if not update.committed_round:
         return StepExecutionResult(
             TransitionSignal(
@@ -789,6 +985,11 @@ def execute_test_gate(
     plan: PlanDocument,
     policy: TestExecutionPolicy,
     worktree: Path,
+    workspace: RunWorkspace,
+    run_id: str,
+    plan_version: int,
+    consensus_round_value: int,
+    generation: int,
 ) -> StepExecutionResult:
     result = run_tests(
         plan.test_contract.commands,
@@ -800,7 +1001,74 @@ def execute_test_gate(
         f"test gate result: {result.status.value}",
         (),
     )
-    return StepExecutionResult(signal, ledger, result.status)
+    command_evidence = [
+        {
+            "command_index": index,
+            "command": {
+                "argv": list(item.command.argv),
+                "cwd": item.command.cwd,
+                "timeout_ms": item.command.timeout_ms,
+                "kind": item.command.kind.value,
+            },
+            "return_code": item.return_code,
+            "timed_out": item.timed_out,
+            "stdout_tail_digest": "sha256:"
+            + hashlib.sha256(item.stdout_tail.encode("utf-8")).hexdigest(),
+            "stderr_tail_digest": "sha256:"
+            + hashlib.sha256(item.stderr_tail.encode("utf-8")).hexdigest(),
+        }
+        for index, item in enumerate(result.command_results)
+    ]
+    value: dict[str, object] = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "plan_version": plan_version,
+        "consensus_round": consensus_round_value,
+        "test_gate_status": result.status.value,
+        "test_policy_digest": policy.policy_digest,
+        "commands": command_evidence,
+        "policy_violations": [
+            {
+                "code": item.code,
+                "command_index": item.command_index,
+                "detail": item.detail,
+            }
+            for item in result.policy_violations
+        ],
+        "before_snapshot_digest": result.before_snapshot.snapshot_digest,
+        "after_snapshot_digest": (
+            None
+            if result.after_snapshot is None
+            else result.after_snapshot.snapshot_digest
+        ),
+        "authoritative_snapshot_digest": (
+            result.after_snapshot.snapshot_digest
+            if result.status is TestGateStatus.PASS
+            and result.after_snapshot is not None
+            else result.before_snapshot.snapshot_digest
+        ),
+        "test_ids": list(plan.test_contract.test_ids),
+        "attribution": result.attribution.value,
+    }
+    value["artifact_digest"] = digest_value(value)
+    evidence = parse_test_evidence(json.dumps(value, ensure_ascii=False))
+    raw = (serialize_json(evidence) + "\n").encode("utf-8")
+    evidence_path = workspace.artifact_dir / "test_evidence.json"
+    write_atomic_bytes(evidence_path, raw)
+    if parse_test_evidence(evidence_path.read_text(encoding="utf-8")) != evidence:
+        raise CoordinatorContractError("persisted test evidence reread mismatch")
+    record_artifact_history(
+        workspace.root,
+        "test_evidence",
+        generation,
+        raw,
+    )
+    return StepExecutionResult(
+        signal,
+        ledger,
+        result.status,
+        test_evidence=evidence,
+    )
 
 
 def execute_human_gate(
@@ -975,6 +1243,14 @@ def commit_step_transition(
         status = RunStatus.BLOCKED
     elif outcome.next_state is LoopState.FAILED:
         status = RunStatus.FAILED
+    test_lineage = None
+    test_snapshot = None
+    if result.test_evidence is not None:
+        test_snapshot = result.test_evidence.authoritative_snapshot_digest
+        test_lineage = ValidationLineage(
+            test_gate_snapshot_digest=test_snapshot,
+            test_evidence_digest=result.test_evidence.artifact_digest,
+        )
     return controller.commit(
         stage=StepStage.TRANSITION_COMMITTED,
         active=None,
@@ -985,6 +1261,9 @@ def commit_step_transition(
         ledger=result.ledger,
         counters=outcome.counters_after,
         test_gate_status=result.test_gate_status,
+        snapshot_digest=test_snapshot,
+        validation_lineage=test_lineage,
+        clear_pending_review=result.test_evidence is not None,
         blocked_from_state=(
             controller.state.state
             if outcome.next_state is LoopState.USER_DECISION_REQUIRED

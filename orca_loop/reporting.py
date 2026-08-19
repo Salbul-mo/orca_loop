@@ -29,8 +29,21 @@ STAGE_REPORTS: tuple[tuple[str, str, str], ...] = (
     ("plan", "01-plan.md", "계획 (Planner)"),
     ("plan_review", "02-plan-review.md", "계획 검토 (Plan Reviewer)"),
     ("implementation", "03-implementation.md", "구현 (Implementer)"),
-    ("code_review", "04-code-review.md", "코드 검토 (Code Reviewer)"),
-    ("cross_review", "05-cross-review.md", "교차 확인 (Cross Confirmer)"),
+    ("code_review_a", "04-code-review-a.md", "Blind 코드 검토 A"),
+    ("code_review_b", "05-code-review-b.md", "Blind 코드 검토 B"),
+    ("review_comparison", "06-review-comparison.md", "검토 비교"),
+    (
+        "review_adjudication_a",
+        "07-review-adjudication-a.md",
+        "검토 재정 A",
+    ),
+    (
+        "review_adjudication_b",
+        "08-review-adjudication-b.md",
+        "검토 재정 B",
+    ),
+    ("code_review", "09-legacy-code-review.md", "Legacy 코드 검토"),
+    ("cross_review", "10-legacy-cross-review.md", "Legacy 교차 확인"),
 )
 STAGE_TITLE = {kind: title for kind, _, title in STAGE_REPORTS}
 STAGE_FILENAME = {kind: name for kind, name, _ in STAGE_REPORTS}
@@ -82,7 +95,7 @@ def _utc_now() -> str:
 
 
 def _as_list(value: object) -> list[object]:
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return list(value)
     if value is None:
         return []
@@ -148,14 +161,30 @@ def _render_plan(value: Mapping[str, object]) -> str:
         "\n## 수용 기준\n\n",
         _bullets(
             [
-                f"{item.get('criterion_id')}: {item.get('statement', '')}"
+                f"{item.get('criterion_id')}: "
+                f"{item.get('verification_method', item.get('statement', ''))}"
                 if isinstance(item, dict)
                 else item
                 for item in criteria
             ]
         ),
         "\n## 테스트 계약\n\n",
-        _bullets([" ".join(_as_list(item)) for item in commands]),
+        _bullets(
+            [
+                (
+                    " ".join(str(part) for part in _as_list(item.get("argv")))
+                    + f" (cwd={item.get('cwd')}, kind={item.get('kind')}, "
+                    + f"timeout_ms={item.get('timeout_ms')})"
+                )
+                if isinstance(item, dict)
+                else (
+                    " ".join(str(part) for part in item)
+                    if isinstance(item, (list, tuple))
+                    else str(item)
+                )
+                for item in commands
+            ]
+        ),
         "\n## 데이터/API/스키마 변경\n\n",
         f"{value.get('data_api_schema_changes', '없음')}\n",
         "\n## 위험\n\n",
@@ -240,7 +269,11 @@ def _render_implementation(value: Mapping[str, object]) -> str:
             "\n## 처리한 finding\n\n",
             _bullets(
                 [
-                    f"{item.get('finding_id')}: {item.get('resolution', '')}"
+                    f"{item.get('finding_id')}: "
+                    + ", ".join(
+                        str(ref)
+                        for ref in _as_list(item.get("evidence_refs"))
+                    )
                     if isinstance(item, dict)
                     else item
                     for item in _as_list(value.get("addressed_findings"))
@@ -255,7 +288,13 @@ def _render_body(artifact_kind: str, value: Mapping[str, object]) -> str:
         return _render_plan(value)
     if artifact_kind == "implementation":
         return _render_implementation(value)
-    if artifact_kind in {"plan_review", "code_review", "cross_review"}:
+    if artifact_kind in {
+        "plan_review",
+        "code_review_a",
+        "code_review_b",
+        "code_review",
+        "cross_review",
+    }:
         return _render_review(value)
     return "```json\n" + json.dumps(
         value,
@@ -336,6 +375,18 @@ def render_run_summary(
         if record.status.value != "RESOLVED"
     )
     history = state.history[-10:]
+    provider_policy = "UNKNOWN"
+    independence = "UNKNOWN"
+    manifest_path = run_root / "control" / "run-manifest.json"
+    if manifest_path.is_file():
+        manifest_value = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if isinstance(manifest_value, dict):
+            provider_policy = str(
+                manifest_value.get("consensus_provider_policy", "UNKNOWN")
+            )
+            independence = str(
+                manifest_value.get("consensus_independence", "UNKNOWN")
+            )
     lines = [
         f"# Orca Loop Run Summary — {state.run_id}\n\n",
         f"갱신: {_utc_now()}  |  상태: **{state.status.value}** / "
@@ -347,6 +398,8 @@ def render_run_summary(
         f"- code_round: {ledger.code_round}\n",
         f"- 미해결 finding: {unresolved}\n",
         f"- test gate: {state.test_gate_status.value if state.test_gate_status else 'NOT RUN'}\n",
+        f"- provider policy: {provider_policy}\n",
+        f"- consensus independence: {independence}\n",
         "\n## 최근 전이\n\n",
     ]
     if not history:

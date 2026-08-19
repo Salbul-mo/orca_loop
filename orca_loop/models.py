@@ -14,6 +14,13 @@ class LoopState(StrEnum):
     IMPLEMENT = "IMPLEMENT"
     FIX = "FIX"
     TEST_GATE = "TEST_GATE"
+    REVIEW_CONTEXT_PREPARE = "REVIEW_CONTEXT_PREPARE"
+    CODE_REVIEW_A = "CODE_REVIEW_A"
+    CODE_REVIEW_B = "CODE_REVIEW_B"
+    REVIEW_COMPARE = "REVIEW_COMPARE"
+    ADJUDICATE_A = "ADJUDICATE_A"
+    ADJUDICATE_B = "ADJUDICATE_B"
+    # Legacy states remain readable for pre-migration runs.
     CODE_REVIEW = "CODE_REVIEW"
     CROSS_CONFIRM = "CROSS_CONFIRM"
     CONSENSUS_EVALUATE = "CONSENSUS_EVALUATE"
@@ -153,6 +160,10 @@ class ArtifactKind(StrEnum):
     IMPLEMENTATION = "implementation"
     CODE_REVIEW = "code_review"
     CROSS_REVIEW = "cross_review"
+    CODE_REVIEW_A = "code_review_a"
+    CODE_REVIEW_B = "code_review_b"
+    REVIEW_ADJUDICATION_A = "review_adjudication_a"
+    REVIEW_ADJUDICATION_B = "review_adjudication_b"
 
 
 class CompletionKind(StrEnum):
@@ -178,6 +189,9 @@ class SignalKind(StrEnum):
     ESCALATE = "escalate"
     ABORT = "abort"
     OPERATIONAL_RETRY = "operational_retry"
+    CONTEXT_PREPARED = "context_prepared"
+    AGREED = "agreed"
+    CONFLICT = "conflict"
 
 
 class GateKind(StrEnum):
@@ -189,6 +203,7 @@ class GateKind(StrEnum):
 class UserDecisionNoticeStatus(StrEnum):
     PENDING = "PENDING"
     RESOLVED = "RESOLVED"
+    INVALIDATED = "INVALIDATED"
 
 
 class UserDecisionNoticeDeliveryStatus(StrEnum):
@@ -310,6 +325,74 @@ class ResumeOutcome(StrEnum):
     RECOVER_SETTLED = "RECOVER_SETTLED"
     STOP_AND_RETRY = "STOP_AND_RETRY"
     ABANDON_AND_BLOCK = "ABANDON_AND_BLOCK"
+
+
+class ReviewPhase(StrEnum):
+    BLIND = "BLIND"
+    ADJUDICATION = "ADJUDICATION"
+
+
+class ReviewLane(StrEnum):
+    A = "A"
+    B = "B"
+
+
+class ReviewComparisonStatus(StrEnum):
+    AGREED = "AGREED"
+    ADJUDICATION_REQUIRED = "ADJUDICATION_REQUIRED"
+    INVALID = "INVALID"
+
+
+class ReviewConflictKind(StrEnum):
+    BASELINE_DECISION = "BASELINE_DECISION"
+    UNILATERAL_FINDING = "UNILATERAL_FINDING"
+    FINDING_SIGNATURE = "FINDING_SIGNATURE"
+    COVERAGE = "COVERAGE"
+    VERIFICATION = "VERIFICATION"
+
+
+class AdjudicationDecision(StrEnum):
+    CONFIRM = "CONFIRM"
+    REJECT = "REJECT"
+    DUPLICATE = "DUPLICATE"
+    VERIFY_REQUIRED = "VERIFY_REQUIRED"
+
+
+class ConsensusIndependence(StrEnum):
+    FULL = "FULL"
+    DEGRADED = "DEGRADED"
+
+
+class ConsensusProviderPolicy(StrEnum):
+    DIVERSE = "DIVERSE"
+    EXPLICIT_SAME_PROVIDER = "EXPLICIT_SAME_PROVIDER"
+    LEGACY_UNSPECIFIED = "LEGACY_UNSPECIFIED"
+
+
+class DriftAction(StrEnum):
+    REBASELINE = "REBASELINE"
+    INVALIDATE_PLAN = "INVALIDATE_PLAN"
+    INVALIDATE_CODE = "INVALIDATE_CODE"
+    BLOCK = "BLOCK"
+
+
+class PendingReviewStage(StrEnum):
+    CONTEXT_READY = "CONTEXT_READY"
+    BLIND_A_READY = "BLIND_A_READY"
+    BLIND_PAIR_READY = "BLIND_PAIR_READY"
+    COMPARISON_READY = "COMPARISON_READY"
+    ADJUDICATION_A_READY = "ADJUDICATION_A_READY"
+    ADJUDICATION_PAIR_READY = "ADJUDICATION_PAIR_READY"
+
+
+class PlanVerificationCategory(StrEnum):
+    AFFECTED_FILES = "affected_files"
+    INTEGRATION_POINTS = "integration_points"
+    PUBLIC_INTERFACES = "public_interfaces"
+    ACCEPTANCE_VERIFIABILITY = "acceptance_verifiability"
+    TEST_CONTRACT = "test_contract"
+    REPOSITORY_FACTS = "repository_facts"
+    SECURITY_AND_CONTRACT_IMPACT = "security_and_contract_impact"
 
 
 @dataclass(frozen=True)
@@ -732,6 +815,37 @@ class PlanDocument:
 
 
 @dataclass(frozen=True)
+class AcceptanceEvaluation:
+    criterion_id: str
+    decision: DecisionValue
+    evidence_refs: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class FileEvaluation:
+    path: str
+    operation: AffectedFileOperation
+    rename_from: str | None
+    decision: DecisionValue
+    evidence_refs: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class TestEvaluation:
+    test_id: str
+    test_gate_status: TestGateStatus
+    decision: DecisionValue
+    evidence_refs: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PlanVerification:
+    category: PlanVerificationCategory
+    decision: DecisionValue
+    evidence_refs: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class ReviewArtifact:
     schema_version: int
     artifact_kind: ArtifactKind
@@ -750,6 +864,89 @@ class ReviewArtifact:
     non_blocking_suggestions: tuple[InformationalFinding, ...]
     escalation_signals: tuple[EscalationTrigger, ...]
     agrees_with_reviewer: bool | None
+    plan_verifications: tuple[PlanVerification, ...] = ()
+
+
+@dataclass(frozen=True)
+class BlindReviewArtifact:
+    schema_version: int
+    artifact_kind: ArtifactKind
+    run_id: str
+    task_id: str
+    dispatch_id: str
+    consensus_round: int
+    plan_version: int
+    snapshot_digest: str
+    review_context_digest: str
+    role: Role
+    lane: ReviewLane
+    verdict: CodeReviewVerdict
+    reviewed_artifact_digest: str
+    reviewed_finding_ids: tuple[str, ...]
+    acceptance_evaluations: tuple[AcceptanceEvaluation, ...]
+    file_evaluations: tuple[FileEvaluation, ...]
+    test_evaluations: tuple[TestEvaluation, ...]
+    review_summary: str
+    finding_decisions: tuple[FindingDecision, ...]
+    findings: tuple[Finding, ...]
+    non_blocking_suggestions: tuple[InformationalFinding, ...]
+    escalation_signals: tuple[EscalationTrigger, ...]
+
+
+@dataclass(frozen=True)
+class ReviewConflictCandidate:
+    candidate_id: str
+    kind: ReviewConflictKind
+    finding_ids: tuple[str, ...]
+    acceptance_criteria_ids: tuple[str, ...]
+    affected_files: tuple[str, ...]
+    test_ids: tuple[str, ...]
+    blind_a_decision: DecisionValue | None
+    blind_b_decision: DecisionValue | None
+    normalized_signature: str
+    evidence_refs: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ReviewComparison:
+    schema_version: int
+    run_id: str
+    consensus_round: int
+    snapshot_digest: str
+    review_context_digest: str
+    pre_round_ledger_digest: str
+    blind_a_artifact_digest: str
+    blind_b_artifact_digest: str
+    status: ReviewComparisonStatus
+    agreed_finding_ids: tuple[str, ...]
+    candidates: tuple[ReviewConflictCandidate, ...]
+    comparison_digest: str
+
+
+@dataclass(frozen=True)
+class CandidateDecision:
+    candidate_id: str
+    decision: AdjudicationDecision
+    duplicate_of: str | None
+    root_cause_assessment: str
+    required_action: str | None
+    evidence_refs: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class AdjudicationArtifact:
+    schema_version: int
+    artifact_kind: ArtifactKind
+    run_id: str
+    task_id: str
+    dispatch_id: str
+    consensus_round: int
+    snapshot_digest: str
+    review_context_digest: str
+    comparison_digest: str
+    role: Role
+    lane: ReviewLane
+    candidate_decisions: tuple[CandidateDecision, ...]
 
 
 @dataclass(frozen=True)
@@ -809,6 +1006,11 @@ class RoleContext:
     test_gate_result: TestGateStatus | None
     test_policy: TestExecutionPolicy | None
     delivered_finding_ids: tuple[str, ...]
+    review_phase: ReviewPhase | None = None
+    review_lane: ReviewLane | None = None
+    review_context_digest: str | None = None
+    comparison_digest: str | None = None
+    reveal_manifest_digest: str | None = None
 
 
 @dataclass(frozen=True)
@@ -817,6 +1019,7 @@ class StepExecutionResult:
     ledger: ConsensusLedger
     test_gate_status: TestGateStatus | None
     escalations: tuple[EscalationTrigger, ...] = ()
+    test_evidence: TestEvidence | None = None
 
 
 @dataclass(frozen=True)
@@ -870,6 +1073,87 @@ class TestGateResult:
     before_snapshot: SnapshotIdentity
     after_snapshot: SnapshotIdentity | None
     attribution: TestFailureAttribution
+
+
+@dataclass(frozen=True)
+class TestCommandEvidence:
+    command_index: int
+    command: TestCommand
+    return_code: int | None
+    timed_out: bool
+    stdout_tail_digest: str
+    stderr_tail_digest: str
+
+
+@dataclass(frozen=True)
+class TestEvidence:
+    schema_version: int
+    run_id: str
+    plan_version: int
+    consensus_round: int
+    test_gate_status: TestGateStatus
+    test_policy_digest: str
+    commands: tuple[TestCommandEvidence, ...]
+    policy_violations: tuple[TestPolicyViolation, ...]
+    before_snapshot_digest: str
+    after_snapshot_digest: str | None
+    authoritative_snapshot_digest: str
+    test_ids: tuple[str, ...]
+    attribution: TestFailureAttribution
+    artifact_digest: str
+
+
+@dataclass(frozen=True)
+class CodeReviewRoundContext:
+    schema_version: int
+    run_id: str
+    consensus_round: int
+    plan_version: int
+    snapshot_digest: str
+    implementation_artifact_digest: str
+    test_evidence_digest: str
+    frozen_diff_digest: str
+    scope_manifest_digest: str
+    readonly_mirror_digest: str
+    baseline_finding_ids: tuple[str, ...]
+    acceptance_criteria_ids: tuple[str, ...]
+    affected_files: tuple[AffectedFile, ...]
+    test_ids: tuple[str, ...]
+    context_digest: str
+
+
+@dataclass(frozen=True)
+class PendingReviewRound:
+    consensus_round: int
+    stage: PendingReviewStage
+    review_context_digest: str
+    pre_round_ledger_digest: str
+    blind_a_input_manifest_digest: str | None = None
+    blind_a_artifact_digest: str | None = None
+    blind_b_input_manifest_digest: str | None = None
+    blind_b_artifact_digest: str | None = None
+    comparison_digest: str | None = None
+    reveal_manifest_digest: str | None = None
+    adjudication_a_artifact_digest: str | None = None
+    adjudication_b_artifact_digest: str | None = None
+
+
+@dataclass(frozen=True)
+class ValidationLineage:
+    test_gate_snapshot_digest: str | None = None
+    test_evidence_digest: str | None = None
+    review_context_snapshot_digest: str | None = None
+    review_context_digest: str | None = None
+    blind_review_a_snapshot_digest: str | None = None
+    blind_review_a_artifact_digest: str | None = None
+    blind_review_b_snapshot_digest: str | None = None
+    blind_review_b_artifact_digest: str | None = None
+    review_comparison_digest: str | None = None
+    adjudication_a_snapshot_digest: str | None = None
+    adjudication_a_artifact_digest: str | None = None
+    adjudication_b_snapshot_digest: str | None = None
+    adjudication_b_artifact_digest: str | None = None
+    consensus_snapshot_digest: str | None = None
 
 
 @dataclass(frozen=True)
@@ -956,6 +1240,31 @@ class FrozenReview:
 
 
 @dataclass(frozen=True)
+class ReadonlyMirrorBinding:
+    path: Path
+    tree_digest: str
+    source_snapshot_digest: str
+
+
+@dataclass(frozen=True)
+class DriftDecision:
+    drifted: bool
+    action: DriftAction | None
+    new_digest: str | None
+    target_state: LoopState | None
+    detail: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MergeQualification:
+    qualified: bool
+    snapshot_digest: str
+    review_context_digest: str
+    validation_lineage_digest: str
+    evidence_digests: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class RenderedContract:
     text: str
     digest: str
@@ -983,6 +1292,9 @@ class GateBinding:
     report_digest: str
     gate_kind: GateKind
     allowed_options: tuple[str, ...] = ()
+    snapshot_digest: str | None = None
+    review_context_digest: str | None = None
+    validation_lineage_digest: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1003,6 +1315,8 @@ class UserDecisionNotice:
     reason: str
     created_at: str
     resolved_at: str | None
+    invalidated_at: str | None = None
+    invalidation_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1075,6 +1389,8 @@ class CoordinatorState:
     destructive_approval: DestructiveApproval | None = None
     blocked_from_state: LoopState | None = None
     pending_escalations: tuple[EscalationTrigger, ...] = ()
+    pending_review: PendingReviewRound | None = None
+    validation_lineage: ValidationLineage = ValidationLineage()
 
 
 @dataclass(frozen=True)

@@ -1,6 +1,6 @@
 # Orca Loop 실행 규칙 및 주의사항
 
-**Date:** 2026-08-04 (2026-08-11 개정)
+**Date:** 2026-08-04 (2026-08-19 개정)
 **Applies to:** `C:\Users\mhj\Desktop\mhj_workspace\orca_harness`를 사용하는 후속 개발 세션
 **Source:** `doc/codex-mhj_26_08_04_1_orca_loop_failure_session_log.md`
 
@@ -15,18 +15,22 @@
 | §3 "model 별칭을 임의로 쓰지 않는다" | 카탈로그 정규화가 흡수한다(`sonnet5`→`sonnet`, `terra`→`gpt-5.6-terra`, `mid`→`medium`). 정확한 값만 허용하려면 `--strict-agent-runtime` |
 | §3 "resume으로 configuration을 바꾸지 않는다" | 여전히 유효. 단 **동일 값의 다른 표기**는 이제 drift로 오판하지 않는다 |
 | §2 permission report 수동 탐색 | `start`가 자동 탐색·검증한다. 조건은 동일하며 약화되지 않았다 |
-| §4 runner terminal 수동 생성 | `start`가 생성한다. `--no-create-terminals`로만 수동 지정 |
+| §4 coordinator terminal | `start`를 실행 중인 현재 Orca terminal을 coordinator로 사용한다. 네 worker terminal은 harness가 자동 provision한다 |
 | §9.1 "stderr가 비어 있어도…" | `logs/step-*.stdout.log`, `*.stderr.log`, `*.runner.json`에 항상 남는다 |
 | §9.5 "IN_PROGRESS라도 process가 없으면…" | `run_loop.py status --run-id <id>`가 판정과 재시작 명령을 함께 출력한다 |
 | §11 "FAILED run을 resume하지 않는다" | 코드가 거부한다 |
 | §13 "claude provider로 implementer를 쓰면 BLOCKED" | **해소.** 2026-08-11 spike가 `V-PERM-06`(claude implementer 쓰기)을 확보했다 |
-| permission report를 Orca 버전에 고정 | **환경 지문 기준으로 전환.** `orca_version`은 정보성이고, 실제 판정은 `claude`/`codex` CLI의 major.minor, `readonly.py`+`profiles.py` 다이제스트, platform으로 한다 |
+| permission report를 Orca 또는 Agent CLI 버전에 고정 | **환경 지문 기준으로 전환.** platform과 `readonly.py`+`profiles.py` enforcement digest만 차단 조건이다. Orca/Claude/Codex CLI availability·version drift는 경고이며, typed observed permission failure가 refresh marker를 만든다 |
 
-**재spike가 필요한 시점** (Orca 업데이트는 더 이상 해당하지 않는다):
+**재spike가 필요한 시점**:
 
-- `claude` 또는 `codex` CLI의 **minor 버전**이 올라갔을 때 (patch는 무관)
 - `orca_loop/readonly.py` 또는 `orca_loop/profiles.py`를 수정했을 때
 - OS(platform)가 바뀌었을 때
+- `OUTBOX_WRITE_DENIED`, `SOURCE_DIRECTORY_READ_DENIED`,
+  `PROCESS_EXECUTION_DENIED`, `READONLY_SOURCE_DELTA`가 실제 run에서 관측됐을 때
+
+Claude/Codex CLI availability·version 차이는 `doctor`와 preflight의 정보성
+경고로 남지만 그 자체로 실행을 차단하지 않는다.
 
 `py -3 run_loop.py doctor`가 해당 사유를 `permission_reports[].problem`에 그대로 출력한다.
 
@@ -57,7 +61,9 @@ py -3 run_loop.py resume --run-id <id> [--accept-worktree-drift]
 새 run을 만들기 전에 다음 조건을 모두 확인한다.
 
 1. 사용자가 **전체 task prompt**를 제공했는지 확인한다. 파일을 prompt로 지정했다면 전체 byte를 request copy로 사용한다.
-2. 사용자가 네 worker의 **model과 effort를 각각 명시적으로 지정**했는지 확인한다.
+2. 네 worker는 코드의 default runtime configuration을 사용한다. 사용자가
+   model/effort override를 요청한 경우에만 `--agent-model`과
+   `--agent-effort`를 명시하고 dry-run 결과를 확인한다.
 3. target repository, branch, current HEAD, `git status --short`를 확인한다.
 4. tracked/untracked 변경이 하나라도 있으면 먼저 diff를 읽는다. 사용자 승인 없이 `restore`, `reset`, `clean`, 삭제 또는 덮어쓰기를 하지 않는다.
 5. 부분 구현을 이어갈 경우 clean checkpoint를 먼저 만든다. 기존 신규 파일이 남은 dirty worktree에서 새 run을 시작하면 plan의 `add`와 후속 FIX의 `modify` 판정이 충돌할 수 있다.
@@ -76,8 +82,8 @@ py -3 run_loop.py resume --run-id <id> [--accept-worktree-drift]
 | Planner | `claude_planner` |
 | Plan Reviewer | `codex_review` |
 | Implementer / Fixer | `codex_implementer` |
-| Code Reviewer | `claude_code_review` |
-| Cross Confirmer | `codex_review` |
+| Blind Review A / Adjudication A | `claude_code_review` |
+| Blind Review B / Adjudication B | `codex_review` |
 
 주의사항:
 
@@ -90,14 +96,19 @@ py -3 run_loop.py resume --run-id <id> [--accept-worktree-drift]
   - `claude_code_review=sonnet`, `effort=medium`
   - `codex_implementer=gpt-5.6-terra`, `effort=medium`
   - `codex_review=gpt-5.6-terra`, `effort=medium`
-- 후속 세션에서도 위 값을 자동 가정하지 말고 사용자에게 다시 명시적으로 확인받는다.
+- worker key와 `CLAUDE`/`CODEX` decision side는 runtime provider 이름이 아니다.
+- 신규 run은 두 review worker가 서로 다른 provider여야 한다. 의도적으로 같은
+  provider를 쓸 때만 `--allow-same-provider-consensus`를 사용하며 manifest와
+  status에 `consensus_independence=DEGRADED`로 남는다.
 
 ## 4. Runner와 orchestration 규칙
 
-1. run마다 target worktree에 전용 runner terminal을 새로 만든다.
-2. 해당 runner terminal 안에서 orchestration Run을 생성한다.
-3. orchestration Run의 `coordinator_handle`과 harness의 `--coordinator-handle`이 같은 terminal인지 확인한다.
-4. gate 조회와 gate resolve는 반드시 동일 runner terminal에서 수행한다.
+1. `start`는 실행 중인 현재 Orca terminal의 `ORCA_TERMINAL_HANDLE`을
+   coordinator handle로 사용한다. 현재 terminal이 없으면
+   `--coordinator-handle`을 명시해야 한다.
+2. harness가 역할별 worker terminal 네 개를 자동 provision한다.
+3. orchestration Run의 `coordinator_handle`과 harness state의 handle이 같은지 확인한다.
+4. gate 조회와 gate resolve는 bound orchestration Run과 gate provenance로 제한한다.
 5. step 및 total timeout은 dry-run, 실제 launch, resume에서 모두 동일하게 유지한다.
 
 권장 timeout:
@@ -127,7 +138,16 @@ plan revision에서는 **현재 revision `contract.md`의 `Delivered finding IDs
 - 과거 review의 finding ID 또는 `HumanDecision.affected_finding_ids`를 자동 계승하지 않는다.
 - 값이 non-empty이면 해당 ID 집합과 `reviewed_finding_ids`가 정확히 일치해야 하며 중복·누락·추가 ID가 없어야 한다.
 
-### 5.3 ReviewArtifact
+### 5.3 BlindReviewArtifact와 AdjudicationArtifact
+
+- `TEST_GATE`의 `PASS` 또는 `NOT_RUN` 뒤에 coordinator가 sealed
+  `CodeReviewRoundContext`와 shared read-only mirror를 한 번 만든다.
+- Blind A와 B는 동일한 logical input manifest를 받으며 서로의 artifact를
+  받지 않는다. 두 결과는 먼저 pending evidence로만 저장되고 ledger를 즉시
+  변경하지 않는다.
+- coordinator 비교가 일치하면 CODE round를 원자 적용한다. 충돌 후보가 있을
+  때만 양쪽 blind artifact와 동일 comparison을 두 adjudicator에게 공개한다.
+- `NOT_RUN`은 테스트를 실행했다는 뜻이 아니며 `PASS`로 표현하면 안 된다.
 
 반환 전에 다음 wire value를 대조한다.
 
@@ -264,6 +284,21 @@ scope_violation:<path>:modified file is not in approved plan scope
 - state가 `IN_PROGRESS`라도 runner process가 종료됐으면 정상 실행으로 간주하지 않는다.
 - terminal error, process table, state history를 함께 근거로 새 run 또는 직접 복구를 결정한다.
 
+### 9.6 Resume worktree drift와 validation lineage
+
+- `PLAN`, `PLAN_REVISE`만 drift를 자동 rebaseline한다.
+- `PLAN_REVIEW`, `PLAN_CONSENSUS_EVALUATE`는 기본 차단하며, 명시적으로
+  `--accept-worktree-drift`를 사용하면 기존 plan evidence를 폐기하고
+  `PLAN_REVISE`로 돌아간다.
+- `IMPLEMENT`, `FIX`는 기본 차단하며, 승인된 drift만 현재 write state에서
+  새 baseline으로 삼고 downstream validation evidence를 모두 지운다.
+- `TEST_GATE` 이후 review/comparison/consensus/human gate의 drift는 기본
+  차단한다. 승인 시 기존 test/review/gate evidence와 pending notice를
+  무효화하고 `TEST_GATE`로 돌아간다.
+- 최종 gate 생성 전과 `merge` 적용 직전에 live snapshot, test evidence,
+  review context, Blind A/B, 필요한 adjudication, consensus lineage와 artifact
+  digest가 모두 일치해야 한다. legacy gate의 누락 provenance를 추정하지 않는다.
+
 ## 10. Test 실행 규칙
 
 1. test policy의 exact allowlist command만 coordinator가 실행한다.
@@ -302,7 +337,7 @@ browser manual verification
 
 ```text
 [ ] 전체 prompt 확보
-[ ] 네 worker model/effort 사용자 명시 확인
+[ ] default runtime 또는 사용자 요청 override 확인
 [ ] target repository와 branch 확인
 [ ] git status와 diff 확인
 [ ] clean worktree 또는 사용자 승인 checkpoint 확인
@@ -310,8 +345,8 @@ browser manual verification
 [ ] test policy parse와 digest 확인
 [ ] baseline test 결과 기록
 [ ] prompt/request SHA-256 동일 확인
-[ ] 전용 runner terminal 생성
-[ ] orchestration Run 생성 및 coordinator handle 일치 확인
+[ ] 현재 Orca terminal의 coordinator handle 확인
+[ ] worker terminal 네 개 provision 및 orchestration Run binding 확인
 [ ] step/total timeout 명시
 [ ] dry-run PASS 및 resolved runtime 확인
 [ ] 실제 launch

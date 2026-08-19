@@ -23,6 +23,8 @@ from .generation import AtomicWriteError, write_atomic_bytes
 from .models import (
     AgentProvider,
     AgentRuntimeConfig,
+    ConsensusIndependence,
+    ConsensusProviderPolicy,
     LoopConfig,
     WorkerHandle,
     WorkerKey,
@@ -32,10 +34,10 @@ from .models import (
 
 MANIFEST_NAME = "run-manifest.json"
 REQUEST_COPY_NAME = "request.md"
-MANIFEST_SCHEMA_VERSION = 2
+MANIFEST_SCHEMA_VERSION = 3
 # Version 1 predates the persisted Orca Run ID.  It still reads, so an
 # existing run keeps its status and reports; resume is what refuses it.
-SUPPORTED_MANIFEST_VERSIONS = (1, 2)
+SUPPORTED_MANIFEST_VERSIONS = (1, 2, 3)
 
 LIMIT_KEYS = (
     "plan_consensus_round_limit",
@@ -88,6 +90,12 @@ class RunManifest:
     workers: tuple[tuple[WorkerKey, str], ...]
     # None only for a manifest migrated from schema version 1.
     orchestration_run_id: str | None = None
+    consensus_provider_policy: ConsensusProviderPolicy = (
+        ConsensusProviderPolicy.LEGACY_UNSPECIFIED
+    )
+    consensus_independence: ConsensusIndependence = (
+        ConsensusIndependence.DEGRADED
+    )
 
     def worker_handles(self) -> dict[WorkerKey, str]:
         return {key: handle for key, handle in self.workers}
@@ -215,6 +223,31 @@ def build_manifest(
     workers: tuple[tuple[WorkerKey, str], ...] = ()
     if pool is not None:
         workers = _ordered_workers(pool)
+    runtime = preflight.agent_runtime
+    agents_by_worker = {
+        item.worker_key: item
+        for item in (() if runtime is None else runtime.agents)
+    }
+    review_providers_differ = (
+        agents_by_worker.get(WorkerKey.CLAUDE_CODE_REVIEW) is not None
+        and agents_by_worker.get(WorkerKey.CODEX_REVIEW) is not None
+        and agents_by_worker[WorkerKey.CLAUDE_CODE_REVIEW].provider
+        is not agents_by_worker[WorkerKey.CODEX_REVIEW].provider
+    )
+    provider_policy = preflight.consensus_provider_policy
+    if provider_policy is None:
+        provider_policy = (
+            ConsensusProviderPolicy.DIVERSE
+            if review_providers_differ
+            else ConsensusProviderPolicy.LEGACY_UNSPECIFIED
+        )
+    independence = preflight.consensus_independence
+    if independence is None:
+        independence = (
+            ConsensusIndependence.FULL
+            if review_providers_differ
+            else ConsensusIndependence.DEGRADED
+        )
     return RunManifest(
         schema_version=MANIFEST_SCHEMA_VERSION,
         run_id=arguments.run_id,
@@ -236,6 +269,8 @@ def build_manifest(
         orca_version=preflight.orca_version,
         coordinator_handle=coordinator_handle,
         workers=workers,
+        consensus_provider_policy=provider_policy,
+        consensus_independence=independence,
     )
 
 
@@ -273,6 +308,10 @@ def manifest_value(manifest: RunManifest) -> dict[str, object]:
         "orca_version": manifest.orca_version,
         "coordinator_handle": manifest.coordinator_handle,
         "workers": {key.value: handle for key, handle in manifest.workers},
+        "consensus_provider_policy": (
+            manifest.consensus_provider_policy.value
+        ),
+        "consensus_independence": manifest.consensus_independence.value,
     }
 
 
@@ -391,6 +430,59 @@ def parse_manifest(raw_text: str) -> RunManifest:
         workers.append((worker, handle))
 
     raw_policy = value.get("test_policy")
+    providers_by_worker = {
+        record.worker_key: record.provider
+        for record in agents
+    }
+    providers_differ = (
+        providers_by_worker.get(WorkerKey.CLAUDE_CODE_REVIEW)
+        is not None
+        and providers_by_worker.get(WorkerKey.CODEX_REVIEW) is not None
+        and providers_by_worker[WorkerKey.CLAUDE_CODE_REVIEW]
+        is not providers_by_worker[WorkerKey.CODEX_REVIEW]
+    )
+    if schema_version >= 3:
+        try:
+            provider_policy = ConsensusProviderPolicy(
+                value.get("consensus_provider_policy")
+            )
+            independence = ConsensusIndependence(
+                value.get("consensus_independence")
+            )
+        except ValueError as exc:
+            raise ManifestError(
+                "run manifest consensus provider policy is invalid"
+            ) from exc
+        if (
+            provider_policy is ConsensusProviderPolicy.DIVERSE
+            and not providers_differ
+        ):
+            raise ManifestError(
+                "diverse consensus policy requires different providers"
+            )
+        if (
+            provider_policy is ConsensusProviderPolicy.EXPLICIT_SAME_PROVIDER
+            and providers_differ
+        ):
+            raise ManifestError(
+                "same-provider consensus policy requires matching providers"
+            )
+        expected_independence = (
+            ConsensusIndependence.FULL
+            if providers_differ
+            else ConsensusIndependence.DEGRADED
+        )
+        if independence is not expected_independence:
+            raise ManifestError(
+                "consensus independence does not match review providers"
+            )
+    else:
+        provider_policy = ConsensusProviderPolicy.LEGACY_UNSPECIFIED
+        independence = (
+            ConsensusIndependence.FULL
+            if providers_differ
+            else ConsensusIndependence.DEGRADED
+        )
     return RunManifest(
         schema_version=MANIFEST_SCHEMA_VERSION,
         orchestration_run_id=orchestration_run_id,
@@ -414,6 +506,8 @@ def parse_manifest(raw_text: str) -> RunManifest:
         orca_version=_require(value, "orca_version", str),
         coordinator_handle=_require(value, "coordinator_handle", str),
         workers=tuple(workers),
+        consensus_provider_policy=provider_policy,
+        consensus_independence=independence,
     )
 
 
@@ -546,6 +640,14 @@ def manifest_to_arguments(
         strict_agent_runtime=strict_agent_runtime,
         accept_worktree_drift=accept_worktree_drift,
         force_unlock=force_unlock,
+        allow_same_provider_consensus=(
+            manifest.consensus_provider_policy
+            in {
+                ConsensusProviderPolicy.EXPLICIT_SAME_PROVIDER,
+                ConsensusProviderPolicy.LEGACY_UNSPECIFIED,
+            }
+        ),
+        consensus_provider_policy=manifest.consensus_provider_policy,
     )
 
 

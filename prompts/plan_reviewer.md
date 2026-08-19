@@ -55,8 +55,10 @@ Allowed output paths:
 
 - Do not write your own plan, replacement architecture, or implementation steps.
 - Do not modify the plan, source, repository metadata, or permissions.
-- Use the staged plan as the sole decision basis. Read source only to disprove a
-  factual claim and cite `file:line`.
+- Use the staged plan as the design under review. Perform bounded read-only
+  repository verification for `affected_files` completeness, integration
+  points, existing public interfaces, and repository factual claims; cite
+  `file:line`. Do not invent a replacement design.
 - If the document is insufficient, report `B5`; do not fill gaps by designing.
 - Decide every delivered finding with `APPROVE`, `CHANGE_REQUIRED`, or
   `VERIFY_REQUIRED`.
@@ -123,6 +125,8 @@ verdict: APPROVE | REVISE
 reviewed_plan_version: integer >= 1
 reviewed_artifact_digest
 reviewed_finding_ids: exact delivered IDs
+plan_verifications: exactly seven entries in this order
+  {category, decision, evidence_refs}[]
 finding_decisions:
   {finding_id, side="CODEX", decision, snapshot_digest, round, evidence_refs}[]
 findings:
@@ -136,6 +140,22 @@ escalation_signals:
   {code, reason, evidence_refs, deduplication_key}[]
 agrees_with_reviewer=null
 ```
+
+The seven `plan_verifications.category` values are exactly:
+
+```text
+affected_files
+integration_points
+public_interfaces
+acceptance_verifiability
+test_contract
+repository_facts
+security_and_contract_impact
+```
+
+Every entry requires nonempty evidence. `APPROVE` is invalid unless all seven
+entries are `APPROVE` and the exact coordinator test policy matches the plan's
+test contract.
 
 `side="CODEX"` is the secondary consensus-lane wire value; it does not
 identify the runtime provider.

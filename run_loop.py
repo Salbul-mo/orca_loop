@@ -31,7 +31,14 @@ from orca_loop.config import (
 )
 from orca_loop.contracts import (
     ContractViolationError,
+    digest_value,
+    parse_adjudication_artifact,
+    parse_blind_review_artifact,
     parse_plan_document,
+    parse_review_comparison,
+    parse_review_context,
+    parse_test_evidence,
+    serialize_json,
 )
 from orca_loop.coordinator import (
     CoordinatorGuardError,
@@ -65,6 +72,7 @@ from orca_loop.escalation import (
     destructive_gate,
     ensure_user_decision_notice,
     find_gate_for_report,
+    invalidate_user_decision_notice,
     read_user_decision_notice,
     read_user_decision_notice_delivery,
     resolve_user_decision_notice,
@@ -89,7 +97,12 @@ from orca_loop.generation import (
     load_committed,
     write_atomic_bytes,
 )
-from orca_loop.ledger import empty_ledger, unresolved_scope
+from orca_loop.ledger import (
+    apply_review_artifact,
+    commit_round,
+    empty_ledger,
+    unresolved_scope,
+)
 from orca_loop.locking import (
     LockInfo,
     RunLockError,
@@ -104,9 +117,16 @@ from orca_loop.models import (
     ResumeOutcome,
     MutationRecord,
     ActiveStep,
+    AdjudicationDecision,
+    AdjudicationArtifact,
     ArtifactKind,
+    BlindReviewArtifact,
+    CodeReviewRoundContext,
     ConsensusKind,
+    ConsensusLedger,
     CoordinatorState,
+    DecisionValue,
+    ExpectedProvenance,
     GateKind,
     GateBinding,
     HumanDecisionKind,
@@ -114,15 +134,25 @@ from orca_loop.models import (
     LoopCounters,
     NoticeChannel,
     LoopState,
+    MergeQualification,
     PlanDocument,
+    PendingReviewRound,
+    PendingReviewStage,
     ResumeDecision,
     ReviewArtifact,
+    ReviewComparison,
+    ReviewComparisonStatus,
+    ReviewConflictCandidate,
+    ReviewConflictKind,
+    ReviewLane,
+    ReviewPhase,
     Role,
     RoleContext,
     RoundEvidence,
     RunStatus,
     ScopeManifest,
     ScopePackage,
+    Side,
     SignalKind,
     StepExecutionResult,
     StepStage,
@@ -130,6 +160,7 @@ from orca_loop.models import (
     TestGateStatus,
     TransitionSignal,
     UserDecisionNotice,
+    ValidationLineage,
     WorkerKey,
     WorkerPool,
 )
@@ -141,7 +172,12 @@ from orca_loop.orca_client import (
 )
 from orca_loop.profiles import build_launch_profile
 from orca_loop.readonly import prepare_readonly_mirror
-from orca_loop.reporting import render_failure_report, resume_command_line
+from orca_loop.reporting import (
+    record_artifact_history,
+    render_failure_report,
+    render_stage_report,
+    resume_command_line,
+)
 from orca_loop.runspec import (
     ManifestError,
     manifest_identity_problems,
@@ -449,24 +485,11 @@ class ResumeBlockedError(RuntimeError):
     """Raised when a resume needs an explicit user decision to continue."""
 
 
-# States whose step only reads the worktree. Resuming one after the tree
-# changed cannot corrupt anything, so the recorded snapshot is re-baselined
-# automatically; a write step is not resumed over a changed tree without an
-# explicit --accept-worktree-drift.
-READ_ONLY_RESUME_STATES = frozenset(
-    {
-        LoopState.PLAN,
-        LoopState.PLAN_REVISE,
-        LoopState.PLAN_REVIEW,
-        LoopState.CODE_REVIEW,
-        LoopState.CROSS_CONFIRM,
-        LoopState.PLAN_CONSENSUS_EVALUATE,
-        LoopState.CONSENSUS_EVALUATE,
-        LoopState.TEST_GATE,
-        LoopState.HUMAN_GATE,
-        LoopState.USER_DECISION_REQUIRED,
-    }
+PLAN_REBASELINE_STATES = frozenset({LoopState.PLAN, LoopState.PLAN_REVISE})
+PLAN_EVIDENCE_STATES = frozenset(
+    {LoopState.PLAN_REVIEW, LoopState.PLAN_CONSENSUS_EVALUATE}
 )
+WRITE_STATES = frozenset({LoopState.IMPLEMENT, LoopState.FIX})
 
 
 @dataclass(frozen=True)
@@ -475,6 +498,8 @@ class DriftDecision:
     rebaselined: bool
     new_digest: str | None
     detail: tuple[str, ...]
+    target_state: LoopState | None = None
+    invalidate_evidence: bool = False
 
 
 def _snapshot_difference(
@@ -505,13 +530,34 @@ def _resolve_drift(
     if current.snapshot_digest == state.snapshot_digest:
         return DriftDecision(False, False, None, ())
     detail = _snapshot_difference(state, current)
-    if state.state in READ_ONLY_RESUME_STATES or accept:
+    if state.state in PLAN_REBASELINE_STATES:
         return DriftDecision(True, True, current.snapshot_digest, detail)
+    if accept:
+        source_state = (
+            state.blocked_from_state
+            if state.state is LoopState.USER_DECISION_REQUIRED
+            and state.blocked_from_state is not None
+            else state.state
+        )
+        if source_state in PLAN_EVIDENCE_STATES:
+            target = LoopState.PLAN_REVISE
+        elif source_state in WRITE_STATES:
+            target = source_state
+        else:
+            target = LoopState.TEST_GATE
+        return DriftDecision(
+            True,
+            True,
+            current.snapshot_digest,
+            detail,
+            target_state=target,
+            invalidate_evidence=True,
+        )
     raise ResumeBlockedError(
         "worktree changed since the last committed generation while the run "
-        f"was in {state.state.value}, which writes to the worktree. Review "
-        "the changes, then resume with --accept-worktree-drift to continue "
-        "from the current tree. "
+        f"was in {state.state.value}; existing plan or validation evidence "
+        "cannot be relabeled to the new snapshot. Review the changes, then "
+        "resume with --accept-worktree-drift to invalidate stale evidence. "
         + "; ".join(detail)
     )
 
@@ -681,6 +727,11 @@ def _resume(
             )
         if drift.rebaselined:
             reasons.append("worktree snapshot re-baselined")
+        if drift.invalidate_evidence and state.gate_binding is not None:
+            invalidate_user_decision_notice(
+                workspace.control_dir,
+                reason="worktree drift invalidated gate-bound evidence",
+            )
         controller.state = replace(
             controller.state,
             coordinator_handle=coordinator.handle,
@@ -691,6 +742,19 @@ def _resume(
             active=controller.state.active,
             reason="resume: " + "; ".join(reasons),
             snapshot_digest=drift.new_digest,
+            state_value=(
+                controller.state.state
+                if drift.target_state is None
+                else drift.target_state
+            ),
+            validation_lineage=(
+                None
+                if not drift.invalidate_evidence
+                else ValidationLineage()
+            ),
+            clear_pending_review=drift.invalidate_evidence,
+            clear_gate=drift.invalidate_evidence,
+            clear_blocked_context=drift.invalidate_evidence,
         )
         append_event(
             workspace.control_dir,
@@ -902,11 +966,816 @@ def _user_scope(
     )
 
 
+def _tree_digest(root: Path) -> str:
+    base = root.resolve()
+    entries: list[dict[str, str]] = []
+    for path in sorted(
+        (item for item in base.rglob("*") if item.is_file()),
+        key=lambda item: item.relative_to(base).as_posix().encode("utf-8"),
+    ):
+        if path.is_symlink():
+            raise OrcaLoopError(f"review mirror contains symlink: {path}")
+        entries.append(
+            {
+                "path": path.relative_to(base).as_posix(),
+                "digest": _digest(path),
+            }
+        )
+    return digest_value(entries)
+
+
+def _review_round_dir(controller: GenerationController) -> Path:
+    return (
+        controller.workspace.review_dir
+        / f"round-{max(1, controller.ledger.code_round + 1)}"
+    )
+
+
+def _ledger_content_digest(ledger: ConsensusLedger) -> str:
+    value = json.loads(serialize_json(ledger))
+    value.pop("generation", None)
+    return digest_value(value)
+
+
+def _load_review_context(
+    controller: GenerationController,
+) -> CodeReviewRoundContext:
+    path = controller.workspace.artifact_dir / "review_context.json"
+    if not path.is_file():
+        raise OrcaLoopError("review context is missing")
+    before_digest = _digest(path)
+    context = parse_review_context(path.read_text(encoding="utf-8"))
+    if _digest(path) != before_digest:
+        raise OrcaLoopError("review context changed while reading")
+    return context
+
+
+def _prepare_review_context(
+    controller: GenerationController,
+    preflight: PreflightResult,
+) -> StepExecutionResult:
+    if controller.state.pending_review is not None:
+        raise OrcaLoopError("a pending review round already exists")
+    plan = _load_plan(controller.workspace.root)
+    if plan is None:
+        raise OrcaLoopError("review context requires a promoted plan")
+    implementation_path = controller.workspace.artifact_dir / "implementation.json"
+    test_path = controller.workspace.artifact_dir / "test_evidence.json"
+    if not implementation_path.is_file() or not test_path.is_file():
+        raise OrcaLoopError("review context requires implementation and test evidence")
+    test_evidence = parse_test_evidence(test_path.read_text(encoding="utf-8"))
+    worktree = preflight.arguments.config.worktree_path
+    before = capture_snapshot(worktree)
+    if before.snapshot_digest != controller.state.snapshot_digest:
+        raise OrcaLoopError("worktree changed before review context preparation")
+    if test_evidence.authoritative_snapshot_digest != before.snapshot_digest:
+        raise OrcaLoopError("test evidence does not bind the current snapshot")
+    round_value = max(1, controller.ledger.code_round + 1)
+    round_dir = _review_round_dir(controller)
+    round_dir.mkdir(parents=True, exist_ok=True)
+    frozen = materialize_frozen_review(
+        worktree,
+        before,
+        plan.affected_files,
+        round_dir,
+        destructive_approval_digest=(
+            None
+            if controller.state.destructive_approval is None
+            else controller.state.destructive_approval.decision_digest
+        ),
+    )
+    mirror_parent = _readonly_mirror_root(
+        worktree,
+        round_dir / "mirror",
+        controller.state.run_id,
+    )
+    mirror_generation = controller.state.generation + 1
+    while (mirror_parent / f"repository-{mirror_generation}").exists():
+        mirror_generation += 1
+    mirror_path = prepare_readonly_mirror(
+        worktree,
+        mirror_parent,
+        mirror_generation,
+    )
+    mirror_digest = _tree_digest(mirror_path)
+    binding_value = {
+        "schema_version": 1,
+        "round": round_value,
+        "path": str(mirror_path.resolve()),
+        "source_snapshot_digest": before.snapshot_digest,
+        "tree_digest": mirror_digest,
+    }
+    write_atomic_bytes(
+        round_dir / "mirror-binding.json",
+        (json.dumps(binding_value, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"),
+    )
+    scope = _user_scope(controller)
+    value: dict[str, object] = {
+        "schema_version": 1,
+        "run_id": controller.state.run_id,
+        "consensus_round": round_value,
+        "plan_version": controller.state.plan_version,
+        "snapshot_digest": before.snapshot_digest,
+        "implementation_artifact_digest": _digest(implementation_path),
+        "test_evidence_digest": _digest(test_path),
+        "frozen_diff_digest": _digest(frozen.diff_path),
+        "scope_manifest_digest": _digest(frozen.manifest_path),
+        "readonly_mirror_digest": mirror_digest,
+        "baseline_finding_ids": list(scope.finding_ids),
+        "acceptance_criteria_ids": [item.criterion_id for item in plan.acceptance_criteria],
+        "affected_files": [
+            {
+                "path": item.path,
+                "operation": item.operation.value,
+                "rename_from": item.rename_from,
+            }
+            for item in plan.affected_files
+        ],
+        "test_ids": list(plan.test_contract.test_ids),
+    }
+    value["context_digest"] = digest_value(value)
+    context = parse_review_context(json.dumps(value, ensure_ascii=False))
+    context_path = controller.workspace.artifact_dir / "review_context.json"
+    write_atomic_bytes(
+        context_path,
+        (serialize_json(context) + "\n").encode("utf-8"),
+    )
+    if parse_review_context(context_path.read_text(encoding="utf-8")) != context:
+        raise OrcaLoopError("persisted review context differs after write")
+    after = capture_snapshot(worktree)
+    if after != before:
+        raise OrcaLoopError("worktree changed during review context preparation")
+    pending = PendingReviewRound(
+        consensus_round=round_value,
+        stage=PendingReviewStage.CONTEXT_READY,
+        review_context_digest=context.context_digest,
+        pre_round_ledger_digest=_ledger_content_digest(controller.ledger),
+    )
+    lineage = replace(
+        controller.state.validation_lineage,
+        review_context_snapshot_digest=before.snapshot_digest,
+        review_context_digest=context.context_digest,
+        blind_review_a_snapshot_digest=None,
+        blind_review_a_artifact_digest=None,
+        blind_review_b_snapshot_digest=None,
+        blind_review_b_artifact_digest=None,
+        review_comparison_digest=None,
+        adjudication_a_snapshot_digest=None,
+        adjudication_a_artifact_digest=None,
+        adjudication_b_snapshot_digest=None,
+        adjudication_b_artifact_digest=None,
+        consensus_snapshot_digest=None,
+    )
+    controller.commit(
+        stage=StepStage.ARTIFACT_VERIFIED,
+        active=None,
+        reason="sealed code review context prepared",
+        pending_review=pending,
+        validation_lineage=lineage,
+    )
+    return StepExecutionResult(
+        TransitionSignal(
+            SignalKind.CONTEXT_PREPARED,
+            "sealed review context prepared",
+            scope.finding_ids,
+        ),
+        controller.ledger,
+        controller.state.test_gate_status,
+    )
+
+
+def _load_blind_review(
+    controller: GenerationController,
+    kind: ArtifactKind,
+) -> BlindReviewArtifact:
+    context = _load_review_context(controller)
+    test_evidence = parse_test_evidence(
+        (controller.workspace.artifact_dir / "test_evidence.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    path = controller.workspace.artifact_dir / f"{kind.value}.json"
+    pending = controller.state.pending_review
+    expected_digest = (
+        None
+        if pending is None
+        else (
+            pending.blind_a_artifact_digest
+            if kind is ArtifactKind.CODE_REVIEW_A
+            else pending.blind_b_artifact_digest
+        )
+    )
+    if not path.is_file() or expected_digest is None or _digest(path) != expected_digest:
+        raise OrcaLoopError(f"promoted {kind.value} provenance mismatch")
+    raw_text = path.read_text(encoding="utf-8")
+    try:
+        raw = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise OrcaLoopError(f"promoted {kind.value} is malformed") from exc
+    if not isinstance(raw, dict):
+        raise OrcaLoopError(f"promoted {kind.value} must be an object")
+    expected = ExpectedProvenance(
+        run_id=controller.state.run_id,
+        task_id=str(raw.get("task_id", "")),
+        dispatch_id=str(raw.get("dispatch_id", "")),
+        consensus_round=context.consensus_round,
+        snapshot_digest=context.snapshot_digest,
+    )
+    return parse_blind_review_artifact(
+        raw_text,
+        kind,
+        expected,
+        expected_plan_version=context.plan_version,
+        expected_context_digest=context.context_digest,
+        expected_reviewed_artifact_digest=context.implementation_artifact_digest,
+        delivered_finding_ids=context.baseline_finding_ids,
+        acceptance_criteria_ids=context.acceptance_criteria_ids,
+        affected_files=context.affected_files,
+        test_ids=context.test_ids,
+        test_gate_status=test_evidence.test_gate_status,
+    )
+
+
+def _finding_semantic_digest(finding) -> str:
+    value = json.loads(serialize_json(finding))
+    value.pop("finding_id", None)
+    return digest_value(value)
+
+
+def _candidate(
+    index: int,
+    kind: ReviewConflictKind,
+    *,
+    finding_ids: tuple[str, ...] = (),
+    acceptance_ids: tuple[str, ...] = (),
+    affected_files: tuple[str, ...] = (),
+    test_ids: tuple[str, ...] = (),
+    a: DecisionValue | None = None,
+    b: DecisionValue | None = None,
+    signature: str,
+    evidence: tuple[str, ...],
+) -> ReviewConflictCandidate:
+    return ReviewConflictCandidate(
+        candidate_id=f"CAND-{index:04d}",
+        kind=kind,
+        finding_ids=finding_ids,
+        acceptance_criteria_ids=acceptance_ids,
+        affected_files=affected_files,
+        test_ids=test_ids,
+        blind_a_decision=a,
+        blind_b_decision=b,
+        normalized_signature=signature,
+        evidence_refs=evidence,
+    )
+
+
+def _compare_blind_pair(
+    controller: GenerationController,
+    blind_a: BlindReviewArtifact,
+    blind_b: BlindReviewArtifact,
+) -> ReviewComparison:
+    context = _load_review_context(controller)
+    pending = controller.state.pending_review
+    if pending is None:
+        raise OrcaLoopError("blind pair has no pending review round")
+    candidates: list[ReviewConflictCandidate] = []
+    agreed: list[str] = []
+
+    def add(kind, **kwargs) -> None:
+        candidates.append(_candidate(len(candidates) + 1, kind, **kwargs))
+
+    a_decisions = {item.finding_id: item for item in blind_a.finding_decisions}
+    b_decisions = {item.finding_id: item for item in blind_b.finding_decisions}
+    for finding_id in context.baseline_finding_ids:
+        a_item = a_decisions[finding_id]
+        b_item = b_decisions[finding_id]
+        if a_item.decision is b_item.decision:
+            agreed.append(finding_id)
+        else:
+            add(
+                ReviewConflictKind.BASELINE_DECISION,
+                finding_ids=(finding_id,),
+                a=a_item.decision,
+                b=b_item.decision,
+                signature=digest_value(
+                    [finding_id, a_item.decision.value, b_item.decision.value]
+                ),
+                evidence=a_item.evidence_refs + b_item.evidence_refs,
+            )
+    for a_item, b_item in zip(
+        blind_a.acceptance_evaluations,
+        blind_b.acceptance_evaluations,
+        strict=True,
+    ):
+        if a_item.decision is not b_item.decision:
+            add(
+                ReviewConflictKind.COVERAGE,
+                acceptance_ids=(a_item.criterion_id,),
+                a=a_item.decision,
+                b=b_item.decision,
+                signature=digest_value(
+                    [a_item.criterion_id, a_item.decision.value, b_item.decision.value]
+                ),
+                evidence=a_item.evidence_refs + b_item.evidence_refs,
+            )
+    for a_item, b_item in zip(
+        blind_a.file_evaluations,
+        blind_b.file_evaluations,
+        strict=True,
+    ):
+        if a_item.decision is not b_item.decision:
+            add(
+                ReviewConflictKind.COVERAGE,
+                affected_files=(a_item.path,),
+                a=a_item.decision,
+                b=b_item.decision,
+                signature=digest_value(
+                    [a_item.path, a_item.decision.value, b_item.decision.value]
+                ),
+                evidence=a_item.evidence_refs + b_item.evidence_refs,
+            )
+    for a_item, b_item in zip(
+        blind_a.test_evaluations,
+        blind_b.test_evaluations,
+        strict=True,
+    ):
+        if a_item.decision is not b_item.decision:
+            add(
+                ReviewConflictKind.VERIFICATION,
+                test_ids=(a_item.test_id,),
+                a=a_item.decision,
+                b=b_item.decision,
+                signature=digest_value(
+                    [a_item.test_id, a_item.decision.value, b_item.decision.value]
+                ),
+                evidence=a_item.evidence_refs + b_item.evidence_refs,
+            )
+    a_findings = {item.finding_id: item for item in blind_a.findings}
+    b_findings = {item.finding_id: item for item in blind_b.findings}
+    for finding_id in sorted(
+        set(a_findings) | set(b_findings),
+        key=lambda item: item.encode("utf-8"),
+    ):
+        a_finding = a_findings.get(finding_id)
+        b_finding = b_findings.get(finding_id)
+        if a_finding is None or b_finding is None:
+            present = a_finding or b_finding
+            assert present is not None
+            add(
+                ReviewConflictKind.UNILATERAL_FINDING,
+                finding_ids=(finding_id,),
+                a=(None if a_finding is None else a_decisions[finding_id].decision),
+                b=(None if b_finding is None else b_decisions[finding_id].decision),
+                signature=_finding_semantic_digest(present),
+                evidence=present.evidence_refs,
+            )
+        elif (
+            _finding_semantic_digest(a_finding)
+            != _finding_semantic_digest(b_finding)
+        ):
+            add(
+                ReviewConflictKind.FINDING_SIGNATURE,
+                finding_ids=(finding_id,),
+                a=a_decisions[finding_id].decision,
+                b=b_decisions[finding_id].decision,
+                signature=digest_value(
+                    [
+                        _finding_semantic_digest(a_finding),
+                        _finding_semantic_digest(b_finding),
+                    ]
+                ),
+                evidence=a_finding.evidence_refs + b_finding.evidence_refs,
+            )
+        elif a_decisions[finding_id].decision is not b_decisions[finding_id].decision:
+            add(
+                ReviewConflictKind.BASELINE_DECISION,
+                finding_ids=(finding_id,),
+                a=a_decisions[finding_id].decision,
+                b=b_decisions[finding_id].decision,
+                signature=_finding_semantic_digest(a_finding),
+                evidence=a_finding.evidence_refs + b_finding.evidence_refs,
+            )
+        else:
+            agreed.append(finding_id)
+    value: dict[str, object] = {
+        "schema_version": 1,
+        "run_id": controller.state.run_id,
+        "consensus_round": context.consensus_round,
+        "snapshot_digest": context.snapshot_digest,
+        "review_context_digest": context.context_digest,
+        "pre_round_ledger_digest": pending.pre_round_ledger_digest,
+        "blind_a_artifact_digest": pending.blind_a_artifact_digest,
+        "blind_b_artifact_digest": pending.blind_b_artifact_digest,
+        "status": (
+            ReviewComparisonStatus.AGREED.value
+            if not candidates
+            else ReviewComparisonStatus.ADJUDICATION_REQUIRED.value
+        ),
+        "agreed_finding_ids": sorted(set(agreed), key=lambda item: item.encode("utf-8")),
+        "candidates": [json.loads(serialize_json(item)) for item in candidates],
+    }
+    value["comparison_digest"] = digest_value(value)
+    return parse_review_comparison(json.dumps(value, ensure_ascii=False))
+
+
+def _as_review_artifact(
+    artifact: BlindReviewArtifact,
+    *,
+    findings=None,
+    decisions=None,
+) -> ReviewArtifact:
+    return ReviewArtifact(
+        schema_version=artifact.schema_version,
+        artifact_kind=(
+            ArtifactKind.CODE_REVIEW
+            if artifact.lane is ReviewLane.A
+            else ArtifactKind.CROSS_REVIEW
+        ),
+        run_id=artifact.run_id,
+        task_id=artifact.task_id,
+        dispatch_id=artifact.dispatch_id,
+        consensus_round=artifact.consensus_round,
+        snapshot_digest=artifact.snapshot_digest,
+        role=artifact.role,
+        verdict=artifact.verdict,
+        reviewed_plan_version=artifact.plan_version,
+        reviewed_artifact_digest=artifact.reviewed_artifact_digest,
+        reviewed_finding_ids=artifact.reviewed_finding_ids,
+        finding_decisions=(
+            artifact.finding_decisions if decisions is None else tuple(decisions)
+        ),
+        findings=artifact.findings if findings is None else tuple(findings),
+        non_blocking_suggestions=artifact.non_blocking_suggestions,
+        escalation_signals=artifact.escalation_signals,
+        agrees_with_reviewer=None,
+    )
+
+
+def _apply_code_round(
+    controller: GenerationController,
+    blind_a: BlindReviewArtifact,
+    blind_b: BlindReviewArtifact,
+    config,
+    *,
+    a_review: ReviewArtifact | None = None,
+    b_review: ReviewArtifact | None = None,
+) -> tuple[ConsensusLedger, tuple]:
+    context = _load_review_context(controller)
+    pending = controller.state.pending_review
+    if pending is None:
+        raise OrcaLoopError("code round has no pending evidence")
+    current_ledger_digest = _ledger_content_digest(controller.ledger)
+    if current_ledger_digest != pending.pre_round_ledger_digest:
+        raise OrcaLoopError("ledger changed while review evidence was pending")
+    first = apply_review_artifact(
+        controller.ledger,
+        _as_review_artifact(blind_a) if a_review is None else a_review,
+        Side.CLAUDE,
+    )
+    second = apply_review_artifact(
+        first.ledger,
+        _as_review_artifact(blind_b) if b_review is None else b_review,
+        Side.CODEX,
+    )
+    evidence = RoundEvidence(
+        kind=ConsensusKind.CODE,
+        consensus_round=context.consensus_round,
+        reviewed_plan_version=None,
+        reviewed_snapshot_digest=context.snapshot_digest,
+        artifact_digests=(
+            pending.blind_a_artifact_digest or "",
+            pending.blind_b_artifact_digest or "",
+        ),
+        changed_during_round=False,
+        both_artifacts_valid=True,
+    )
+    committed = commit_round(
+        second.ledger,
+        evidence,
+        plan_limit=config.plan_consensus_round_limit,
+        code_limit=config.code_consensus_round_limit,
+        expected_snapshot_digest=context.snapshot_digest,
+    )
+    if not committed.committed_round:
+        raise OrcaLoopError("code review pair did not form a valid round")
+    return (
+        committed.ledger,
+        first.escalations + second.escalations + committed.escalations,
+    )
+
+
+def _execute_review_compare(
+    controller: GenerationController,
+    config,
+) -> StepExecutionResult:
+    pending = controller.state.pending_review
+    if pending is None:
+        raise OrcaLoopError("review comparison has no pending round")
+    context = _load_review_context(controller)
+    if capture_snapshot(config.worktree_path).snapshot_digest != context.snapshot_digest:
+        raise OrcaLoopError("worktree changed during the code review round")
+    blind_a = _load_blind_review(controller, ArtifactKind.CODE_REVIEW_A)
+    blind_b = _load_blind_review(controller, ArtifactKind.CODE_REVIEW_B)
+    comparison_path = controller.workspace.artifact_dir / "review_comparison.json"
+    if pending.stage is PendingReviewStage.BLIND_PAIR_READY:
+        comparison = _compare_blind_pair(controller, blind_a, blind_b)
+        write_atomic_bytes(
+            comparison_path,
+            (serialize_json(comparison) + "\n").encode("utf-8"),
+        )
+        comparison_raw = (serialize_json(comparison) + "\n").encode("utf-8")
+        record_artifact_history(
+            controller.workspace.root,
+            "review_comparison",
+            controller.state.generation + 1,
+            comparison_raw,
+        )
+        render_stage_report(
+            controller.workspace.root,
+            "review_comparison",
+            comparison_raw.decode("utf-8"),
+            controller.state.generation + 1,
+        )
+        reveal_digest = digest_value(
+            {
+                "review_context": comparison.review_context_digest,
+                "blind_a": comparison.blind_a_artifact_digest,
+                "blind_b": comparison.blind_b_artifact_digest,
+                "comparison": comparison.comparison_digest,
+            }
+        )
+        next_pending = replace(
+            pending,
+            stage=PendingReviewStage.COMPARISON_READY,
+            comparison_digest=comparison.comparison_digest,
+            reveal_manifest_digest=reveal_digest,
+        )
+        lineage = replace(
+            controller.state.validation_lineage,
+            review_comparison_digest=comparison.comparison_digest,
+        )
+        if comparison.status is ReviewComparisonStatus.AGREED:
+            next_ledger, escalations = _apply_code_round(
+                controller,
+                blind_a,
+                blind_b,
+                config,
+            )
+            lineage = replace(
+                lineage,
+                consensus_snapshot_digest=comparison.snapshot_digest,
+            )
+            controller.commit(
+                stage=StepStage.ARTIFACT_VERIFIED,
+                active=None,
+                reason="blind review pair agreed and was applied atomically",
+                ledger=next_ledger,
+                pending_review=next_pending,
+                validation_lineage=lineage,
+            )
+            return StepExecutionResult(
+                TransitionSignal(
+                    SignalKind.ESCALATE if escalations else SignalKind.AGREED,
+                    (
+                        "; ".join(item.reason for item in escalations)
+                        if escalations
+                        else "blind review pair agreed"
+                    ),
+                    _user_scope(controller).finding_ids,
+                ),
+                controller.ledger,
+                controller.state.test_gate_status,
+                escalations,
+            )
+        controller.commit(
+            stage=StepStage.ARTIFACT_VERIFIED,
+            active=None,
+            reason="blind review pair requires adjudication",
+            pending_review=next_pending,
+            validation_lineage=lineage,
+        )
+        return StepExecutionResult(
+            TransitionSignal(
+                SignalKind.CONFLICT,
+                "blind review candidates require symmetric adjudication",
+                tuple(
+                    finding_id
+                    for item in comparison.candidates
+                    for finding_id in item.finding_ids
+                ),
+            ),
+            controller.ledger,
+            controller.state.test_gate_status,
+        )
+    if pending.stage is not PendingReviewStage.ADJUDICATION_PAIR_READY:
+        raise OrcaLoopError("review comparison pending stage is invalid")
+    comparison = parse_review_comparison(comparison_path.read_text(encoding="utf-8"))
+    adjudications: list[AdjudicationArtifact] = []
+    for kind, expected_digest in (
+        (ArtifactKind.REVIEW_ADJUDICATION_A, pending.adjudication_a_artifact_digest),
+        (ArtifactKind.REVIEW_ADJUDICATION_B, pending.adjudication_b_artifact_digest),
+    ):
+        path = controller.workspace.artifact_dir / f"{kind.value}.json"
+        if expected_digest is None or not path.is_file() or _digest(path) != expected_digest:
+            raise OrcaLoopError(f"{kind.value} provenance mismatch")
+        raw_text = path.read_text(encoding="utf-8")
+        raw = json.loads(raw_text)
+        expected = ExpectedProvenance(
+            run_id=controller.state.run_id,
+            task_id=str(raw.get("task_id", "")),
+            dispatch_id=str(raw.get("dispatch_id", "")),
+            consensus_round=comparison.consensus_round,
+            snapshot_digest=comparison.snapshot_digest,
+        )
+        adjudications.append(
+            parse_adjudication_artifact(
+                raw_text,
+                kind,
+                expected,
+                expected_context_digest=comparison.review_context_digest,
+                comparison=comparison,
+                valid_duplicate_targets=tuple(
+                    item.finding.finding_id for item in controller.ledger.findings
+                ),
+            )
+        )
+    a_adj, b_adj = adjudications
+    if any(
+        a_item.decision is not b_item.decision
+        or a_item.duplicate_of != b_item.duplicate_of
+        for a_item, b_item in zip(
+            a_adj.candidate_decisions,
+            b_adj.candidate_decisions,
+            strict=True,
+        )
+    ):
+        return StepExecutionResult(
+            TransitionSignal(
+                SignalKind.ESCALATE,
+                "adjudicators disagreed on candidate disposition",
+                tuple(
+                    finding_id
+                    for item in comparison.candidates
+                    for finding_id in item.finding_ids
+                ),
+            ),
+            controller.ledger,
+            controller.state.test_gate_status,
+        )
+    rejected_ids: set[str] = set()
+    duplicate_ids: set[str] = set()
+    canonical_a_ids: set[str] = set()
+    for candidate, disposition in zip(
+        comparison.candidates,
+        a_adj.candidate_decisions,
+        strict=True,
+    ):
+        if disposition.decision is AdjudicationDecision.REJECT:
+            rejected_ids.update(candidate.finding_ids)
+        elif disposition.decision is AdjudicationDecision.DUPLICATE:
+            duplicate_ids.update(
+                item
+                for item in candidate.finding_ids
+                if item != disposition.duplicate_of
+            )
+        elif candidate.kind is ReviewConflictKind.FINDING_SIGNATURE:
+            canonical_a_ids.update(candidate.finding_ids)
+    filtered = rejected_ids | duplicate_ids
+    baseline_ids = set(_load_review_context(controller).baseline_finding_ids)
+    filtered_new = filtered - baseline_ids
+    rejected_baseline = rejected_ids & baseline_ids
+
+    def adjudicated_decisions(items):
+        return tuple(
+            replace(item, decision=DecisionValue.APPROVE)
+            if item.finding_id in rejected_baseline
+            else item
+            for item in items
+            if item.finding_id not in filtered_new
+        )
+
+    a_review = _as_review_artifact(
+        blind_a,
+        findings=(
+            item for item in blind_a.findings if item.finding_id not in filtered_new
+        ),
+        decisions=adjudicated_decisions(blind_a.finding_decisions),
+    )
+    b_review = _as_review_artifact(
+        blind_b,
+        findings=(
+            next(
+                candidate
+                for candidate in blind_a.findings
+                if candidate.finding_id == item.finding_id
+            )
+            if item.finding_id in canonical_a_ids
+            else item
+            for item in blind_b.findings
+            if item.finding_id not in filtered_new
+        ),
+        decisions=adjudicated_decisions(blind_b.finding_decisions),
+    )
+    next_ledger, escalations = _apply_code_round(
+        controller,
+        blind_a,
+        blind_b,
+        config,
+        a_review=a_review,
+        b_review=b_review,
+    )
+    lineage = replace(
+        controller.state.validation_lineage,
+        consensus_snapshot_digest=comparison.snapshot_digest,
+    )
+    controller.commit(
+        stage=StepStage.ARTIFACT_VERIFIED,
+        active=None,
+        reason="adjudicated review pair applied atomically",
+        ledger=next_ledger,
+        validation_lineage=lineage,
+    )
+    return StepExecutionResult(
+        TransitionSignal(
+            SignalKind.ESCALATE if escalations else SignalKind.AGREED,
+            (
+                "; ".join(item.reason for item in escalations)
+                if escalations
+                else "adjudicated review pair committed"
+            ),
+            _user_scope(controller).finding_ids,
+        ),
+        controller.ledger,
+        controller.state.test_gate_status,
+        escalations,
+    )
+
+
 def _step_inputs(
     controller: GenerationController,
     preflight: PreflightResult,
     role: Role,
 ) -> tuple[StagedInput, ...]:
+    state = controller.state.state
+    artifacts = controller.workspace.artifact_dir
+    if state in {
+        LoopState.CODE_REVIEW_A,
+        LoopState.CODE_REVIEW_B,
+        LoopState.ADJUDICATE_A,
+        LoopState.ADJUDICATE_B,
+    }:
+        context = _load_review_context(controller)
+        round_dir = _review_round_dir(controller)
+        sealed = (
+            ("request.md", preflight.arguments.config.request_path, None),
+            ("plan.json", artifacts / "plan.json", None),
+            ("plan_review.json", artifacts / "plan_review.json", None),
+            (
+                "implementation.json",
+                artifacts / "implementation.json",
+                context.implementation_artifact_digest,
+            ),
+            (
+                "test-evidence.json",
+                artifacts / "test_evidence.json",
+                context.test_evidence_digest,
+            ),
+            (
+                "review-context.json",
+                artifacts / "review_context.json",
+                None,
+            ),
+            (
+                "frozen.diff",
+                round_dir / "frozen.diff",
+                context.frozen_diff_digest,
+            ),
+            (
+                "scope-manifest.json",
+                round_dir / "scope-manifest.json",
+                context.scope_manifest_digest,
+            ),
+        )
+        values: list[StagedInput] = []
+        for name, path, expected_digest in sealed:
+            if not path.is_file():
+                raise OrcaLoopError(f"required review input is missing: {name}")
+            if expected_digest is not None and _digest(path) != expected_digest:
+                raise OrcaLoopError(f"sealed review input digest mismatch: {name}")
+            values.append(StagedInput(name, path, None))
+        if state in {LoopState.ADJUDICATE_A, LoopState.ADJUDICATE_B}:
+            for name, path in (
+                ("code_review_a.json", artifacts / "code_review_a.json"),
+                ("code_review_b.json", artifacts / "code_review_b.json"),
+                (
+                    "review-comparison.json",
+                    artifacts / "review_comparison.json",
+                ),
+            ):
+                if not path.is_file():
+                    raise OrcaLoopError(f"required adjudication input is missing: {name}")
+                values.append(StagedInput(name, path, None))
+        return tuple(values)
     values = [
         StagedInput(
             "request.md",
@@ -925,10 +1794,7 @@ def _step_inputs(
         if path.is_file():
             values.append(StagedInput(filename, path, None))
     plan = _load_plan(controller.workspace.root)
-    if (
-        role in {Role.CODE_REVIEWER, Role.CROSS_CONFIRMER}
-        and plan is not None
-    ):
+    if role in {Role.CODE_REVIEWER, Role.CROSS_CONFIRMER} and plan is not None:
         frozen = materialize_frozen_review(
             preflight.arguments.config.worktree_path,
             capture_snapshot(preflight.arguments.config.worktree_path),
@@ -960,6 +1826,37 @@ def _profile_root(
 ) -> Path:
     if role is Role.IMPLEMENTER:
         return preflight.arguments.config.worktree_path
+    if controller.state.state in {
+        LoopState.CODE_REVIEW_A,
+        LoopState.CODE_REVIEW_B,
+        LoopState.ADJUDICATE_A,
+        LoopState.ADJUDICATE_B,
+    }:
+        context = _load_review_context(controller)
+        binding_path = _review_round_dir(controller) / "mirror-binding.json"
+        try:
+            binding = json.loads(binding_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise OrcaLoopError("shared review mirror binding is invalid") from exc
+        if not isinstance(binding, dict) or set(binding) != {
+            "schema_version",
+            "round",
+            "path",
+            "source_snapshot_digest",
+            "tree_digest",
+        }:
+            raise OrcaLoopError("shared review mirror binding schema mismatch")
+        mirror = Path(str(binding["path"])).resolve()
+        if (
+            binding["schema_version"] != 1
+            or binding["round"] != context.consensus_round
+            or binding["source_snapshot_digest"] != context.snapshot_digest
+            or binding["tree_digest"] != context.readonly_mirror_digest
+            or not mirror.is_dir()
+            or _tree_digest(mirror) != context.readonly_mirror_digest
+        ):
+            raise OrcaLoopError("shared review mirror provenance mismatch")
+        return mirror
     review_root = _readonly_mirror_root(
         preflight.arguments.config.worktree_path,
         controller.workspace.review_dir,
@@ -1039,6 +1936,28 @@ def _execute_worker(
         expected_orca_version=preflight.orca_version,
         runtime_options=runtime_options,
     )
+    review_phase = None
+    review_lane = None
+    review_context_digest = None
+    comparison_digest = None
+    reveal_manifest_digest = None
+    if state in {LoopState.CODE_REVIEW_A, LoopState.CODE_REVIEW_B}:
+        review_phase = ReviewPhase.BLIND
+        review_lane = (
+            ReviewLane.A if state is LoopState.CODE_REVIEW_A else ReviewLane.B
+        )
+    elif state in {LoopState.ADJUDICATE_A, LoopState.ADJUDICATE_B}:
+        review_phase = ReviewPhase.ADJUDICATION
+        review_lane = (
+            ReviewLane.A if state is LoopState.ADJUDICATE_A else ReviewLane.B
+        )
+    if review_phase is not None:
+        pending = controller.state.pending_review
+        if pending is None:
+            raise OrcaLoopError("review worker has no pending round")
+        review_context_digest = pending.review_context_digest
+        comparison_digest = pending.comparison_digest
+        reveal_manifest_digest = pending.reveal_manifest_digest
     context = RoleContext(
         role=role,
         provider=runtime_options.provider,
@@ -1060,6 +1979,11 @@ def _execute_worker(
             else None
         ),
         delivered_finding_ids=scope.finding_ids,
+        review_phase=review_phase,
+        review_lane=review_lane,
+        review_context_digest=review_context_digest,
+        comparison_digest=comparison_digest,
+        reveal_manifest_digest=reveal_manifest_digest,
     )
     contract = render_role_contract(
         context,
@@ -1162,11 +2086,9 @@ def _round_evidence(
         reviewed_snapshot = None
         round_value = controller.ledger.plan_round + 1
     else:
-        first = artifacts / "code_review.json"
-        second = artifacts / "cross_review.json"
-        reviewed_plan_version = None
-        reviewed_snapshot = controller.state.snapshot_digest
-        round_value = controller.ledger.code_round + 1
+        raise OrcaLoopError(
+            "CODE round evidence is committed by blind-pair comparison"
+        )
     both_valid = first.is_file() and second.is_file()
     digests = (
         _digest(first) if first.is_file() else "",
@@ -1347,6 +2269,126 @@ def _close_user_decision_notice(
     )
 
 
+def _qualify_merge(
+    controller: GenerationController,
+    worktree: Path,
+) -> MergeQualification:
+    state = controller.state
+    lineage = state.validation_lineage
+    live = capture_snapshot(worktree).snapshot_digest
+    required_snapshots = {
+        "state": state.snapshot_digest,
+        "test": lineage.test_gate_snapshot_digest,
+        "context": lineage.review_context_snapshot_digest,
+        "blind_a": lineage.blind_review_a_snapshot_digest,
+        "blind_b": lineage.blind_review_b_snapshot_digest,
+        "consensus": lineage.consensus_snapshot_digest,
+    }
+    missing = [name for name, value in required_snapshots.items() if value is None]
+    mismatched = [
+        name
+        for name, value in required_snapshots.items()
+        if value is not None and value != live
+    ]
+    if missing or mismatched:
+        raise ResumeBlockedError(
+            "merge qualification snapshot lineage is incomplete or stale: "
+            f"missing={missing}, mismatched={mismatched}"
+        )
+    artifacts = controller.workspace.artifact_dir
+    test_path = artifacts / "test_evidence.json"
+    context_path = artifacts / "review_context.json"
+    blind_a_path = artifacts / "code_review_a.json"
+    blind_b_path = artifacts / "code_review_b.json"
+    comparison_path = artifacts / "review_comparison.json"
+    for path in (
+        test_path,
+        context_path,
+        blind_a_path,
+        blind_b_path,
+        comparison_path,
+    ):
+        if not path.is_file():
+            raise ResumeBlockedError(f"merge qualification artifact is missing: {path.name}")
+    try:
+        test_evidence = parse_test_evidence(
+            test_path.read_text(encoding="utf-8")
+        )
+        context = parse_review_context(
+            context_path.read_text(encoding="utf-8")
+        )
+        comparison = parse_review_comparison(
+            comparison_path.read_text(encoding="utf-8")
+        )
+    except (OSError, ContractViolationError) as exc:
+        raise ResumeBlockedError(
+            f"merge qualification artifact is invalid: {exc}"
+        ) from exc
+    digest_checks = {
+        "test_evidence": (
+            lineage.test_evidence_digest,
+            test_evidence.artifact_digest,
+        ),
+        "review_context": (
+            lineage.review_context_digest,
+            context.context_digest,
+        ),
+        "blind_a": (
+            lineage.blind_review_a_artifact_digest,
+            _digest(blind_a_path),
+        ),
+        "blind_b": (
+            lineage.blind_review_b_artifact_digest,
+            _digest(blind_b_path),
+        ),
+        "comparison": (
+            lineage.review_comparison_digest,
+            comparison.comparison_digest,
+        ),
+    }
+    pending = state.pending_review
+    if pending is not None and pending.adjudication_a_artifact_digest is not None:
+        for lane, expected in (
+            ("a", lineage.adjudication_a_artifact_digest),
+            ("b", lineage.adjudication_b_artifact_digest),
+        ):
+            path = artifacts / f"review_adjudication_{lane}.json"
+            if not path.is_file():
+                raise ResumeBlockedError(
+                    f"merge qualification adjudication {lane} is missing"
+                )
+            digest_checks[f"adjudication_{lane}"] = (expected, _digest(path))
+            snapshot_value = getattr(
+                lineage,
+                f"adjudication_{lane}_snapshot_digest",
+            )
+            if snapshot_value != live:
+                raise ResumeBlockedError(
+                    f"merge qualification adjudication {lane} snapshot is stale"
+                )
+    bad_digests = [
+        name
+        for name, (expected, actual) in digest_checks.items()
+        if expected is None or expected != actual
+    ]
+    if bad_digests:
+        raise ResumeBlockedError(
+            "merge qualification artifact digest mismatch: "
+            + ", ".join(bad_digests)
+        )
+    lineage_digest = digest_value(json.loads(serialize_json(lineage)))
+    evidence_digests = tuple(
+        actual for _, actual in digest_checks.values()
+    )
+    return MergeQualification(
+        qualified=True,
+        snapshot_digest=live,
+        review_context_digest=context.context_digest,
+        validation_lineage_digest=lineage_digest,
+        evidence_digests=evidence_digests,
+    )
+
+
 def _ensure_gate(
     controller: GenerationController,
     preflight: PreflightResult,
@@ -1386,6 +2428,28 @@ def _ensure_gate(
             else GateKind.ESCALATION
         )
     )
+    qualification = None
+    if kind is GateKind.FINAL:
+        try:
+            qualification = _qualify_merge(
+                controller,
+                preflight.arguments.config.worktree_path,
+            )
+        except ResumeBlockedError as exc:
+            live = capture_snapshot(preflight.arguments.config.worktree_path)
+            controller.commit(
+                stage=StepStage.TRANSITION_COMMITTED,
+                active=None,
+                reason=f"final gate qualification invalidated: {exc}",
+                state_value=LoopState.TEST_GATE,
+                status=RunStatus.IN_PROGRESS,
+                snapshot_digest=live.snapshot_digest,
+                validation_lineage=ValidationLineage(),
+                clear_gate=True,
+                clear_pending_review=True,
+                clear_blocked_context=True,
+            )
+            return
     binding = find_gate_for_report(
         client,
         report=report,
@@ -1398,6 +2462,15 @@ def _ensure_gate(
             binding = replace(
                 binding,
                 allowed_options=_gate_options(controller, plan),
+            )
+        if qualification is not None:
+            binding = replace(
+                binding,
+                snapshot_digest=qualification.snapshot_digest,
+                review_context_digest=qualification.review_context_digest,
+                validation_lineage_digest=(
+                    qualification.validation_lineage_digest
+                ),
             )
         controller.commit(
             stage=StepStage.TRANSITION_COMMITTED,
@@ -1440,6 +2513,13 @@ def _ensure_gate(
         run_id=controller.state.run_id,
         commit_after_binding=False,
     )
+    if qualification is not None:
+        binding = replace(
+            binding,
+            snapshot_digest=qualification.snapshot_digest,
+            review_context_digest=qualification.review_context_digest,
+            validation_lineage_digest=qualification.validation_lineage_digest,
+        )
     controller.commit(
         stage=StepStage.TRANSITION_COMMITTED,
         active=None,
@@ -1483,6 +2563,49 @@ def _resume_gate(
     if decision is None:
         return False
     if controller.state.state is LoopState.HUMAN_GATE:
+        if decision.decision is HumanDecisionKind.MERGE:
+            qualification_problem = None
+            try:
+                qualification = _qualify_merge(
+                    controller,
+                    preflight.arguments.config.worktree_path,
+                )
+                if (
+                    binding.snapshot_digest != qualification.snapshot_digest
+                    or binding.review_context_digest
+                    != qualification.review_context_digest
+                    or binding.validation_lineage_digest
+                    != qualification.validation_lineage_digest
+                ):
+                    qualification_problem = (
+                        "final gate was created for different validation evidence"
+                    )
+            except ResumeBlockedError as exc:
+                qualification_problem = str(exc)
+            if qualification_problem is not None:
+                invalidate_user_decision_notice(
+                    controller.workspace.control_dir,
+                    reason=qualification_problem,
+                )
+                live = capture_snapshot(
+                    preflight.arguments.config.worktree_path
+                )
+                controller.commit(
+                    stage=StepStage.TRANSITION_COMMITTED,
+                    active=None,
+                    reason=(
+                        "stale final gate invalidated: "
+                        + qualification_problem
+                    ),
+                    state_value=LoopState.TEST_GATE,
+                    status=RunStatus.IN_PROGRESS,
+                    snapshot_digest=live.snapshot_digest,
+                    validation_lineage=ValidationLineage(),
+                    clear_gate=True,
+                    clear_pending_review=True,
+                    clear_blocked_context=True,
+                )
+                return True
         result = execute_human_gate(
             controller.ledger,
             decision,
@@ -1618,6 +2741,12 @@ def _run_loop(
                     continue
                 return controller.state
             _ensure_gate(controller, preflight, client)
+            if controller.state.state not in {
+                LoopState.HUMAN_GATE,
+                LoopState.USER_DECISION_REQUIRED,
+            }:
+                transitions += 1
+                continue
             if (
                 controller.state.gate_binding is not None
                 and _resume_gate(
@@ -1646,7 +2775,11 @@ def _run_loop(
                 )
                 transitions += 1
                 continue
-            if state is LoopState.PLAN_CONSENSUS_EVALUATE:
+            if state is LoopState.REVIEW_CONTEXT_PREPARE:
+                result = _prepare_review_context(controller, preflight)
+            elif state is LoopState.REVIEW_COMPARE:
+                result = _execute_review_compare(controller, config)
+            elif state is LoopState.PLAN_CONSENSUS_EVALUATE:
                 plan = _load_plan(controller.workspace.root)
                 if plan is None:
                     raise OrcaLoopError(
@@ -1669,10 +2802,7 @@ def _run_loop(
                 result = execute_evaluate(
                     state=state,
                     ledger=controller.ledger,
-                    evidence=_round_evidence(
-                        controller,
-                        ConsensusKind.CODE,
-                    ),
+                    evidence=None,
                     config=config,
                     plan=_load_plan(controller.workspace.root),
                     destructive_approval=(
@@ -1688,6 +2818,14 @@ def _run_loop(
                     plan=plan,
                     policy=preflight.test_policy,
                     worktree=config.worktree_path,
+                    workspace=controller.workspace,
+                    run_id=controller.state.run_id,
+                    plan_version=controller.state.plan_version,
+                    consensus_round_value=max(
+                        1,
+                        controller.ledger.code_round + 1,
+                    ),
+                    generation=controller.state.generation + 1,
                 )
             else:
                 raise OrcaLoopError(
@@ -2022,6 +3160,12 @@ def _resume_argv(
         resolved.append("--force-unlock")
     if known.strict_agent_runtime:
         resolved.append("--strict-agent-runtime")
+    resolved.extend(
+        (
+            "--consensus-provider-policy",
+            manifest.consensus_provider_policy.value,
+        )
+    )
     return resolved
 
 
@@ -2176,6 +3320,15 @@ def _status_report(harness_root: Path, run_id: str) -> dict[str, object]:
         value["worktree"] = None
     else:
         value["worktree"] = manifest.worktree_path
+        value["consensus_provider_policy"] = (
+            manifest.consensus_provider_policy.value
+        )
+        value["consensus_independence"] = (
+            manifest.consensus_independence.value
+        )
+        value["validation_lineage"] = json.loads(
+            serialize_json(state.validation_lineage)
+        )
         value["agents"] = {
             record.worker_key.value: {
                 "provider": record.provider.value,
@@ -2483,6 +3636,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                         ),
                         "plan_consensus_round_limit": 5,
                         "code_consensus_round_limit": 5,
+                        "consensus_provider_policy": (
+                            preflight.consensus_provider_policy.value
+                        ),
+                        "consensus_independence": (
+                            preflight.consensus_independence.value
+                        ),
                         "agents": {
                             item.worker_key.value: {
                                 "provider": item.provider.value,

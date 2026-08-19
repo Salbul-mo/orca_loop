@@ -154,6 +154,19 @@ class CompareEnvironmentTest(unittest.TestCase):
             any("availability changed" in item for item in environment_notes(BASE, current))
         )
 
+    def test_operator_guide_matches_current_safety_policy(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        guide = (root / "orca_loop_execution_rules.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("--allow-same-provider-consensus", guide)
+        self.assertIn("consensus_independence=DEGRADED", guide)
+        self.assertIn("CLI availability·version 차이는", guide)
+        self.assertIn("Blind A와 B", guide)
+        self.assertIn("`NOT_RUN`은 테스트를 실행했다는 뜻이 아니며", guide)
+        self.assertIn("현재 Orca terminal", guide)
+        self.assertIn("worker terminal 네 개", guide)
+
 
 class ReportGateTest(unittest.TestCase):
     def setUp(self) -> None:

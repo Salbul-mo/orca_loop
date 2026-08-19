@@ -32,12 +32,23 @@ POLICY_PLACEHOLDERS = {
     "APPROVED_TEST_KINDS",
     "ALLOWED_TEST_OUTPUT_PATHS",
 }
+REVIEW_PLACEHOLDERS = {
+    "REVIEW_PHASE",
+    "REVIEW_LANE",
+    "REVIEW_CONTEXT_DIGEST",
+    "COMPARISON_DIGEST",
+    "REVEAL_MANIFEST_DIGEST",
+}
 ALLOWED_PLACEHOLDERS = {
     Role.PLANNER: BASE_PLACEHOLDERS | POLICY_PLACEHOLDERS,
     Role.PLAN_REVIEWER: BASE_PLACEHOLDERS | POLICY_PLACEHOLDERS,
     Role.IMPLEMENTER: BASE_PLACEHOLDERS | {"TEST_GATE_RESULT"},
-    Role.CODE_REVIEWER: BASE_PLACEHOLDERS | {"TEST_GATE_RESULT"},
-    Role.CROSS_CONFIRMER: BASE_PLACEHOLDERS | {"TEST_GATE_RESULT"},
+    Role.CODE_REVIEWER: (
+        BASE_PLACEHOLDERS | {"TEST_GATE_RESULT"} | REVIEW_PLACEHOLDERS
+    ),
+    Role.CROSS_CONFIRMER: (
+        BASE_PLACEHOLDERS | {"TEST_GATE_RESULT"} | REVIEW_PLACEHOLDERS
+    ),
 }
 ARTIFACT_FILENAMES = {
     Role.PLANNER: "plan.json",
@@ -77,6 +88,15 @@ def _mapping(context: RoleContext) -> dict[str, str]:
             "code review roles require PASS or NOT_RUN test gate"
         )
     policy = context.test_policy
+    artifact_filename = ARTIFACT_FILENAMES[context.role]
+    if context.review_phase is not None and context.review_lane is not None:
+        if context.review_phase.value == "BLIND":
+            artifact_filename = f"code_review_{context.review_lane.value.lower()}.json"
+        else:
+            artifact_filename = (
+                "review_adjudication_"
+                f"{context.review_lane.value.lower()}.json"
+            )
     mapping = {
         "ROLE": context.role.value,
         "PROVIDER": context.provider.value,
@@ -97,7 +117,16 @@ def _mapping(context: RoleContext) -> dict[str, str]:
             if context.test_gate_result is None
             else context.test_gate_result.value
         ),
-        "ARTIFACT_FILE": ARTIFACT_FILENAMES[context.role],
+        "ARTIFACT_FILE": artifact_filename,
+        "REVIEW_PHASE": (
+            "none" if context.review_phase is None else context.review_phase.value
+        ),
+        "REVIEW_LANE": (
+            "none" if context.review_lane is None else context.review_lane.value
+        ),
+        "REVIEW_CONTEXT_DIGEST": context.review_context_digest or "none",
+        "COMPARISON_DIGEST": context.comparison_digest or "none",
+        "REVEAL_MANIFEST_DIGEST": context.reveal_manifest_digest or "none",
         "ALLOWED_TEST_COMMANDS": (
             "[]" if policy is None else _compact(policy.allowed_commands)
         ),

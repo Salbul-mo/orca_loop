@@ -90,20 +90,40 @@ def transition(
         ): LoopState.PLAN_REVIEW,
         (LoopState.IMPLEMENT, SignalKind.ARTIFACT_OK): LoopState.TEST_GATE,
         (LoopState.FIX, SignalKind.ARTIFACT_OK): LoopState.TEST_GATE,
-        (LoopState.TEST_GATE, SignalKind.PASS): LoopState.CODE_REVIEW,
-        (LoopState.TEST_GATE, SignalKind.NOT_RUN): LoopState.CODE_REVIEW,
+        (LoopState.TEST_GATE, SignalKind.PASS): LoopState.REVIEW_CONTEXT_PREPARE,
+        (LoopState.TEST_GATE, SignalKind.NOT_RUN): LoopState.REVIEW_CONTEXT_PREPARE,
         (
             LoopState.TEST_GATE,
             SignalKind.POLICY_VIOLATION,
         ): LoopState.USER_DECISION_REQUIRED,
         (
-            LoopState.CODE_REVIEW,
-            SignalKind.ARTIFACT_OK,
-        ): LoopState.CROSS_CONFIRM,
+            LoopState.REVIEW_CONTEXT_PREPARE,
+            SignalKind.CONTEXT_PREPARED,
+        ): LoopState.CODE_REVIEW_A,
         (
-            LoopState.CROSS_CONFIRM,
+            LoopState.CODE_REVIEW_A,
             SignalKind.ARTIFACT_OK,
+        ): LoopState.CODE_REVIEW_B,
+        (
+            LoopState.CODE_REVIEW_B,
+            SignalKind.ARTIFACT_OK,
+        ): LoopState.REVIEW_COMPARE,
+        (
+            LoopState.REVIEW_COMPARE,
+            SignalKind.AGREED,
         ): LoopState.CONSENSUS_EVALUATE,
+        (
+            LoopState.REVIEW_COMPARE,
+            SignalKind.CONFLICT,
+        ): LoopState.ADJUDICATE_A,
+        (
+            LoopState.ADJUDICATE_A,
+            SignalKind.ARTIFACT_OK,
+        ): LoopState.ADJUDICATE_B,
+        (
+            LoopState.ADJUDICATE_B,
+            SignalKind.ARTIFACT_OK,
+        ): LoopState.REVIEW_COMPARE,
         (LoopState.HUMAN_GATE, SignalKind.MERGE): LoopState.READY_FOR_MERGE,
         (LoopState.HUMAN_GATE, SignalKind.REJECT): LoopState.REJECTED,
         (LoopState.HUMAN_GATE, SignalKind.REVISE_CODE): LoopState.FIX,
