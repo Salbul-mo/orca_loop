@@ -9,18 +9,23 @@ from pathlib import Path
 from orca_loop.contracts import (
     ContractViolationError,
     build_agent_runtime_snapshot,
-    canonical_json_bytes,
+    build_master_runtime_config,
+    build_master_runtime_snapshot,
     digest_value,
     parse_agent_runtime_config,
     parse_agent_runtime_snapshot,
     parse_human_decision,
-    parse_permission_report,
+    parse_master_decision,
+    parse_master_runtime_config,
+    parse_master_runtime_snapshot,
     parse_plan_document,
     parse_review_artifact,
     parse_worker_done,
     serialize_agent_runtime_config,
     serialize_agent_runtime_snapshot,
     serialize_json,
+    serialize_master_runtime_config,
+    serialize_master_runtime_snapshot,
 )
 from orca_loop.models import (
     AgentProvider,
@@ -29,6 +34,11 @@ from orca_loop.models import (
     DispatchHandle,
     ExpectedProvenance,
     LoopCounters,
+    MasterAction,
+    MasterDecision,
+    MasterRuntimeConfig,
+    MasterRuntimeOptions,
+    PermissionProfile,
     Role,
     RoleContext,
     ScopePackage,
@@ -53,6 +63,100 @@ from orca_loop.config import empty_test_policy
 
 DIGEST_A = "sha256:" + "a" * 64
 DIGEST_B = "sha256:" + "b" * 64
+
+
+class MasterDecisionContractTest(unittest.TestCase):
+    def test_dispatch_parses_camel_case_permission_profile(self) -> None:
+        decision = parse_master_decision(
+            json.dumps(
+                {
+                    "action": "dispatch",
+                    "role": "implementer",
+                    "permissionProfile": "workspace_write",
+                    "reason": "Source changes are required.",
+                }
+            )
+        )
+        self.assertEqual(
+            MasterDecision(
+                MasterAction.DISPATCH,
+                Role.IMPLEMENTER,
+                PermissionProfile.WORKSPACE_WRITE,
+                "Source changes are required.",
+            ),
+            decision,
+        )
+        self.assertEqual(
+            {
+                "action": "dispatch",
+                "permissionProfile": "workspace_write",
+                "reason": "Source changes are required.",
+                "role": "implementer",
+            },
+            json.loads(serialize_json(decision)),
+        )
+
+    def test_non_dispatch_requires_null_worker_selection(self) -> None:
+        for action in ("test", "finish", "escalate", "abort"):
+            with self.subTest(action=action):
+                decision = parse_master_decision(
+                    json.dumps(
+                        {
+                            "action": action,
+                            "role": None,
+                            "permissionProfile": None,
+                            "reason": "Coordinator action is required.",
+                        }
+                    )
+                )
+                self.assertIsNone(decision.role)
+                self.assertIsNone(decision.permission_profile)
+
+    def test_dispatch_requires_role_and_permission_profile(self) -> None:
+        with self.assertRaisesRegex(
+            ContractViolationError,
+            "requires role and permission_profile",
+        ):
+            parse_master_decision(
+                json.dumps(
+                    {
+                        "action": "dispatch",
+                        "role": "planner",
+                        "permissionProfile": None,
+                        "reason": "Planning is required.",
+                    }
+                )
+            )
+
+    def test_non_dispatch_rejects_worker_selection(self) -> None:
+        with self.assertRaisesRegex(
+            ContractViolationError,
+            "must not select role or permission_profile",
+        ):
+            parse_master_decision(
+                json.dumps(
+                    {
+                        "action": "finish",
+                        "role": "planner",
+                        "permissionProfile": "read_only",
+                        "reason": "Done.",
+                    }
+                )
+            )
+
+    def test_unknown_fields_are_rejected(self) -> None:
+        with self.assertRaisesRegex(ContractViolationError, "unknown fields"):
+            parse_master_decision(
+                json.dumps(
+                    {
+                        "action": "test",
+                        "role": None,
+                        "permissionProfile": None,
+                        "reason": "Run tests.",
+                        "extra": True,
+                    }
+                )
+            )
 
 
 def agent_runtime_value() -> dict[str, object]:
@@ -268,6 +372,64 @@ class ModelContractTest(unittest.TestCase):
                 "run-2",
             )
 
+    def test_master_runtime_config_and_snapshot_roundtrip(self) -> None:
+        options = MasterRuntimeOptions(
+            provider=AgentProvider.CLAUDE,
+            model="claude-master",
+            effort="high",
+        )
+        config = build_master_runtime_config(options)
+        self.assertIsInstance(config, MasterRuntimeConfig)
+        self.assertEqual(1, config.schema_version)
+        self.assertEqual(
+            config,
+            parse_master_runtime_config(serialize_master_runtime_config(config)),
+        )
+
+        snapshot = build_master_runtime_snapshot(
+            "run-1",
+            config,
+            str(Path.cwd().resolve() / "master-runtime.json"),
+        )
+        self.assertEqual(
+            snapshot,
+            parse_master_runtime_snapshot(
+                serialize_master_runtime_snapshot(snapshot),
+                "run-1",
+            ),
+        )
+
+    def test_master_runtime_rejects_shape_and_digest_drift(self) -> None:
+        raw = {
+            "schema_version": 1,
+            "master": {
+                "provider": "claude",
+                "model": None,
+                "effort": None,
+            },
+        }
+        unknown = json.loads(json.dumps(raw))
+        unknown["master"]["extra"] = True
+        with self.assertRaisesRegex(ContractViolationError, "unknown fields"):
+            parse_master_runtime_config(json.dumps(unknown))
+
+        config = parse_master_runtime_config(json.dumps(raw))
+        snapshot = json.loads(
+            serialize_master_runtime_snapshot(
+                build_master_runtime_snapshot("run-1", config, None)
+            )
+        )
+        snapshot["configuration_digest"] = DIGEST_A
+        with self.assertRaisesRegex(ContractViolationError, "digest mismatch"):
+            parse_master_runtime_snapshot(json.dumps(snapshot), "run-1")
+        with self.assertRaisesRegex(ContractViolationError, "run_id mismatch"):
+            parse_master_runtime_snapshot(
+                serialize_master_runtime_snapshot(
+                    build_master_runtime_snapshot("run-1", config, None)
+                ),
+                "run-2",
+            )
+
 
 class ArtifactContractTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -336,30 +498,6 @@ class ArtifactContractTest(unittest.TestCase):
         }
         with self.assertRaises(ContractViolationError):
             parse_human_decision(json.dumps(value))
-
-    def test_live_permission_report_matches_exact_contract(self) -> None:
-        path = (
-            Path.cwd()
-            / "runs"
-            / "20260731-permission-spike-03"
-            / "control"
-            / "permission-feasibility.json"
-        )
-        if not path.exists():
-            self.skipTest("live permission report is not present")
-        parsed = parse_permission_report(path.read_text(encoding="utf-8"))
-        self.assertEqual("D", parsed.strategy.value if parsed.strategy else None)
-        value = json.loads(path.read_text(encoding="utf-8"))
-        digest_input = dict(value)
-        claimed = digest_input.pop("report_digest")
-        self.assertEqual(claimed, digest_value(digest_input))
-        self.assertEqual(
-            claimed.removeprefix("sha256:"),
-            __import__("hashlib").sha256(
-                canonical_json_bytes(digest_input)
-            ).hexdigest(),
-        )
-
 
 class TransportContractTest(unittest.TestCase):
     def test_staging_detects_tamper_and_duplicate(self) -> None:

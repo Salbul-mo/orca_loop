@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import json
 import re
 from pathlib import Path
 
@@ -23,19 +21,6 @@ class PathBoundaryError(WorkspaceError):
     """Raised when a run or step path escapes the harness boundary."""
 
 
-def _canonical_json_bytes(value: object) -> bytes:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-
-
-def _sha256(value: bytes) -> str:
-    return "sha256:" + hashlib.sha256(value).hexdigest()
-
-
 def _validate_id(value: str, field: str) -> None:
     if not ID_PATTERN.fullmatch(value):
         raise PathBoundaryError(
@@ -51,33 +36,6 @@ def _within(path: Path, parent: Path) -> bool:
     return True
 
 
-def _valid_permission_skeleton(root: Path, run_id: str) -> bool:
-    report_path = root / "control" / "permission-feasibility.json"
-    existing_files = tuple(
-        path.relative_to(root).as_posix()
-        for path in root.rglob("*")
-        if path.is_file()
-    )
-    if existing_files != ("control/permission-feasibility.json",):
-        return False
-    try:
-        value = json.loads(report_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    if not isinstance(value, dict):
-        return False
-    if value.get("run_id") != run_id:
-        return False
-    if Path(str(value.get("canonical_path", ""))).resolve() != report_path.resolve():
-        return False
-    report_digest = value.get("report_digest")
-    if not isinstance(report_digest, str):
-        return False
-    digest_input = dict(value)
-    digest_input.pop("report_digest", None)
-    return _sha256(_canonical_json_bytes(digest_input)) == report_digest
-
-
 def agent_runtime_snapshot_path(harness_root: Path, run_id: str) -> Path:
     _validate_id(run_id, "run_id")
     root = harness_root.resolve()
@@ -88,6 +46,18 @@ def agent_runtime_snapshot_path(harness_root: Path, run_id: str) -> Path:
     if not _within(run_root, runs_root):
         raise PathBoundaryError("run path escaped harness_root/runs")
     return run_root / "control" / "agent-runtime.json"
+
+
+def master_runtime_snapshot_path(harness_root: Path, run_id: str) -> Path:
+    _validate_id(run_id, "run_id")
+    root = harness_root.resolve()
+    if not root.is_dir():
+        raise PathBoundaryError(f"harness_root does not exist: {root}")
+    runs_root = (root / "runs").resolve()
+    run_root = (runs_root / run_id).resolve()
+    if not _within(run_root, runs_root):
+        raise PathBoundaryError("run path escaped harness_root/runs")
+    return run_root / "control" / "master-runtime.json"
 
 
 def create_run_workspace(
@@ -108,7 +78,7 @@ def create_run_workspace(
         raise PathBoundaryError("run path escaped harness_root/runs")
 
     if run_root.exists() and any(run_root.iterdir()):
-        if not resume and not _valid_permission_skeleton(run_root, run_id):
+        if not resume:
             raise RunWorkspaceExistsError(
                 f"non-resume run already exists: {run_root}"
             )

@@ -79,6 +79,19 @@ class Role(StrEnum):
     CROSS_CONFIRMER = "cross_confirmer"
 
 
+class PermissionProfile(StrEnum):
+    READ_ONLY = "read_only"
+    WORKSPACE_WRITE = "workspace_write"
+
+
+class MasterAction(StrEnum):
+    DISPATCH = "dispatch"
+    TEST = "test"
+    FINISH = "finish"
+    ESCALATE = "escalate"
+    ABORT = "abort"
+
+
 class WorkerKey(StrEnum):
     """Stable worker-slot IDs whose names do not select a provider."""
 
@@ -91,11 +104,6 @@ class WorkerKey(StrEnum):
 class AgentProvider(StrEnum):
     CLAUDE = "claude"
     CODEX = "codex"
-
-
-class AgentAccessMode(StrEnum):
-    READ_ONLY = "read_only"
-    WRITABLE = "writable"
 
 
 class Side(StrEnum):
@@ -171,13 +179,6 @@ class AffectedFileOperation(StrEnum):
     MODIFY = "modify"
     DELETE = "delete"
     RENAME = "rename"
-
-
-class PermissionStrategy(StrEnum):
-    ADD_DIR = "A"
-    COORDINATOR_STDOUT = "B"
-    ARTIFACT_HELPER = "C"
-    READONLY_REPOSITORY = "D"
 
 
 class ValidationStatus(StrEnum):
@@ -261,35 +262,6 @@ class DestructiveApproval:
 
 
 @dataclass(frozen=True)
-class PermissionCheck:
-    check_id: str
-    status: ValidationStatus
-    evidence: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class PermissionFeasibilityReport:
-    schema_version: int
-    run_id: str
-    status: ValidationStatus
-    strategy: PermissionStrategy | None
-    checks: tuple[PermissionCheck, ...]
-    evidence: tuple[str, ...]
-    orca_version: str
-    canonical_path: str
-    report_digest: str
-
-
-@dataclass(frozen=True)
-class PermissionSpikeConfig:
-    run_id: str
-    harness_root: Path
-    fixture_path: Path
-    coordinator_handle: str
-    orca_version: str
-
-
-@dataclass(frozen=True)
 class SnapshotIdentity:
     base_head: str
     tracked_diff_digest: str
@@ -332,9 +304,26 @@ class AgentRuntimeSnapshot:
 
 
 @dataclass(frozen=True)
-class ProviderCapability:
+class MasterRuntimeOptions:
     provider: AgentProvider
-    access_mode: AgentAccessMode
+    model: str | None
+    effort: str | None
+
+
+@dataclass(frozen=True)
+class MasterRuntimeConfig:
+    schema_version: int
+    master: MasterRuntimeOptions
+    configuration_digest: str
+
+
+@dataclass(frozen=True)
+class MasterRuntimeSnapshot:
+    schema_version: int
+    run_id: str
+    master: MasterRuntimeOptions
+    configuration_digest: str
+    source_config_path: str | None
 
 
 @dataclass(frozen=True)
@@ -752,7 +741,14 @@ class BootstrapReport:
 class LaunchProfile:
     command: tuple[str, ...]
     writable_roots: tuple[Path, ...]
-    permission_report_digest: str
+
+
+@dataclass(frozen=True)
+class MasterDecision:
+    action: MasterAction
+    role: Role | None
+    permission_profile: PermissionProfile | None
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -850,7 +846,7 @@ class CoordinatorState:
     snapshot_digest: str
     test_gate_status: TestGateStatus | None
     test_policy_digest: str | None
-    permission_report_digest: str
+    permission_policy_digest: str
     history: tuple[StateHistoryEntry, ...]
     gate_binding: GateBinding | None = None
     human_decision: HumanDecision | None = None
@@ -878,7 +874,6 @@ class ResumeDecision:
 class E2EConfig:
     fixture_path: Path
     coordinator_handle: str
-    permission_report_digest: str
 
 
 @dataclass(frozen=True)

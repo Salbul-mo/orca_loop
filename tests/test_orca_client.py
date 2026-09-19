@@ -7,11 +7,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from orca_loop.contracts import digest_value, parse_permission_report
 from orca_loop.models import (
     AgentProvider,
     AgentRuntimeOptions,
-    PermissionFeasibilityReport,
+    PermissionProfile,
     Role,
     WorkerKey,
 )
@@ -72,29 +71,6 @@ class OrcaClientTest(unittest.TestCase):
 
 
 class ProfileTest(unittest.TestCase):
-    def permission_report(self, root: Path) -> PermissionFeasibilityReport:
-        path = root / "permission.json"
-        value = {
-            "schema_version": 1,
-            "run_id": "profile-test",
-            "status": "PASS",
-            "strategy": "D",
-            "checks": [
-                {
-                    "check_id": f"V-PERM-0{index}",
-                    "status": "PASS",
-                    "evidence": ["deterministic fixture"],
-                }
-                for index in range(1, 6)
-            ],
-            "evidence": ["deterministic fixture"],
-            "orca_version": "1.4.159",
-            "canonical_path": str(path.resolve()),
-        }
-        value["report_digest"] = digest_value(value)
-        path.write_text(json.dumps(value), encoding="utf-8")
-        return parse_permission_report(path.read_text(encoding="utf-8"))
-
     def test_runtime_options_generate_provider_specific_arguments(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -104,15 +80,13 @@ class ProfileTest(unittest.TestCase):
             worktree.mkdir()
             input_dir.mkdir()
             output_dir.mkdir()
-            report = self.permission_report(root)
 
             claude = build_launch_profile(
                 Role.PLANNER,
+                PermissionProfile.READ_ONLY,
                 worktree,
                 input_dir,
                 output_dir,
-                report,
-                expected_orca_version="1.4.159",
                 runtime_options=AgentRuntimeOptions(
                     WorkerKey.CLAUDE_PLANNER,
                     AgentProvider.CLAUDE,
@@ -127,11 +101,10 @@ class ProfileTest(unittest.TestCase):
 
             codex = build_launch_profile(
                 Role.IMPLEMENTER,
+                PermissionProfile.WORKSPACE_WRITE,
                 worktree,
                 input_dir,
                 output_dir,
-                report,
-                expected_orca_version="1.4.159",
                 runtime_options=AgentRuntimeOptions(
                     WorkerKey.CODEX_IMPLEMENTER,
                     AgentProvider.CODEX,
@@ -151,11 +124,10 @@ class ProfileTest(unittest.TestCase):
 
             codex_planner = build_launch_profile(
                 Role.PLANNER,
+                PermissionProfile.READ_ONLY,
                 worktree,
                 input_dir,
                 output_dir,
-                report,
-                expected_orca_version="1.4.159",
                 runtime_options=AgentRuntimeOptions(
                     WorkerKey.CLAUDE_PLANNER,
                     AgentProvider.CODEX,
@@ -168,11 +140,10 @@ class ProfileTest(unittest.TestCase):
 
             claude_implementer = build_launch_profile(
                 Role.IMPLEMENTER,
+                PermissionProfile.WORKSPACE_WRITE,
                 worktree,
                 input_dir,
                 output_dir,
-                report,
-                expected_orca_version="1.4.159",
                 runtime_options=AgentRuntimeOptions(
                     WorkerKey.CODEX_IMPLEMENTER,
                     AgentProvider.CLAUDE,
@@ -194,22 +165,19 @@ class ProfileTest(unittest.TestCase):
             worktree.mkdir()
             input_dir.mkdir()
             output_dir.mkdir()
-            report = self.permission_report(root)
             baseline = build_launch_profile(
                 Role.CROSS_CONFIRMER,
+                PermissionProfile.READ_ONLY,
                 worktree,
                 input_dir,
                 output_dir,
-                report,
-                expected_orca_version="1.4.159",
             )
             inherited = build_launch_profile(
                 Role.CROSS_CONFIRMER,
+                PermissionProfile.READ_ONLY,
                 worktree,
                 input_dir,
                 output_dir,
-                report,
-                expected_orca_version="1.4.159",
                 runtime_options=AgentRuntimeOptions(
                     WorkerKey.CODEX_REVIEW,
                     AgentProvider.CODEX,
@@ -222,11 +190,10 @@ class ProfileTest(unittest.TestCase):
             with self.assertRaisesRegex(LaunchProfileError, "does not match"):
                 build_launch_profile(
                     Role.PLAN_REVIEWER,
+                    PermissionProfile.READ_ONLY,
                     worktree,
                     input_dir,
                     output_dir,
-                    report,
-                    expected_orca_version="1.4.159",
                     runtime_options=AgentRuntimeOptions(
                         WorkerKey.CODEX_IMPLEMENTER,
                         AgentProvider.CODEX,
@@ -244,7 +211,6 @@ class ProfileTest(unittest.TestCase):
             worktree.mkdir()
             input_dir.mkdir()
             output_dir.mkdir()
-            report = self.permission_report(root)
             slots = {
                 WorkerKey.CLAUDE_PLANNER: Role.PLANNER,
                 WorkerKey.CLAUDE_CODE_REVIEW: Role.CODE_REVIEWER,
@@ -256,11 +222,14 @@ class ProfileTest(unittest.TestCase):
                     with self.subTest(worker=worker, provider=provider):
                         profile = build_launch_profile(
                             role,
+                            (
+                                PermissionProfile.WORKSPACE_WRITE
+                                if role is Role.IMPLEMENTER
+                                else PermissionProfile.READ_ONLY
+                            ),
                             worktree,
                             input_dir,
                             output_dir,
-                            report,
-                            expected_orca_version="1.4.159",
                             runtime_options=AgentRuntimeOptions(
                                 worker,
                                 provider,
@@ -284,19 +253,7 @@ class ProfileTest(unittest.TestCase):
                             profile.writable_roots,
                         )
 
-    def test_strategy_d_profiles_match_live_contract(self) -> None:
-        report_path = (
-            Path.cwd()
-            / "runs"
-            / "20260731-permission-spike-03"
-            / "control"
-            / "permission-feasibility.json"
-        )
-        if not report_path.exists():
-            self.skipTest("live permission report is not present")
-        report = parse_permission_report(
-            report_path.read_text(encoding="utf-8")
-        )
+    def test_role_profiles_enforce_writable_roots(self) -> None:
         root = Path.cwd().resolve()
         step_input = root / "runs" / "profile-test" / "in"
         step_output = root / "runs" / "profile-test" / "out"
@@ -305,17 +262,48 @@ class ProfileTest(unittest.TestCase):
         for role in Role:
             profile = build_launch_profile(
                 role,
+                (
+                    PermissionProfile.WORKSPACE_WRITE
+                    if role is Role.IMPLEMENTER
+                    else PermissionProfile.READ_ONLY
+                ),
                 root,
                 step_input,
                 step_output,
-                report,
-                expected_orca_version="1.4.159",
             )
             if role is Role.IMPLEMENTER:
                 self.assertEqual((root,), profile.writable_roots)
             else:
                 self.assertEqual((), profile.writable_roots)
             self.assertNotIn(str(step_input.parent), profile.command)
+
+    def test_permission_profile_controls_writable_roots_not_role(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            worktree = root / "worktree"
+            input_dir = root / "in"
+            output_dir = root / "out"
+            worktree.mkdir()
+            input_dir.mkdir()
+            output_dir.mkdir()
+
+            planner_with_write = build_launch_profile(
+                Role.PLANNER,
+                PermissionProfile.WORKSPACE_WRITE,
+                worktree,
+                input_dir,
+                output_dir,
+            )
+            implementer_read_only = build_launch_profile(
+                Role.IMPLEMENTER,
+                PermissionProfile.READ_ONLY,
+                worktree,
+                input_dir,
+                output_dir,
+            )
+
+            self.assertEqual((worktree,), planner_with_write.writable_roots)
+            self.assertEqual((), implementer_read_only.writable_roots)
 
 
 if __name__ == "__main__":

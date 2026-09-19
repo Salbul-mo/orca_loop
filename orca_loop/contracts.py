@@ -11,7 +11,6 @@ from typing import Any, Callable, Mapping, TypeVar
 from .models import (
     AcceptanceCriterion,
     AddressedFinding,
-    AgentAccessMode,
     AgentProvider,
     AgentRuntimeConfig,
     AgentRuntimeOptions,
@@ -33,12 +32,14 @@ from .models import (
     ImplementationArtifact,
     ImplementationStatus,
     InformationalFinding,
-    PermissionCheck,
-    PermissionFeasibilityReport,
-    PermissionStrategy,
+    MasterAction,
+    MasterDecision,
+    MasterRuntimeConfig,
+    MasterRuntimeOptions,
+    MasterRuntimeSnapshot,
     PlanDocument,
+    PermissionProfile,
     PlanReviewVerdict,
-    ProviderCapability,
     ReviewArtifact,
     Role,
     Severity,
@@ -58,10 +59,7 @@ MAX_ARTIFACT_BYTES = 1_048_576
 SCHEMA_VERSION = 1
 AGENT_RUNTIME_SCHEMA_VERSION = 2
 LEGACY_AGENT_RUNTIME_SCHEMA_VERSION = 1
-MANDATORY_PERMISSION_CHECK_IDS = tuple(
-    f"V-PERM-0{index}" for index in range(1, 6)
-)
-OPTIONAL_PERMISSION_CHECK_IDS = ("V-PERM-06",)
+MASTER_RUNTIME_SCHEMA_VERSION = 1
 DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 ID_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,160}$")
 FENCED_JSON_PATTERN = re.compile(
@@ -80,6 +78,7 @@ DECISION_ALIASES = {"id": "finding_id", "evidence": "evidence_refs"}
 ADDRESSED_ALIASES = {"id": "finding_id", "evidence": "evidence_refs"}
 ESCALATION_ALIASES = {"evidence": "evidence_refs"}
 INFORMATIONAL_ALIASES = {"id": "finding_id", "evidence": "evidence_refs"}
+MASTER_DECISION_ALIASES = {"permissionProfile": "permission_profile"}
 
 
 class ContractViolationError(ValueError):
@@ -291,6 +290,171 @@ def default_agent_provider(worker: WorkerKey) -> AgentProvider:
     }:
         return AgentProvider.CLAUDE
     return AgentProvider.CODEX
+
+
+def _parse_master_runtime_options(
+    value: object,
+    context: str,
+) -> MasterRuntimeOptions:
+    raw = _exact(
+        value,
+        {"provider", "model", "effort"},
+        context=context,
+    )
+    return MasterRuntimeOptions(
+        provider=_enum(AgentProvider, raw["provider"], f"{context}.provider"),
+        model=_runtime_string(raw["model"], f"{context}.model"),
+        effort=_runtime_string(raw["effort"], f"{context}.effort"),
+    )
+
+
+def _master_runtime_value(master: MasterRuntimeOptions) -> dict[str, object]:
+    return {
+        "schema_version": MASTER_RUNTIME_SCHEMA_VERSION,
+        "master": {
+            "provider": master.provider.value,
+            "model": master.model,
+            "effort": master.effort,
+        },
+    }
+
+
+def build_master_runtime_config(
+    master: MasterRuntimeOptions,
+) -> MasterRuntimeConfig:
+    value = _master_runtime_value(master)
+    parsed = _parse_master_runtime_options(value["master"], "master_runtime.master")
+    return MasterRuntimeConfig(
+        schema_version=MASTER_RUNTIME_SCHEMA_VERSION,
+        master=parsed,
+        configuration_digest=digest_value(value),
+    )
+
+
+def parse_master_runtime_config(raw_text: str) -> MasterRuntimeConfig:
+    raw = _exact(
+        _strict_json_object(raw_text, "master_runtime"),
+        {"schema_version", "master"},
+        context="master_runtime",
+    )
+    if raw["schema_version"] != MASTER_RUNTIME_SCHEMA_VERSION:
+        raise ContractViolationError(
+            "master_runtime.schema_version must be "
+            f"{MASTER_RUNTIME_SCHEMA_VERSION}"
+        )
+    master = _parse_master_runtime_options(raw["master"], "master_runtime.master")
+    return build_master_runtime_config(master)
+
+
+def serialize_master_runtime_config(config: MasterRuntimeConfig) -> str:
+    if config.schema_version != MASTER_RUNTIME_SCHEMA_VERSION:
+        raise ContractViolationError(
+            "master_runtime.schema_version must be "
+            f"{MASTER_RUNTIME_SCHEMA_VERSION}"
+        )
+    verified = build_master_runtime_config(config.master)
+    if config.configuration_digest != verified.configuration_digest:
+        raise ContractViolationError("master runtime configuration digest mismatch")
+    return json.dumps(
+        _master_runtime_value(verified.master),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def build_master_runtime_snapshot(
+    run_id: str,
+    config: MasterRuntimeConfig,
+    source_config_path: str | None,
+) -> MasterRuntimeSnapshot:
+    _identifier(run_id, "master_runtime_snapshot.run_id")
+    validated_source_path = _runtime_string(
+        source_config_path,
+        "master_runtime_snapshot.source_config_path",
+    )
+    if validated_source_path is not None and not Path(
+        validated_source_path
+    ).is_absolute():
+        raise ContractViolationError(
+            "master_runtime_snapshot.source_config_path must be absolute"
+        )
+    verified = build_master_runtime_config(config.master)
+    if verified.configuration_digest != config.configuration_digest:
+        raise ContractViolationError("master runtime configuration digest mismatch")
+    return MasterRuntimeSnapshot(
+        schema_version=MASTER_RUNTIME_SCHEMA_VERSION,
+        run_id=run_id,
+        master=verified.master,
+        configuration_digest=verified.configuration_digest,
+        source_config_path=validated_source_path,
+    )
+
+
+def serialize_master_runtime_snapshot(snapshot: MasterRuntimeSnapshot) -> str:
+    config = build_master_runtime_config(snapshot.master)
+    verified = build_master_runtime_snapshot(
+        snapshot.run_id,
+        config,
+        snapshot.source_config_path,
+    )
+    if snapshot.configuration_digest != verified.configuration_digest:
+        raise ContractViolationError("master runtime snapshot digest mismatch")
+    value = _master_runtime_value(verified.master)
+    value.update(
+        {
+            "run_id": verified.run_id,
+            "configuration_digest": verified.configuration_digest,
+            "source_config_path": verified.source_config_path,
+        }
+    )
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def parse_master_runtime_snapshot(
+    raw_text: str,
+    expected_run_id: str,
+) -> MasterRuntimeSnapshot:
+    raw = _exact(
+        _strict_json_object(raw_text, "master_runtime_snapshot"),
+        {
+            "schema_version",
+            "run_id",
+            "master",
+            "configuration_digest",
+            "source_config_path",
+        },
+        context="master_runtime_snapshot",
+    )
+    if raw["schema_version"] != MASTER_RUNTIME_SCHEMA_VERSION:
+        raise ContractViolationError(
+            "master_runtime_snapshot.schema_version must be "
+            f"{MASTER_RUNTIME_SCHEMA_VERSION}"
+        )
+    run_id = _identifier(raw["run_id"], "master_runtime_snapshot.run_id")
+    if run_id != expected_run_id:
+        raise ContractViolationError("master runtime snapshot run_id mismatch")
+    master = _parse_master_runtime_options(
+        raw["master"],
+        "master_runtime_snapshot.master",
+    )
+    config = build_master_runtime_config(master)
+    digest = _digest(
+        raw["configuration_digest"],
+        "master_runtime_snapshot.configuration_digest",
+    )
+    if digest != config.configuration_digest:
+        raise ContractViolationError("master runtime snapshot digest mismatch")
+    source_path = _runtime_string(
+        raw["source_config_path"],
+        "master_runtime_snapshot.source_config_path",
+    )
+    return build_master_runtime_snapshot(run_id, config, source_path)
 
 
 def _agent_runtime_schema(value: object, context: str) -> int:
@@ -1393,149 +1557,6 @@ def parse_test_policy(raw_text: str) -> TestExecutionPolicy:
     )
 
 
-def parse_permission_report(raw_text: str) -> PermissionFeasibilityReport:
-    raw = _exact(
-        _decode(raw_text),
-        {
-            "schema_version",
-            "run_id",
-            "status",
-            "strategy",
-            "checks",
-            "evidence",
-            "orca_version",
-            "canonical_path",
-            "report_digest",
-        },
-        context="permission_report",
-    )
-    _schema(raw, "permission_report")
-    digest_input = dict(raw)
-    claimed = _digest(
-        digest_input.pop("report_digest"),
-        "permission_report.report_digest",
-    )
-    if digest_value(digest_input) != claimed:
-        raise ContractViolationError(
-            "permission report digest mismatch"
-        )
-
-    def parse_check(value: object, context: str) -> PermissionCheck:
-        check = _exact(
-            _object(value, context),
-            {"check_id", "status", "evidence"},
-            context=context,
-        )
-        return PermissionCheck(
-            check_id=_identifier(
-                check["check_id"],
-                f"{context}.check_id",
-            ),
-            status=_enum(
-                ValidationStatus,
-                check["status"],
-                f"{context}.status",
-            ),
-            evidence=_strings(
-                check["evidence"],
-                f"{context}.evidence",
-            ),
-        )
-
-    status = _enum(
-        ValidationStatus,
-        raw["status"],
-        "permission_report.status",
-    )
-    strategy_value = raw["strategy"]
-    strategy = (
-        None
-        if strategy_value is None
-        else _enum(
-            PermissionStrategy,
-            strategy_value,
-            "permission_report.strategy",
-        )
-    )
-    checks = _tuple(raw["checks"], parse_check, "permission_report.checks")
-    check_ids = tuple(item.check_id for item in checks)
-    valid_check_sequences = {
-        MANDATORY_PERMISSION_CHECK_IDS,
-        MANDATORY_PERMISSION_CHECK_IDS + OPTIONAL_PERMISSION_CHECK_IDS,
-    }
-    if check_ids not in valid_check_sequences:
-        raise ContractViolationError(
-            "permission report checks must be ordered V-PERM-01..05 "
-            "with optional V-PERM-06"
-        )
-    if status is ValidationStatus.PASS and (
-        strategy is None
-        or any(item.status is not ValidationStatus.PASS for item in checks)
-    ):
-        raise ContractViolationError(
-            "PASS permission report requires strategy and all checks PASS"
-        )
-    return PermissionFeasibilityReport(
-        schema_version=SCHEMA_VERSION,
-        run_id=_identifier(raw["run_id"], "permission_report.run_id"),
-        status=status,
-        strategy=strategy,
-        checks=checks,
-        evidence=_strings(
-            raw["evidence"],
-            "permission_report.evidence",
-        ),
-        orca_version=_string(
-            raw["orca_version"],
-            "permission_report.orca_version",
-        ),
-        canonical_path=_string(
-            raw["canonical_path"],
-            "permission_report.canonical_path",
-        ),
-        report_digest=claimed,
-    )
-
-
-def permission_capabilities(
-    report: PermissionFeasibilityReport,
-) -> frozenset[ProviderCapability]:
-    checks = {item.check_id: item.status for item in report.checks}
-    capabilities: set[ProviderCapability] = set()
-    if (
-        checks.get("V-PERM-02") is ValidationStatus.PASS
-        and checks.get("V-PERM-03") is ValidationStatus.PASS
-    ):
-        capabilities.add(
-            ProviderCapability(
-                AgentProvider.CLAUDE,
-                AgentAccessMode.READ_ONLY,
-            )
-        )
-    if checks.get("V-PERM-04") is ValidationStatus.PASS:
-        capabilities.add(
-            ProviderCapability(
-                AgentProvider.CODEX,
-                AgentAccessMode.READ_ONLY,
-            )
-        )
-    if checks.get("V-PERM-05") is ValidationStatus.PASS:
-        capabilities.add(
-            ProviderCapability(
-                AgentProvider.CODEX,
-                AgentAccessMode.WRITABLE,
-            )
-        )
-    if checks.get("V-PERM-06") is ValidationStatus.PASS:
-        capabilities.add(
-            ProviderCapability(
-                AgentProvider.CLAUDE,
-                AgentAccessMode.WRITABLE,
-            )
-        )
-    return frozenset(capabilities)
-
-
 def parse_human_decision(raw_text: str) -> HumanDecision:
     raw = _exact(
         _decode(raw_text),
@@ -1584,7 +1605,49 @@ def parse_human_decision(raw_text: str) -> HumanDecision:
     )
 
 
+def parse_master_decision(raw_text: str) -> MasterDecision:
+    raw = _exact(
+        _normalize_aliases(_decode(raw_text), MASTER_DECISION_ALIASES),
+        {"action", "role", "permission_profile", "reason"},
+        context="master_decision",
+    )
+    action = _enum(MasterAction, raw["action"], "master_decision.action")
+    role = (
+        None
+        if raw["role"] is None
+        else _enum(Role, raw["role"], "master_decision.role")
+    )
+    permission_profile = (
+        None
+        if raw["permission_profile"] is None
+        else _enum(
+            PermissionProfile,
+            raw["permission_profile"],
+            "master_decision.permission_profile",
+        )
+    )
+    reason = _string(raw["reason"], "master_decision.reason")
+
+    if action is MasterAction.DISPATCH:
+        if role is None or permission_profile is None:
+            raise ContractViolationError(
+                "dispatch master decision requires role and permission_profile"
+            )
+    elif role is not None or permission_profile is not None:
+        raise ContractViolationError(
+            "non-dispatch master decision must not select role or permission_profile"
+        )
+
+    return MasterDecision(
+        action=action,
+        role=role,
+        permission_profile=permission_profile,
+        reason=reason,
+    )
+
+
 WIRE_ALIASES_BY_TYPE: dict[type[object], dict[str, str]] = {
+    MasterDecision: {"permission_profile": "permissionProfile"},
     WorkerDonePayload: {
         "task_id": "taskId",
         "dispatch_id": "dispatchId",

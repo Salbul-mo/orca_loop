@@ -6,6 +6,7 @@ from typing import Callable
 
 from .contracts import (
     ContractViolationError,
+    digest_value,
     parse_implementation_artifact,
     parse_plan_document,
     parse_review_artifact,
@@ -46,7 +47,10 @@ from .models import (
     LedgerView,
     LoopConfig,
     LoopState,
+    MasterAction,
+    MasterDecision,
     PlanDocument,
+    PermissionProfile,
     RenderedContract,
     ResumeAction,
     ResumeDecision,
@@ -119,6 +123,81 @@ ARTIFACT_BY_ROLE = {
     Role.CODE_REVIEWER: ArtifactKind.CODE_REVIEW,
     Role.CROSS_CONFIRMER: ArtifactKind.CROSS_REVIEW,
 }
+ROLE_ALLOWED_PERMISSIONS = {
+    Role.PLANNER: frozenset({PermissionProfile.READ_ONLY}),
+    Role.PLAN_REVIEWER: frozenset({PermissionProfile.READ_ONLY}),
+    Role.IMPLEMENTER: frozenset({PermissionProfile.WORKSPACE_WRITE}),
+    Role.CODE_REVIEWER: frozenset({PermissionProfile.READ_ONLY}),
+    Role.CROSS_CONFIRMER: frozenset({PermissionProfile.READ_ONLY}),
+}
+DEFAULT_PERMISSION_PROFILE_BY_ROLE = {
+    role: next(iter(permissions))
+    for role, permissions in ROLE_ALLOWED_PERMISSIONS.items()
+}
+
+
+def permission_policy_value() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "role_allowed_permissions": {
+            role.value: sorted(
+                permission.value for permission in permissions
+            )
+            for role, permissions in sorted(
+                ROLE_ALLOWED_PERMISSIONS.items(),
+                key=lambda item: item[0].value,
+            )
+        },
+    }
+
+
+def permission_policy_digest() -> str:
+    return digest_value(permission_policy_value())
+
+
+def validate_permission_profile(
+    role: Role,
+    permission_profile: PermissionProfile,
+) -> PermissionProfile:
+    allowed = ROLE_ALLOWED_PERMISSIONS.get(role)
+    if allowed is None:
+        raise CoordinatorContractError(f"unsupported role: {role.value}")
+    if permission_profile not in allowed:
+        raise CoordinatorContractError(
+            "permission profile is not allowed for role: "
+            f"{role.value} + {permission_profile.value}"
+        )
+    return permission_profile
+
+
+def default_permission_profile(role: Role) -> PermissionProfile:
+    try:
+        permission_profile = DEFAULT_PERMISSION_PROFILE_BY_ROLE[role]
+    except KeyError as error:
+        raise CoordinatorContractError(
+            f"unsupported role: {role.value}"
+        ) from error
+    return validate_permission_profile(role, permission_profile)
+
+
+def validate_master_decision(decision: MasterDecision) -> MasterDecision:
+    if not decision.reason:
+        raise CoordinatorContractError("master decision reason must be nonempty")
+    if decision.action is MasterAction.DISPATCH:
+        if decision.role is None or decision.permission_profile is None:
+            raise CoordinatorContractError(
+                "dispatch master decision requires role and permission profile"
+            )
+        validate_permission_profile(
+            decision.role,
+            decision.permission_profile,
+        )
+        return decision
+    if decision.role is not None or decision.permission_profile is not None:
+        raise CoordinatorContractError(
+            "non-dispatch master decision must not select worker permission"
+        )
+    return decision
 
 
 def ledger_view(ledger: ConsensusLedger) -> LedgerView:

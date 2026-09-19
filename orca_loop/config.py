@@ -13,31 +13,35 @@ from .contracts import (
     ContractViolationError,
     build_agent_runtime_config,
     build_agent_runtime_snapshot,
+    build_master_runtime_config,
+    build_master_runtime_snapshot,
     default_agent_provider,
     digest_value,
     parse_agent_runtime_config,
     parse_agent_runtime_snapshot,
-    parse_permission_report,
+    parse_master_runtime_config,
+    parse_master_runtime_snapshot,
     parse_test_policy,
-    permission_capabilities,
     serialize_agent_runtime_config,
     serialize_agent_runtime_snapshot,
+    serialize_master_runtime_snapshot,
 )
 from .generation import AtomicWriteError, write_atomic_bytes
 from .models import (
-    AgentAccessMode,
     AgentProvider,
     AgentRuntimeConfig,
     AgentRuntimeOptions,
     LoopConfig,
-    PermissionFeasibilityReport,
-    PermissionStrategy,
+    MasterRuntimeConfig,
     TestExecutionPolicy,
-    ValidationStatus,
     WorkerKey,
 )
 from .orca_client import OrcaClient
-from .workspace import PathBoundaryError, agent_runtime_snapshot_path
+from .workspace import (
+    PathBoundaryError,
+    agent_runtime_snapshot_path,
+    master_runtime_snapshot_path,
+)
 
 
 DEFAULT_PLAN_ROUND_LIMIT = 5
@@ -62,20 +66,20 @@ class RunArguments:
     run_id: str
     harness_root: Path
     config: LoopConfig
-    permission_report_path: Path
     resume: bool
     dry_run: bool
     agent_runtime_request: AgentRuntimeRequest | None = None
+    master_runtime_request: MasterRuntimeRequest | None = None
 
 
 @dataclass(frozen=True)
 class PreflightResult:
     arguments: RunArguments
     test_policy: TestExecutionPolicy
-    permission_report: PermissionFeasibilityReport
     orca_version: str
     base_head: str
     agent_runtime: AgentRuntimeConfig | None = None
+    master_runtime: MasterRuntimeConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +93,13 @@ class AgentRuntimeRequest:
     model_overrides: tuple[tuple[WorkerKey, str | None], ...]
     effort_overrides: tuple[tuple[WorkerKey, str | None], ...]
     explicit_input: bool
+
+
+@dataclass(frozen=True)
+class MasterRuntimeRequest:
+    source_path: Path
+    source_digest: str
+    config: MasterRuntimeConfig
 
 
 @dataclass(frozen=True)
@@ -256,6 +267,33 @@ def _read_agent_runtime_request(
             or model_overrides
             or effort_overrides
         ),
+    )
+
+
+def _read_master_runtime_request(
+    source_argument: str | None,
+) -> MasterRuntimeRequest | None:
+    if source_argument is None:
+        return None
+    candidate = Path(source_argument).absolute()
+    if candidate.is_symlink():
+        raise ConfigurationError("master config path must not be a symlink")
+    source_path = candidate.resolve()
+    if not source_path.is_file():
+        raise ConfigurationError(
+            f"master config does not exist: {source_path}"
+        )
+    try:
+        raw = source_path.read_bytes()
+        config = parse_master_runtime_config(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ContractViolationError) as exc:
+        raise ConfigurationError(
+            f"invalid master config {source_path}: {exc}"
+        ) from exc
+    return MasterRuntimeRequest(
+        source_path=source_path,
+        source_digest="sha256:" + hashlib.sha256(raw).hexdigest(),
+        config=config,
     )
 
 
@@ -589,6 +627,64 @@ def persist_agent_runtime_snapshot(
     return write_atomic_bytes(target, raw)
 
 
+def load_master_runtime_snapshot(
+    harness_root: Path,
+    run_id: str,
+) -> MasterRuntimeConfig | None:
+    try:
+        path = master_runtime_snapshot_path(harness_root, run_id)
+    except PathBoundaryError as exc:
+        raise PreflightError(str(exc)) from exc
+    if not path.exists():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise PreflightError(
+            f"master runtime snapshot must be a regular file: {path}"
+        )
+    try:
+        snapshot = parse_master_runtime_snapshot(
+            path.read_text(encoding="utf-8"),
+            run_id,
+        )
+    except (OSError, UnicodeDecodeError, ContractViolationError) as exc:
+        raise PreflightError(
+            f"invalid master runtime snapshot: {exc}"
+        ) from exc
+    return build_master_runtime_config(snapshot.master)
+
+
+def persist_master_runtime_snapshot(
+    control_dir: Path,
+    run_id: str,
+    config: MasterRuntimeConfig,
+    source_path: Path | None,
+) -> Path:
+    target = control_dir.resolve() / "master-runtime.json"
+    snapshot = build_master_runtime_snapshot(
+        run_id,
+        config,
+        None if source_path is None else str(source_path.resolve()),
+    )
+    raw = serialize_master_runtime_snapshot(snapshot).encode("utf-8") + b"\n"
+    if target.exists():
+        if target.is_symlink() or not target.is_file():
+            raise AtomicWriteError(
+                f"master runtime snapshot must be a regular file: {target}"
+            )
+        try:
+            existing = target.read_bytes()
+        except OSError as exc:
+            raise AtomicWriteError(
+                f"failed to read master runtime snapshot: {target}"
+            ) from exc
+        if existing != raw:
+            raise AtomicWriteError(
+                "master runtime snapshot already exists with different content"
+            )
+        return target
+    return write_atomic_bytes(target, raw)
+
+
 def prepare_agent_runtime(
     preflight: PreflightResult,
     *,
@@ -643,32 +739,36 @@ def prepare_agent_runtime(
                 "a migration snapshot will be created.",
                 file=output,
             )
-    capabilities = permission_capabilities(preflight.permission_report)
-    for item in resolved.agents:
-        access_mode = (
-            AgentAccessMode.WRITABLE
-            if item.worker_key is WorkerKey.CODEX_IMPLEMENTER
-            else AgentAccessMode.READ_ONLY
-        )
-        if not any(
-            capability.provider is item.provider
-            and capability.access_mode is access_mode
-            for capability in capabilities
-        ):
-            check_hint = (
-                "V-PERM-06"
-                if item.provider is AgentProvider.CLAUDE
-                and access_mode is AgentAccessMode.WRITABLE
-                else "the matching permission check"
-            )
-            raise PreflightError(
-                f"permission report does not prove {item.provider.value} "
-                f"{access_mode.value} capability required by "
-                f"{item.worker_key.value}; pass {check_hint} before "
-                "worker provisioning"
-            )
     print_agent_runtime_summary(resolved, stderr=stderr)
     return replace(preflight, agent_runtime=resolved)
+
+
+def prepare_master_runtime(
+    preflight: PreflightResult,
+) -> PreflightResult:
+    arguments = preflight.arguments
+    request = arguments.master_runtime_request
+    persisted = (
+        load_master_runtime_snapshot(
+            arguments.harness_root,
+            arguments.run_id,
+        )
+        if arguments.resume
+        else None
+    )
+    if persisted is not None:
+        if (
+            request is not None
+            and request.config.configuration_digest
+            != persisted.configuration_digest
+        ):
+            raise PreflightError(
+                "master runtime configuration drift on resume"
+            )
+        return replace(preflight, master_runtime=persisted)
+    if request is None:
+        return preflight
+    return replace(preflight, master_runtime=request.config)
 
 
 def load_test_policy(path: Path | None) -> TestExecutionPolicy:
@@ -727,12 +827,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--request", required=True)
     parser.add_argument("--worktree", required=True)
     parser.add_argument("--coordinator-handle", required=True)
-    parser.add_argument("--permission-report", required=True)
     parser.add_argument("--test-policy")
     parser.add_argument(
         "--agent-config",
         metavar="PATH",
         help="Load the strict JSON configuration for all four agents.",
+    )
+    parser.add_argument(
+        "--master-config",
+        metavar="PATH",
+        help="Load the strict JSON configuration for the Master runtime.",
     )
     parser.add_argument(
         "--configure-agents",
@@ -819,13 +923,15 @@ def parse_run_arguments(
         if namespace.test_policy is None
         else Path(namespace.test_policy).resolve()
     )
-    permission = Path(namespace.permission_report).resolve()
     agent_runtime_request = _read_agent_runtime_request(
         namespace.agent_config,
         namespace.configure_agents,
         namespace.agent_provider,
         namespace.agent_model,
         namespace.agent_effort,
+    )
+    master_runtime_request = _read_master_runtime_request(
+        namespace.master_config,
     )
     config = validate_loop_config(
         LoopConfig(
@@ -850,10 +956,10 @@ def parse_run_arguments(
         run_id=namespace.run_id,
         harness_root=root,
         config=config,
-        permission_report_path=permission,
         resume=namespace.resume,
         dry_run=namespace.dry_run,
         agent_runtime_request=agent_runtime_request,
+        master_runtime_request=master_runtime_request,
     )
 
 
@@ -922,14 +1028,7 @@ def run_preflight(
         raise PreflightError(
             "target worktree must be clean before a new run"
         )
-    if not arguments.permission_report_path.is_file():
-        raise PreflightError(
-            "permission feasibility report does not exist"
-        )
     try:
-        permission = parse_permission_report(
-            arguments.permission_report_path.read_text(encoding="utf-8")
-        )
         policy = load_test_policy(config.test_policy_path)
     except (ContractViolationError, ConfigurationError) as exc:
         raise PreflightError(str(exc)) from exc
@@ -955,30 +1054,6 @@ def run_preflight(
         raise PreflightError(
             f"Orca version drift: expected {expected_orca_version}, got {version}"
         )
-    if (
-        permission.status is not ValidationStatus.PASS
-        or permission.strategy
-        is not PermissionStrategy.READONLY_REPOSITORY
-        or permission.orca_version != version
-    ):
-        raise PreflightError(
-            "permission report is not a PASS result for strategy D "
-            "and the active Orca version"
-        )
-    if (
-        Path(permission.canonical_path).resolve()
-        != arguments.permission_report_path
-    ):
-        raise PreflightError(
-            "permission report path differs from canonical_path"
-        )
-    if any(
-        item.status is not ValidationStatus.PASS
-        for item in permission.checks
-    ):
-        raise PreflightError(
-            "permission report contains a non-PASS check"
-        )
     client.call(
         (
             "terminal",
@@ -991,7 +1066,6 @@ def run_preflight(
     return PreflightResult(
         arguments=arguments,
         test_policy=policy,
-        permission_report=permission,
         orca_version=version,
         base_head=base_head,
     )

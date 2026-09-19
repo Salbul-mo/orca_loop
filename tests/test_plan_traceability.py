@@ -112,7 +112,6 @@ class PhaseThreeTraceabilityTest(unittest.TestCase):
 
     def test_all_declared_phase_four_core_targets_exist(self) -> None:
         targets = (
-            "permission_spike.py",
             "worker_runner.py",
             "run_loop.py",
             "orca_loop/bootstrap.py",

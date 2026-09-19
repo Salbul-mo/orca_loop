@@ -3,15 +3,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .contracts import default_agent_provider, parse_permission_report
+from .contracts import default_agent_provider
 from .models import (
     AgentProvider,
     AgentRuntimeOptions,
     LaunchProfile,
-    PermissionFeasibilityReport,
-    PermissionStrategy,
+    PermissionProfile,
     Role,
-    ValidationStatus,
     WorkerKey,
 )
 
@@ -20,12 +18,6 @@ class LaunchProfileError(ValueError):
     """Raised when a role launch profile is not permission-feasible."""
 
 
-READ_ONLY_ROLES = {
-    Role.PLANNER,
-    Role.PLAN_REVIEWER,
-    Role.CODE_REVIEWER,
-    Role.CROSS_CONFIRMER,
-}
 ROLE_RUNTIME_WORKERS = {
     Role.PLANNER: WorkerKey.CLAUDE_PLANNER,
     Role.PLAN_REVIEWER: WorkerKey.CODEX_REVIEW,
@@ -44,52 +36,19 @@ def _validate_path(path: Path, name: str) -> Path:
     return resolved
 
 
-def _verify_permission_report(
-    report: PermissionFeasibilityReport,
-    expected_orca_version: str,
-) -> None:
-    if report.status is not ValidationStatus.PASS:
-        raise LaunchProfileError("permission report is not PASS")
-    if report.strategy is not PermissionStrategy.READONLY_REPOSITORY:
-        raise LaunchProfileError(
-            "only the live-verified strategy D may be used"
-        )
-    if report.orca_version != expected_orca_version:
-        raise LaunchProfileError(
-            "permission report Orca version does not match runtime"
-        )
-    canonical = Path(report.canonical_path)
-    if not canonical.is_absolute() or not canonical.is_file():
-        raise LaunchProfileError(
-            "permission report canonical_path is invalid"
-        )
-    parsed = parse_permission_report(
-        canonical.read_text(encoding="utf-8")
-    )
-    if parsed != report:
-        raise LaunchProfileError(
-            "permission report does not match canonical file"
-        )
-
-
 def build_launch_profile(
     role: Role,
+    permission_profile: PermissionProfile,
     worktree: Path,
     step_input: Path,
     step_output: Path,
-    permission_report: PermissionFeasibilityReport,
     *,
-    expected_orca_version: str,
     runtime_options: AgentRuntimeOptions | None = None,
 ) -> LaunchProfile:
     root = _validate_path(worktree, "worktree")
     input_dir = _validate_path(step_input, "step_input")
     _validate_path(step_output, "step_output")
-    _verify_permission_report(
-        permission_report,
-        expected_orca_version,
-    )
-    if role not in READ_ONLY_ROLES | {Role.IMPLEMENTER}:
+    if role not in ROLE_RUNTIME_WORKERS:
         raise LaunchProfileError(f"unsupported role: {role.value}")
     if (
         runtime_options is not None
@@ -152,10 +111,14 @@ def build_launch_profile(
     else:
         raise LaunchProfileError(f"unsupported role: {role.value}")
 
-    if role in READ_ONLY_ROLES:
+    if permission_profile is PermissionProfile.READ_ONLY:
         writable_roots: tuple[Path, ...] = ()
-    else:
+    elif permission_profile is PermissionProfile.WORKSPACE_WRITE:
         writable_roots = (root,)
+    else:
+        raise LaunchProfileError(
+            f"unsupported permission profile: {permission_profile}"
+        )
     if any(path == input_dir.parent for path in writable_roots):
         raise LaunchProfileError(
             "launch profile cannot grant the entire step root"
@@ -163,5 +126,4 @@ def build_launch_profile(
     return LaunchProfile(
         command=command,
         writable_roots=writable_roots,
-        permission_report_digest=permission_report.report_digest,
     )

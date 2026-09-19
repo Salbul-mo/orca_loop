@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from orca_loop.coordinator import permission_policy_digest
 from orca_loop.escalation import (
     GateProtocolError,
     build_user_decision_report,
@@ -60,7 +61,7 @@ def state() -> CoordinatorState:
         snapshot_digest=DIGEST_A,
         test_gate_status=None,
         test_policy_digest=None,
-        permission_report_digest=DIGEST_A,
+        permission_policy_digest=permission_policy_digest(),
         history=(),
     )
 

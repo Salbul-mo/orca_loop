@@ -15,12 +15,15 @@ from orca_loop.config import (
     default_agent_runtime_config,
     parse_run_arguments,
     persist_agent_runtime_snapshot,
+    persist_master_runtime_snapshot,
     prepare_agent_runtime,
+    prepare_master_runtime,
     run_preflight,
 )
 from orca_loop.contracts import (
     ContractViolationError,
     parse_plan_document,
+    to_wire_value,
 )
 from orca_loop.coordinator import (
     GenerationController,
@@ -28,12 +31,16 @@ from orca_loop.coordinator import (
     WORKER_STATES,
     commit_step_transition,
     consensus_round,
+    default_permission_profile,
     execute_evaluate,
     execute_human_gate,
     execute_test_gate,
     execute_worker_step,
+    ledger_view,
     operational_retry_result,
+    permission_policy_digest,
     role_for_state,
+    validate_master_decision,
 )
 from orca_loop.dispatcher import provision_workers, worker_for_role
 from orca_loop.escalation import (
@@ -49,16 +56,23 @@ from orca_loop.generation import (
     commit_generation,
     load_committed,
 )
-from orca_loop.ledger import empty_ledger, unresolved_scope
+from orca_loop.ledger import InvalidRoundError, empty_ledger, unresolved_scope
 from orca_loop.locking import (
     RunLockError,
     acquire_run_lock,
     release_run_lock,
 )
 from orca_loop.machine import TERMINAL_STATES
+from orca_loop.master_runtime import (
+    MasterInvoker,
+    MasterRuntimeAdapterError,
+    invoke_master,
+    invoke_master_provider,
+)
 from orca_loop.models import (
     ActiveStep,
     ArtifactKind,
+    CodeReviewVerdict,
     ConsensusKind,
     CoordinatorState,
     GateKind,
@@ -66,7 +80,9 @@ from orca_loop.models import (
     LaunchProfile,
     LoopCounters,
     LoopState,
+    MasterAction,
     PlanDocument,
+    PlanReviewVerdict,
     ReviewArtifact,
     Role,
     RoleContext,
@@ -137,28 +153,115 @@ def _initial_state(preflight: PreflightResult) -> CoordinatorState:
         snapshot_digest=snapshot.snapshot_digest,
         test_gate_status=None,
         test_policy_digest=preflight.test_policy.policy_digest,
-        permission_report_digest=(
-            preflight.permission_report.report_digest
-        ),
+        permission_policy_digest=permission_policy_digest(),
         history=(),
     )
 
 
-def _dummy_profiles(
-    worktree: Path,
-    permission_digest: str,
-) -> dict[WorkerKey, LaunchProfile]:
+def _dummy_profiles(worktree: Path) -> dict[WorkerKey, LaunchProfile]:
     profile = LaunchProfile(
         ("not-executed", "-C", str(worktree.resolve())),
         (),
-        permission_digest,
     )
     return {key: profile for key in WorkerKey}
+
+
+def _initial_master_context(
+    preflight: PreflightResult,
+    controller: GenerationController,
+) -> dict[str, object]:
+    return {
+        "stage": "initial_routing",
+        "runId": controller.state.run_id,
+        "currentState": controller.state.state.value,
+        "request": preflight.arguments.config.request_path.read_text(
+            encoding="utf-8"
+        ),
+        "allowedDispatches": [
+            {
+                "role": Role.PLANNER.value,
+                "permissionProfile": "read_only",
+            },
+            {
+                "role": Role.IMPLEMENTER.value,
+                "permissionProfile": "workspace_write",
+            },
+        ],
+    }
+
+
+def _commit_initial_route(
+    controller: GenerationController,
+    preflight: PreflightResult,
+    *,
+    master_invoke: MasterInvoker | None = None,
+) -> None:
+    arguments = preflight.arguments
+    if preflight.master_runtime is None:
+        commit_step_transition(
+            controller,
+            StepExecutionResult(
+                TransitionSignal(
+                    SignalKind.OK,
+                    "initialization completed",
+                    (),
+                ),
+                controller.ledger,
+                None,
+            ),
+            arguments.config,
+        )
+        return
+    if controller.state.state is not LoopState.INIT:
+        raise OrcaLoopError(
+            "initial Master routing requires coordinator state INIT"
+        )
+    invoke = master_invoke
+    if invoke is None:
+        invoke = lambda options, prompt: invoke_master_provider(
+            options,
+            prompt,
+            timeout_ms=arguments.config.step_timeout_ms,
+        )
+    try:
+        decision = invoke_master(
+            preflight.master_runtime,
+            arguments.harness_root / "prompts" / "master.md",
+            _initial_master_context(preflight, controller),
+            invoke,
+        )
+    except MasterRuntimeAdapterError as exc:
+        raise OrcaLoopError(f"initial Master routing failed: {exc}") from exc
+    decision = validate_master_decision(decision)
+    if decision.action is not MasterAction.DISPATCH:
+        raise OrcaLoopError(
+            "initial Master routing requires action dispatch"
+        )
+    route_by_role = {
+        Role.PLANNER: LoopState.PLAN,
+        Role.IMPLEMENTER: LoopState.IMPLEMENT,
+    }
+    target = route_by_role.get(decision.role)
+    if target is None:
+        role_value = None if decision.role is None else decision.role.value
+        raise OrcaLoopError(
+            "initial Master routing role is not allowed: "
+            f"{role_value}"
+        )
+    controller.commit(
+        stage=StepStage.STEP_PENDING,
+        active=None,
+        reason=f"initial Master dispatch: {decision.reason}",
+        signal=SignalKind.OK,
+        state_value=target,
+    )
 
 
 def _initialize(
     preflight: PreflightResult,
     client: OrcaClient,
+    *,
+    master_invoke: MasterInvoker | None = None,
 ) -> tuple[GenerationController, WorkerPool]:
     arguments = preflight.arguments
     workspace, _ = create_run_workspace(
@@ -182,14 +285,23 @@ def _initialize(
         runtime,
         source_path,
     )
+    if preflight.master_runtime is not None:
+        master_source_path = (
+            None
+            if arguments.master_runtime_request is None
+            else arguments.master_runtime_request.source_path
+        )
+        persist_master_runtime_snapshot(
+            workspace.control_dir,
+            arguments.run_id,
+            preflight.master_runtime,
+            master_source_path,
+        )
     controller = GenerationController(workspace, state, ledger)
     pool = provision_workers(
         client,
         state.worktree_selector,
-        _dummy_profiles(
-            arguments.config.worktree_path,
-            state.permission_report_digest,
-        ),
+        _dummy_profiles(arguments.config.worktree_path),
         coordinator_handle=state.coordinator_handle,
     )
     controller.commit(
@@ -207,18 +319,10 @@ def _initialize(
         active=None,
         reason="worker pool provenance recorded",
     )
-    commit_step_transition(
+    _commit_initial_route(
         controller,
-        StepExecutionResult(
-            TransitionSignal(
-                SignalKind.OK,
-                "initialization completed",
-                (),
-            ),
-            controller.ledger,
-            None,
-        ),
-        arguments.config,
+        preflight,
+        master_invoke=master_invoke,
     )
     return controller, pool
 
@@ -240,6 +344,10 @@ def _resume(
         raise OrcaLoopError(
             "resume coordinator handle does not match committed state"
         )
+    if state.permission_policy_digest != permission_policy_digest():
+        raise OrcaLoopError(
+            "resume permission policy does not match committed state"
+        )
     snapshot = capture_snapshot(arguments.config.worktree_path)
     if snapshot.snapshot_digest != state.snapshot_digest:
         raise OrcaLoopError(
@@ -258,6 +366,22 @@ def _resume(
             arguments.run_id,
             runtime,
             source_path,
+        )
+    master_runtime_path = workspace.control_dir / "master-runtime.json"
+    if (
+        not master_runtime_path.exists()
+        and preflight.master_runtime is not None
+    ):
+        master_source_path = (
+            None
+            if arguments.master_runtime_request is None
+            else arguments.master_runtime_request.source_path
+        )
+        persist_master_runtime_snapshot(
+            workspace.control_dir,
+            arguments.run_id,
+            preflight.master_runtime,
+            master_source_path,
         )
     pool = WorkerPool(state.worker_handles)
     if len(pool.workers) != 4:
@@ -380,11 +504,818 @@ def _profile_root(
     )
 
 
+def _worker_completion_master_context(
+    controller: GenerationController,
+    preflight: PreflightResult,
+    role: Role,
+    result: StepExecutionResult,
+    artifact: object,
+    *,
+    allow_plan_review_implement: bool = False,
+    allow_cross_confirm_finish: bool = False,
+) -> dict[str, object]:
+    state = controller.state.state
+    if state in {LoopState.PLAN, LoopState.PLAN_REVISE}:
+        allowed = [
+            {
+                "action": MasterAction.DISPATCH.value,
+                "role": Role.PLAN_REVIEWER.value,
+                "permissionProfile": "read_only",
+            },
+        ]
+        if _plan_review_can_be_skipped(result, artifact):
+            allowed.append(
+                {
+                    "action": MasterAction.DISPATCH.value,
+                    "role": Role.IMPLEMENTER.value,
+                    "permissionProfile": "workspace_write",
+                }
+            )
+        allowed.append(
+            {
+                "action": MasterAction.ESCALATE.value,
+                "role": None,
+                "permissionProfile": None,
+            }
+        )
+    elif state is LoopState.PLAN_REVIEW and allow_plan_review_implement:
+        allowed = [
+            {
+                "action": MasterAction.DISPATCH.value,
+                "role": Role.IMPLEMENTER.value,
+                "permissionProfile": "workspace_write",
+            },
+            {
+                "action": MasterAction.ESCALATE.value,
+                "role": None,
+                "permissionProfile": None,
+            },
+        ]
+    elif state in {LoopState.IMPLEMENT, LoopState.FIX}:
+        allowed = [
+            {
+                "action": MasterAction.TEST.value,
+                "role": None,
+                "permissionProfile": None,
+            },
+            {
+                "action": MasterAction.ESCALATE.value,
+                "role": None,
+                "permissionProfile": None,
+            },
+        ]
+    elif state is LoopState.CODE_REVIEW:
+        allowed = [
+            {
+                "action": MasterAction.DISPATCH.value,
+                "role": Role.CROSS_CONFIRMER.value,
+                "permissionProfile": "read_only",
+            },
+        ]
+        if _code_review_can_finish(controller, result, artifact):
+            allowed.append(
+                {
+                    "action": MasterAction.FINISH.value,
+                    "role": None,
+                    "permissionProfile": None,
+                }
+            )
+        allowed.append(
+            {
+                "action": MasterAction.ESCALATE.value,
+                "role": None,
+                "permissionProfile": None,
+            }
+        )
+    elif state is LoopState.CROSS_CONFIRM and allow_cross_confirm_finish:
+        allowed = [
+            {
+                "action": MasterAction.FINISH.value,
+                "role": None,
+                "permissionProfile": None,
+            },
+            {
+                "action": MasterAction.ESCALATE.value,
+                "role": None,
+                "permissionProfile": None,
+            },
+        ]
+    else:
+        allowed = []
+    return {
+        "stage": "worker_completion",
+        "runId": controller.state.run_id,
+        "currentState": state.value,
+        "completedRole": role.value,
+        "request": preflight.arguments.config.request_path.read_text(
+            encoding="utf-8"
+        ),
+        "artifact": to_wire_value(artifact),
+        "resultSignal": result.signal.kind.value,
+        "allowedDecisions": allowed,
+    }
+
+
+def _plan_review_can_be_skipped(
+    result: StepExecutionResult,
+    artifact: object,
+) -> bool:
+    if not isinstance(artifact, PlanDocument):
+        return False
+    if ledger_view(result.ledger).unresolved_count != 0:
+        return False
+    if artifact.data_api_schema_changes.strip() not in {"", "없음", "none", "None"}:
+        return False
+    return not any(
+        item.operation.value in {"delete", "rename"}
+        for item in artifact.affected_files
+    )
+
+
+def _code_review_can_finish(
+    controller: GenerationController,
+    result: StepExecutionResult,
+    artifact: object,
+) -> bool:
+    if result.signal.kind is not SignalKind.ARTIFACT_OK:
+        return False
+    if result.test_gate_status is not TestGateStatus.PASS:
+        return False
+    if not isinstance(artifact, ReviewArtifact):
+        return False
+    if (
+        artifact.artifact_kind is not ArtifactKind.CODE_REVIEW
+        or artifact.role is not Role.CODE_REVIEWER
+        or artifact.verdict is not CodeReviewVerdict.APPROVE
+    ):
+        return False
+    if (
+        artifact.reviewed_finding_ids
+        or artifact.finding_decisions
+        or artifact.findings
+        or artifact.non_blocking_suggestions
+        or artifact.escalation_signals
+        or result.escalations
+    ):
+        return False
+    plan = _load_plan(controller.workspace.root)
+    return plan is not None and _plan_review_can_be_skipped(result, plan)
+
+
+def _plan_review_implement_preview(
+    controller: GenerationController,
+    preflight: PreflightResult,
+    result: StepExecutionResult,
+    artifact: object,
+) -> StepExecutionResult | None:
+    if result.signal.kind is not SignalKind.ARTIFACT_OK:
+        return None
+    if not isinstance(artifact, ReviewArtifact):
+        return None
+    if (
+        artifact.artifact_kind is not ArtifactKind.PLAN_REVIEW
+        or artifact.role is not Role.PLAN_REVIEWER
+        or artifact.verdict is not PlanReviewVerdict.APPROVE
+    ):
+        return None
+    if (
+        artifact.reviewed_finding_ids
+        or artifact.finding_decisions
+        or artifact.findings
+        or artifact.non_blocking_suggestions
+        or artifact.escalation_signals
+        or result.escalations
+    ):
+        return None
+    plan = _load_plan(controller.workspace.root)
+    if plan is None:
+        return None
+    try:
+        preview = execute_evaluate(
+            state=LoopState.PLAN_CONSENSUS_EVALUATE,
+            ledger=result.ledger,
+            evidence=_round_evidence(controller, ConsensusKind.PLAN),
+            config=preflight.arguments.config,
+            plan=plan,
+            destructive_approval=controller.state.destructive_approval,
+        )
+    except InvalidRoundError:
+        return None
+    if (
+        preview.signal.kind is not SignalKind.UNRESOLVED_ZERO
+        or preview.escalations
+    ):
+        return None
+    return replace(preview, test_gate_status=result.test_gate_status)
+
+
+def _cross_confirm_finish_preview(
+    controller: GenerationController,
+    preflight: PreflightResult,
+    result: StepExecutionResult,
+    artifact: object,
+) -> StepExecutionResult | None:
+    if result.signal.kind is not SignalKind.ARTIFACT_OK:
+        return None
+    if result.test_gate_status is not TestGateStatus.PASS:
+        return None
+    if not isinstance(artifact, ReviewArtifact):
+        return None
+    if (
+        artifact.artifact_kind is not ArtifactKind.CROSS_REVIEW
+        or artifact.role is not Role.CROSS_CONFIRMER
+        or artifact.verdict is not CodeReviewVerdict.APPROVE
+        or artifact.agrees_with_reviewer is not True
+    ):
+        return None
+    if (
+        artifact.reviewed_finding_ids
+        or artifact.finding_decisions
+        or artifact.findings
+        or artifact.non_blocking_suggestions
+        or artifact.escalation_signals
+        or result.escalations
+    ):
+        return None
+    plan = _load_plan(controller.workspace.root)
+    if plan is None or not _plan_review_can_be_skipped(result, plan):
+        return None
+    preview = execute_evaluate(
+        state=LoopState.CONSENSUS_EVALUATE,
+        ledger=result.ledger,
+        evidence=_round_evidence(controller, ConsensusKind.CODE),
+        config=preflight.arguments.config,
+        plan=plan,
+        destructive_approval=controller.state.destructive_approval,
+    )
+    if (
+        preview.signal.kind is not SignalKind.UNRESOLVED_ZERO
+        or preview.escalations
+    ):
+        return None
+    return replace(preview, test_gate_status=result.test_gate_status)
+
+
+def _validate_worker_completion_master_decision(
+    state: LoopState,
+    decision,
+    *,
+    allow_direct_implementation: bool = False,
+    allow_plan_review_implement: bool = False,
+    allow_code_review_finish: bool = False,
+    allow_cross_confirm_finish: bool = False,
+) -> SignalKind | LoopState | None:
+    decision = validate_master_decision(decision)
+    if decision.action is MasterAction.ESCALATE:
+        return SignalKind.ESCALATE
+    if state in {LoopState.PLAN, LoopState.PLAN_REVISE}:
+        if (
+            decision.action is MasterAction.DISPATCH
+            and decision.role is Role.PLAN_REVIEWER
+        ):
+            return None
+        if (
+            allow_direct_implementation
+            and decision.action is MasterAction.DISPATCH
+            and decision.role is Role.IMPLEMENTER
+        ):
+            return LoopState.IMPLEMENT
+        if not allow_direct_implementation:
+            raise OrcaLoopError(
+                "Master decision after planning must dispatch plan_reviewer or escalate"
+            )
+        raise OrcaLoopError(
+            "Master decision after planning must dispatch an allowed next worker "
+            "or escalate"
+        )
+    if state is LoopState.PLAN_REVIEW:
+        if (
+            allow_plan_review_implement
+            and decision.action is MasterAction.DISPATCH
+            and decision.role is Role.IMPLEMENTER
+        ):
+            return LoopState.IMPLEMENT
+        if allow_plan_review_implement:
+            raise OrcaLoopError(
+                "Master decision after clean plan review must dispatch implementer "
+                "or escalate"
+            )
+        raise OrcaLoopError(
+            "Master routing after plan review requires verified consensus preview"
+        )
+    if state in {LoopState.IMPLEMENT, LoopState.FIX}:
+        if decision.action is MasterAction.TEST:
+            return None
+        raise OrcaLoopError(
+            "Master decision after implementation must request test or escalate"
+        )
+    if state is LoopState.CODE_REVIEW:
+        if (
+            decision.action is MasterAction.DISPATCH
+            and decision.role is Role.CROSS_CONFIRMER
+        ):
+            return None
+        if allow_code_review_finish and decision.action is MasterAction.FINISH:
+            return LoopState.HUMAN_GATE
+        if not allow_code_review_finish:
+            raise OrcaLoopError(
+                "Master decision after code review must dispatch cross_confirmer or escalate"
+            )
+        raise OrcaLoopError(
+            "Master decision after code review must choose an allowed "
+            "confirmation/final action or escalate"
+        )
+    if state is LoopState.CROSS_CONFIRM:
+        if allow_cross_confirm_finish and decision.action is MasterAction.FINISH:
+            return LoopState.HUMAN_GATE
+        if allow_cross_confirm_finish:
+            raise OrcaLoopError(
+                "Master decision after clean cross-confirm must finish through "
+                "the human gate or escalate"
+            )
+        raise OrcaLoopError(
+            "Master routing after cross-confirm requires verified consensus preview"
+        )
+    raise OrcaLoopError(
+        f"worker-completion Master routing is unsupported from {state.value}"
+    )
+
+
+def _route_worker_completion(
+    controller: GenerationController,
+    preflight: PreflightResult,
+    role: Role,
+    result: StepExecutionResult,
+    artifact: object | None,
+    *,
+    master_invoke: MasterInvoker | None = None,
+) -> StepExecutionResult:
+    plan_review_preview = (
+        _plan_review_implement_preview(controller, preflight, result, artifact)
+        if (
+            preflight.master_runtime is not None
+            and controller.state.state is LoopState.PLAN_REVIEW
+            and artifact is not None
+        )
+        else None
+    )
+    cross_confirm_preview = (
+        _cross_confirm_finish_preview(controller, preflight, result, artifact)
+        if (
+            preflight.master_runtime is not None
+            and controller.state.state is LoopState.CROSS_CONFIRM
+            and artifact is not None
+        )
+        else None
+    )
+    if (
+        preflight.master_runtime is None
+        or result.signal.kind is not SignalKind.ARTIFACT_OK
+        or artifact is None
+        or controller.state.state
+        not in {
+            LoopState.PLAN,
+            LoopState.PLAN_REVISE,
+            LoopState.PLAN_REVIEW,
+            LoopState.IMPLEMENT,
+            LoopState.FIX,
+            LoopState.CODE_REVIEW,
+            LoopState.CROSS_CONFIRM,
+        }
+        or (
+            controller.state.state is LoopState.PLAN_REVIEW
+            and plan_review_preview is None
+        )
+        or (
+            controller.state.state is LoopState.CROSS_CONFIRM
+            and cross_confirm_preview is None
+        )
+    ):
+        return result
+    invoke = master_invoke
+    if invoke is None:
+        invoke = lambda options, prompt: invoke_master_provider(
+            options,
+            prompt,
+            timeout_ms=preflight.arguments.config.step_timeout_ms,
+        )
+    try:
+        decision = invoke_master(
+            preflight.master_runtime,
+            preflight.arguments.harness_root / "prompts" / "master.md",
+            _worker_completion_master_context(
+                controller,
+                preflight,
+                role,
+                result,
+                artifact,
+                allow_plan_review_implement=(plan_review_preview is not None),
+                allow_cross_confirm_finish=(cross_confirm_preview is not None),
+            ),
+            invoke,
+        )
+    except MasterRuntimeAdapterError as exc:
+        raise OrcaLoopError(
+            f"worker-completion Master routing failed: {exc}"
+        ) from exc
+    override = _validate_worker_completion_master_decision(
+        controller.state.state,
+        decision,
+        allow_direct_implementation=_plan_review_can_be_skipped(
+            result,
+            artifact,
+        ),
+        allow_plan_review_implement=(plan_review_preview is not None),
+        allow_code_review_finish=_code_review_can_finish(
+            controller,
+            result,
+            artifact,
+        ),
+        allow_cross_confirm_finish=(cross_confirm_preview is not None),
+    )
+    if override is None:
+        return result
+    if override is LoopState.IMPLEMENT:
+        if controller.state.state is LoopState.PLAN_REVIEW:
+            assert plan_review_preview is not None
+            controller.commit(
+                stage=StepStage.TRANSITION_COMMITTED,
+                active=None,
+                reason=(
+                    "Master collapsed clean plan-review consensus evaluation "
+                    "and dispatched implementation: "
+                    f"{decision.reason}"
+                ),
+                signal=plan_review_preview.signal.kind,
+                state_value=LoopState.IMPLEMENT,
+                status=RunStatus.IN_PROGRESS,
+                ledger=plan_review_preview.ledger,
+                counters=controller.state.counters,
+                test_gate_status=result.test_gate_status,
+            )
+            return result
+        controller.commit(
+            stage=StepStage.TRANSITION_COMMITTED,
+            active=None,
+            reason=(
+                "Master skipped plan review for safe verified plan: "
+                f"{decision.reason}"
+            ),
+            signal=result.signal.kind,
+            state_value=LoopState.IMPLEMENT,
+            status=RunStatus.IN_PROGRESS,
+            ledger=result.ledger,
+            test_gate_status=result.test_gate_status,
+        )
+        return result
+    if override is LoopState.HUMAN_GATE:
+        if controller.state.state is LoopState.CROSS_CONFIRM:
+            assert cross_confirm_preview is not None
+            controller.commit(
+                stage=StepStage.TRANSITION_COMMITTED,
+                active=None,
+                reason=(
+                    "Master collapsed clean cross-confirm consensus evaluation "
+                    "and requested final human disposition: "
+                    f"{decision.reason}"
+                ),
+                signal=cross_confirm_preview.signal.kind,
+                state_value=LoopState.HUMAN_GATE,
+                status=RunStatus.IN_PROGRESS,
+                ledger=cross_confirm_preview.ledger,
+                counters=controller.state.counters,
+                test_gate_status=result.test_gate_status,
+            )
+            return result
+        controller.commit(
+            stage=StepStage.TRANSITION_COMMITTED,
+            active=None,
+            reason=(
+                "Master skipped cross-confirm for clean low-risk code review "
+                f"and requested final human disposition: {decision.reason}"
+            ),
+            signal=result.signal.kind,
+            state_value=LoopState.HUMAN_GATE,
+            status=RunStatus.IN_PROGRESS,
+            ledger=result.ledger,
+            counters=controller.state.counters,
+            test_gate_status=result.test_gate_status,
+        )
+        return result
+    routed_result = plan_review_preview or cross_confirm_preview or result
+    return StepExecutionResult(
+        TransitionSignal(
+            override,
+            f"Master escalated after {role.value}: {decision.reason}",
+            routed_result.signal.finding_ids,
+        ),
+        routed_result.ledger,
+        routed_result.test_gate_status,
+        routed_result.escalations,
+    )
+
+
+def _test_result_master_context(
+    controller: GenerationController,
+    preflight: PreflightResult,
+    result: StepExecutionResult,
+    plan: PlanDocument,
+) -> dict[str, object]:
+    if result.signal.kind in {SignalKind.PASS, SignalKind.NOT_RUN}:
+        allowed = [
+            {
+                "action": MasterAction.DISPATCH.value,
+                "role": Role.CODE_REVIEWER.value,
+                "permissionProfile": "read_only",
+            },
+        ]
+        if _test_result_can_finish(result, plan):
+            allowed.append(
+                {
+                    "action": MasterAction.FINISH.value,
+                    "role": None,
+                    "permissionProfile": None,
+                }
+            )
+        allowed.append(
+            {
+                "action": MasterAction.ESCALATE.value,
+                "role": None,
+                "permissionProfile": None,
+            }
+        )
+    elif result.signal.kind is SignalKind.FAIL:
+        allowed = [
+            {
+                "action": MasterAction.DISPATCH.value,
+                "role": Role.IMPLEMENTER.value,
+                "permissionProfile": "workspace_write",
+            },
+            {
+                "action": MasterAction.ESCALATE.value,
+                "role": None,
+                "permissionProfile": None,
+            },
+        ]
+    else:
+        allowed = []
+    return {
+        "stage": "test_result",
+        "runId": controller.state.run_id,
+        "currentState": controller.state.state.value,
+        "request": preflight.arguments.config.request_path.read_text(
+            encoding="utf-8"
+        ),
+        "plan": to_wire_value(plan),
+        "testStatus": (
+            None
+            if result.test_gate_status is None
+            else result.test_gate_status.value
+        ),
+        "resultSignal": result.signal.kind.value,
+        "testFixAttempts": controller.state.counters.test_fix_attempts,
+        "allowedDecisions": allowed,
+    }
+
+
+def _test_result_can_finish(
+    result: StepExecutionResult,
+    plan: PlanDocument,
+) -> bool:
+    return (
+        result.signal.kind is SignalKind.PASS
+        and result.test_gate_status is TestGateStatus.PASS
+        and _plan_review_can_be_skipped(result, plan)
+    )
+
+
+def _validate_test_result_master_decision(
+    signal: SignalKind,
+    decision,
+    *,
+    allow_finish: bool = False,
+) -> SignalKind | LoopState | None:
+    decision = validate_master_decision(decision)
+    if decision.action is MasterAction.ESCALATE:
+        return SignalKind.ESCALATE
+    if signal in {SignalKind.PASS, SignalKind.NOT_RUN}:
+        if (
+            decision.action is MasterAction.DISPATCH
+            and decision.role is Role.CODE_REVIEWER
+        ):
+            return None
+        if (
+            allow_finish
+            and signal is SignalKind.PASS
+            and decision.action is MasterAction.FINISH
+        ):
+            return LoopState.HUMAN_GATE
+        if not allow_finish:
+            raise OrcaLoopError(
+                "Master decision after successful test gate must dispatch "
+                "code_reviewer or escalate"
+            )
+        raise OrcaLoopError(
+            "Master decision after successful test gate must choose an allowed "
+            "review/final action or escalate"
+        )
+    if signal is SignalKind.FAIL:
+        if (
+            decision.action is MasterAction.DISPATCH
+            and decision.role is Role.IMPLEMENTER
+        ):
+            return None
+        raise OrcaLoopError(
+            "Master decision after failed test gate must dispatch "
+            "implementer or escalate"
+        )
+    raise OrcaLoopError(
+        f"test-result Master routing is unsupported for {signal.value}"
+    )
+
+
+def _route_test_result(
+    controller: GenerationController,
+    preflight: PreflightResult,
+    result: StepExecutionResult,
+    plan: PlanDocument,
+    *,
+    master_invoke: MasterInvoker | None = None,
+) -> StepExecutionResult:
+    if (
+        preflight.master_runtime is None
+        or controller.state.state is not LoopState.TEST_GATE
+        or result.signal.kind
+        not in {SignalKind.PASS, SignalKind.NOT_RUN, SignalKind.FAIL}
+    ):
+        return result
+    invoke = master_invoke
+    if invoke is None:
+        invoke = lambda options, prompt: invoke_master_provider(
+            options,
+            prompt,
+            timeout_ms=preflight.arguments.config.step_timeout_ms,
+        )
+    try:
+        decision = invoke_master(
+            preflight.master_runtime,
+            preflight.arguments.harness_root / "prompts" / "master.md",
+            _test_result_master_context(
+                controller,
+                preflight,
+                result,
+                plan,
+            ),
+            invoke,
+        )
+    except MasterRuntimeAdapterError as exc:
+        raise OrcaLoopError(
+            f"test-result Master routing failed: {exc}"
+        ) from exc
+    override = _validate_test_result_master_decision(
+        result.signal.kind,
+        decision,
+        allow_finish=_test_result_can_finish(result, plan),
+    )
+    if override is None:
+        return result
+    if override is LoopState.HUMAN_GATE:
+        controller.commit(
+            stage=StepStage.TRANSITION_COMMITTED,
+            active=None,
+            reason=(
+                "Master skipped code review for safe passing change and "
+                f"requested final human disposition: {decision.reason}"
+            ),
+            signal=result.signal.kind,
+            state_value=LoopState.HUMAN_GATE,
+            status=RunStatus.IN_PROGRESS,
+            ledger=result.ledger,
+            counters=LoopCounters(
+                0,
+                controller.state.counters.operational_retries,
+            ),
+            test_gate_status=result.test_gate_status,
+        )
+        return result
+    return StepExecutionResult(
+        TransitionSignal(
+            override,
+            f"Master escalated after test gate: {decision.reason}",
+            result.signal.finding_ids,
+        ),
+        result.ledger,
+        result.test_gate_status,
+        result.escalations,
+    )
+
+
+def _final_master_context(
+    controller: GenerationController,
+    preflight: PreflightResult,
+    result: StepExecutionResult,
+    plan: PlanDocument | None,
+) -> dict[str, object]:
+    return {
+        "stage": "final_decision",
+        "runId": controller.state.run_id,
+        "currentState": controller.state.state.value,
+        "request": preflight.arguments.config.request_path.read_text(
+            encoding="utf-8"
+        ),
+        "plan": None if plan is None else to_wire_value(plan),
+        "ledger": to_wire_value(result.ledger),
+        "testStatus": (
+            None
+            if controller.state.test_gate_status is None
+            else controller.state.test_gate_status.value
+        ),
+        "resultSignal": result.signal.kind.value,
+        "allowedDecisions": [
+            {
+                "action": MasterAction.FINISH.value,
+                "role": None,
+                "permissionProfile": None,
+            },
+            {
+                "action": MasterAction.ESCALATE.value,
+                "role": None,
+                "permissionProfile": None,
+            },
+        ],
+    }
+
+
+def _validate_final_master_decision(decision) -> SignalKind | None:
+    decision = validate_master_decision(decision)
+    if decision.action is MasterAction.FINISH:
+        return None
+    if decision.action is MasterAction.ESCALATE:
+        return SignalKind.ESCALATE
+    raise OrcaLoopError(
+        "Master final decision must finish through the human gate or escalate"
+    )
+
+
+def _route_final_decision(
+    controller: GenerationController,
+    preflight: PreflightResult,
+    result: StepExecutionResult,
+    plan: PlanDocument | None,
+    *,
+    master_invoke: MasterInvoker | None = None,
+) -> StepExecutionResult:
+    if (
+        preflight.master_runtime is None
+        or controller.state.state is not LoopState.CONSENSUS_EVALUATE
+        or result.signal.kind is not SignalKind.UNRESOLVED_ZERO
+    ):
+        return result
+    invoke = master_invoke
+    if invoke is None:
+        invoke = lambda options, prompt: invoke_master_provider(
+            options,
+            prompt,
+            timeout_ms=preflight.arguments.config.step_timeout_ms,
+        )
+    try:
+        decision = invoke_master(
+            preflight.master_runtime,
+            preflight.arguments.harness_root / "prompts" / "master.md",
+            _final_master_context(
+                controller,
+                preflight,
+                result,
+                plan,
+            ),
+            invoke,
+        )
+    except MasterRuntimeAdapterError as exc:
+        raise OrcaLoopError(
+            f"final Master routing failed: {exc}"
+        ) from exc
+    override = _validate_final_master_decision(decision)
+    if override is None:
+        return result
+    return StepExecutionResult(
+        TransitionSignal(
+            override,
+            f"Master escalated before final human gate: {decision.reason}",
+            result.signal.finding_ids,
+        ),
+        result.ledger,
+        result.test_gate_status,
+        result.escalations,
+    )
+
+
 def _execute_worker(
     controller: GenerationController,
     pool: WorkerPool,
     preflight: PreflightResult,
     client: OrcaClient,
+    *,
+    master_invoke: MasterInvoker | None = None,
 ) -> object | None:
     state = controller.state.state
     role = role_for_state(state)
@@ -416,13 +1347,13 @@ def _execute_worker(
         raise OrcaLoopError(
             f"agent runtime is missing worker {worker.worker_key.value}"
         )
+    permission_profile = default_permission_profile(role)
     profile = build_launch_profile(
         role,
+        permission_profile,
         profile_root,
         step.input_dir,
         step.output_dir,
-        preflight.permission_report,
-        expected_orca_version=preflight.orca_version,
         runtime_options=runtime_options,
     )
     context = RoleContext(
@@ -528,11 +1459,20 @@ def _execute_worker(
         step_timeout_ms=preflight.arguments.config.step_timeout_ms,
         validate_artifact=validate_artifact,
     )
-    commit_step_transition(
+    result = _route_worker_completion(
         controller,
+        preflight,
+        role,
         result,
-        preflight.arguments.config,
+        artifact,
+        master_invoke=master_invoke,
     )
+    if controller.state.state is state:
+        commit_step_transition(
+            controller,
+            result,
+            preflight.arguments.config,
+        )
     return artifact
 
 
@@ -824,6 +1764,8 @@ def _run_loop(
     pool: WorkerPool,
     preflight: PreflightResult,
     client: OrcaClient,
+    *,
+    master_invoke: MasterInvoker | None = None,
 ) -> CoordinatorState:
     config = preflight.arguments.config
     started = time.monotonic()
@@ -861,6 +1803,7 @@ def _run_loop(
                     pool,
                     preflight,
                     client,
+                    master_invoke=master_invoke,
                 )
                 transitions += 1
                 continue
@@ -884,6 +1827,7 @@ def _run_loop(
                     ),
                 )
             elif state is LoopState.CONSENSUS_EVALUATE:
+                plan = _load_plan(controller.workspace.root)
                 result = execute_evaluate(
                     state=state,
                     ledger=controller.ledger,
@@ -892,10 +1836,17 @@ def _run_loop(
                         ConsensusKind.CODE,
                     ),
                     config=config,
-                    plan=_load_plan(controller.workspace.root),
+                    plan=plan,
                     destructive_approval=(
                         controller.state.destructive_approval
                     ),
+                )
+                result = _route_final_decision(
+                    controller,
+                    preflight,
+                    result,
+                    plan,
+                    master_invoke=master_invoke,
                 )
             elif state is LoopState.TEST_GATE:
                 plan = _load_plan(controller.workspace.root)
@@ -907,11 +1858,19 @@ def _run_loop(
                     policy=preflight.test_policy,
                     worktree=config.worktree_path,
                 )
+                result = _route_test_result(
+                    controller,
+                    preflight,
+                    result,
+                    plan,
+                    master_invoke=master_invoke,
+                )
             else:
                 raise OrcaLoopError(
                     f"unsupported coordinator state: {state.value}"
                 )
-            commit_step_transition(controller, result, config)
+            if controller.state.state is state:
+                commit_step_transition(controller, result, config)
             transitions += 1
         except ContractViolationError as exc:
             retry = operational_retry_result(
@@ -973,6 +1932,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             expected_orca_version=EXPECTED_ORCA_VERSION,
         )
         preflight = prepare_agent_runtime(preflight)
+        preflight = prepare_master_runtime(preflight)
         if arguments.dry_run:
             print(
                 json.dumps(

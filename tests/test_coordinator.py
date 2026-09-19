@@ -13,10 +13,16 @@ from orca_loop.generation import (
 )
 from orca_loop.config import validate_loop_config
 from orca_loop.coordinator import (
+    CoordinatorContractError,
     apply_worker_artifact,
+    default_permission_profile,
     execute_evaluate,
     operational_retry_result,
+    permission_policy_digest,
+    permission_policy_value,
     reconcile_resume,
+    validate_master_decision,
+    validate_permission_profile,
 )
 from orca_loop.contracts import ContractViolationError
 from orca_loop.ledger import empty_ledger
@@ -32,7 +38,10 @@ from orca_loop.models import (
     LoopConfig,
     LoopCounters,
     LoopState,
+    MasterAction,
+    MasterDecision,
     PlanDocument,
+    PermissionProfile,
     ResumeAction,
     Role,
     RoundEvidence,
@@ -48,6 +57,116 @@ from orca_loop.models import DecisionValue, Side
 
 
 DIGEST_A = "sha256:" + "a" * 64
+
+
+class PermissionPolicyTest(unittest.TestCase):
+    def test_static_role_permission_policy_accepts_expected_profiles(self) -> None:
+        expected = {
+            Role.PLANNER: PermissionProfile.READ_ONLY,
+            Role.PLAN_REVIEWER: PermissionProfile.READ_ONLY,
+            Role.IMPLEMENTER: PermissionProfile.WORKSPACE_WRITE,
+            Role.CODE_REVIEWER: PermissionProfile.READ_ONLY,
+            Role.CROSS_CONFIRMER: PermissionProfile.READ_ONLY,
+        }
+        for role, permission_profile in expected.items():
+            with self.subTest(role=role):
+                self.assertIs(
+                    permission_profile,
+                    default_permission_profile(role),
+                )
+                self.assertIs(
+                    permission_profile,
+                    validate_permission_profile(role, permission_profile),
+                )
+
+    def test_static_role_permission_policy_rejects_write_for_read_only_roles(
+        self,
+    ) -> None:
+        for role in (
+            Role.PLANNER,
+            Role.PLAN_REVIEWER,
+            Role.CODE_REVIEWER,
+            Role.CROSS_CONFIRMER,
+        ):
+            with self.subTest(role=role):
+                with self.assertRaisesRegex(
+                    CoordinatorContractError,
+                    "permission profile is not allowed for role",
+                ):
+                    validate_permission_profile(
+                        role,
+                        PermissionProfile.WORKSPACE_WRITE,
+                    )
+
+    def test_static_role_permission_policy_rejects_read_only_implementer(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(
+            CoordinatorContractError,
+            "permission profile is not allowed for role",
+        ):
+            validate_permission_profile(
+                Role.IMPLEMENTER,
+                PermissionProfile.READ_ONLY,
+            )
+
+    def test_permission_policy_value_is_canonical_and_digest_is_stable(
+        self,
+    ) -> None:
+        self.assertEqual(
+            {
+                "schema_version": 1,
+                "role_allowed_permissions": {
+                    "code_reviewer": ["read_only"],
+                    "cross_confirmer": ["read_only"],
+                    "implementer": ["workspace_write"],
+                    "plan_reviewer": ["read_only"],
+                    "planner": ["read_only"],
+                },
+            },
+            permission_policy_value(),
+        )
+        self.assertRegex(
+            permission_policy_digest(),
+            r"^sha256:[0-9a-f]{64}$",
+        )
+
+
+class MasterDecisionPolicyTest(unittest.TestCase):
+    def test_dispatch_accepts_allowed_role_permission_pair(self) -> None:
+        decision = MasterDecision(
+            MasterAction.DISPATCH,
+            Role.IMPLEMENTER,
+            PermissionProfile.WORKSPACE_WRITE,
+            "Implementation is required.",
+        )
+        self.assertIs(decision, validate_master_decision(decision))
+
+    def test_dispatch_rejects_disallowed_role_permission_pair(self) -> None:
+        decision = MasterDecision(
+            MasterAction.DISPATCH,
+            Role.PLANNER,
+            PermissionProfile.WORKSPACE_WRITE,
+            "Planning is required.",
+        )
+        with self.assertRaisesRegex(
+            CoordinatorContractError,
+            "permission profile is not allowed for role",
+        ):
+            validate_master_decision(decision)
+
+    def test_non_dispatch_rejects_direct_worker_selection(self) -> None:
+        decision = MasterDecision(
+            MasterAction.TEST,
+            Role.IMPLEMENTER,
+            PermissionProfile.WORKSPACE_WRITE,
+            "Run tests.",
+        )
+        with self.assertRaisesRegex(
+            CoordinatorContractError,
+            "must not select worker permission",
+        ):
+            validate_master_decision(decision)
 
 
 def initial_state() -> CoordinatorState:
@@ -68,7 +187,7 @@ def initial_state() -> CoordinatorState:
         snapshot_digest=DIGEST_A,
         test_gate_status=None,
         test_policy_digest=None,
-        permission_report_digest=DIGEST_A,
+        permission_policy_digest=permission_policy_digest(),
         history=(),
     )
 
