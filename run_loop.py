@@ -56,7 +56,7 @@ from orca_loop.generation import (
     commit_generation,
     load_committed,
 )
-from orca_loop.ledger import InvalidRoundError, empty_ledger, unresolved_scope
+from orca_loop.ledger import empty_ledger, unresolved_scope
 from orca_loop.locking import (
     RunLockError,
     acquire_run_lock,
@@ -82,7 +82,6 @@ from orca_loop.models import (
     LoopState,
     MasterAction,
     PlanDocument,
-    PlanReviewVerdict,
     ReviewArtifact,
     Role,
     RoleContext,
@@ -510,9 +509,6 @@ def _worker_completion_master_context(
     role: Role,
     result: StepExecutionResult,
     artifact: object,
-    *,
-    allow_plan_review_implement: bool = False,
-    allow_cross_confirm_finish: bool = False,
 ) -> dict[str, object]:
     state = controller.state.state
     if state in {LoopState.PLAN, LoopState.PLAN_REVISE}:
@@ -538,19 +534,6 @@ def _worker_completion_master_context(
                 "permissionProfile": None,
             }
         )
-    elif state is LoopState.PLAN_REVIEW and allow_plan_review_implement:
-        allowed = [
-            {
-                "action": MasterAction.DISPATCH.value,
-                "role": Role.IMPLEMENTER.value,
-                "permissionProfile": "workspace_write",
-            },
-            {
-                "action": MasterAction.ESCALATE.value,
-                "role": None,
-                "permissionProfile": None,
-            },
-        ]
     elif state in {LoopState.IMPLEMENT, LoopState.FIX}:
         allowed = [
             {
@@ -587,19 +570,6 @@ def _worker_completion_master_context(
                 "permissionProfile": None,
             }
         )
-    elif state is LoopState.CROSS_CONFIRM and allow_cross_confirm_finish:
-        allowed = [
-            {
-                "action": MasterAction.FINISH.value,
-                "role": None,
-                "permissionProfile": None,
-            },
-            {
-                "action": MasterAction.ESCALATE.value,
-                "role": None,
-                "permissionProfile": None,
-            },
-        ]
     else:
         allowed = []
     return {
@@ -662,108 +632,12 @@ def _code_review_can_finish(
     return plan is not None and _plan_review_can_be_skipped(result, plan)
 
 
-def _plan_review_implement_preview(
-    controller: GenerationController,
-    preflight: PreflightResult,
-    result: StepExecutionResult,
-    artifact: object,
-) -> StepExecutionResult | None:
-    if result.signal.kind is not SignalKind.ARTIFACT_OK:
-        return None
-    if not isinstance(artifact, ReviewArtifact):
-        return None
-    if (
-        artifact.artifact_kind is not ArtifactKind.PLAN_REVIEW
-        or artifact.role is not Role.PLAN_REVIEWER
-        or artifact.verdict is not PlanReviewVerdict.APPROVE
-    ):
-        return None
-    if (
-        artifact.reviewed_finding_ids
-        or artifact.finding_decisions
-        or artifact.findings
-        or artifact.non_blocking_suggestions
-        or artifact.escalation_signals
-        or result.escalations
-    ):
-        return None
-    plan = _load_plan(controller.workspace.root)
-    if plan is None:
-        return None
-    try:
-        preview = execute_evaluate(
-            state=LoopState.PLAN_CONSENSUS_EVALUATE,
-            ledger=result.ledger,
-            evidence=_round_evidence(controller, ConsensusKind.PLAN),
-            config=preflight.arguments.config,
-            plan=plan,
-            destructive_approval=controller.state.destructive_approval,
-        )
-    except InvalidRoundError:
-        return None
-    if (
-        preview.signal.kind is not SignalKind.UNRESOLVED_ZERO
-        or preview.escalations
-    ):
-        return None
-    return replace(preview, test_gate_status=result.test_gate_status)
-
-
-def _cross_confirm_finish_preview(
-    controller: GenerationController,
-    preflight: PreflightResult,
-    result: StepExecutionResult,
-    artifact: object,
-) -> StepExecutionResult | None:
-    if result.signal.kind is not SignalKind.ARTIFACT_OK:
-        return None
-    if result.test_gate_status is not TestGateStatus.PASS:
-        return None
-    if not isinstance(artifact, ReviewArtifact):
-        return None
-    if (
-        artifact.artifact_kind is not ArtifactKind.CROSS_REVIEW
-        or artifact.role is not Role.CROSS_CONFIRMER
-        or artifact.verdict is not CodeReviewVerdict.APPROVE
-        or artifact.agrees_with_reviewer is not True
-    ):
-        return None
-    if (
-        artifact.reviewed_finding_ids
-        or artifact.finding_decisions
-        or artifact.findings
-        or artifact.non_blocking_suggestions
-        or artifact.escalation_signals
-        or result.escalations
-    ):
-        return None
-    plan = _load_plan(controller.workspace.root)
-    if plan is None or not _plan_review_can_be_skipped(result, plan):
-        return None
-    preview = execute_evaluate(
-        state=LoopState.CONSENSUS_EVALUATE,
-        ledger=result.ledger,
-        evidence=_round_evidence(controller, ConsensusKind.CODE),
-        config=preflight.arguments.config,
-        plan=plan,
-        destructive_approval=controller.state.destructive_approval,
-    )
-    if (
-        preview.signal.kind is not SignalKind.UNRESOLVED_ZERO
-        or preview.escalations
-    ):
-        return None
-    return replace(preview, test_gate_status=result.test_gate_status)
-
-
 def _validate_worker_completion_master_decision(
     state: LoopState,
     decision,
     *,
     allow_direct_implementation: bool = False,
-    allow_plan_review_implement: bool = False,
     allow_code_review_finish: bool = False,
-    allow_cross_confirm_finish: bool = False,
 ) -> SignalKind | LoopState | None:
     decision = validate_master_decision(decision)
     if decision.action is MasterAction.ESCALATE:
@@ -788,21 +662,6 @@ def _validate_worker_completion_master_decision(
             "Master decision after planning must dispatch an allowed next worker "
             "or escalate"
         )
-    if state is LoopState.PLAN_REVIEW:
-        if (
-            allow_plan_review_implement
-            and decision.action is MasterAction.DISPATCH
-            and decision.role is Role.IMPLEMENTER
-        ):
-            return LoopState.IMPLEMENT
-        if allow_plan_review_implement:
-            raise OrcaLoopError(
-                "Master decision after clean plan review must dispatch implementer "
-                "or escalate"
-            )
-        raise OrcaLoopError(
-            "Master routing after plan review requires verified consensus preview"
-        )
     if state in {LoopState.IMPLEMENT, LoopState.FIX}:
         if decision.action is MasterAction.TEST:
             return None
@@ -825,17 +684,6 @@ def _validate_worker_completion_master_decision(
             "Master decision after code review must choose an allowed "
             "confirmation/final action or escalate"
         )
-    if state is LoopState.CROSS_CONFIRM:
-        if allow_cross_confirm_finish and decision.action is MasterAction.FINISH:
-            return LoopState.HUMAN_GATE
-        if allow_cross_confirm_finish:
-            raise OrcaLoopError(
-                "Master decision after clean cross-confirm must finish through "
-                "the human gate or escalate"
-            )
-        raise OrcaLoopError(
-            "Master routing after cross-confirm requires verified consensus preview"
-        )
     raise OrcaLoopError(
         f"worker-completion Master routing is unsupported from {state.value}"
     )
@@ -850,24 +698,6 @@ def _route_worker_completion(
     *,
     master_invoke: MasterInvoker | None = None,
 ) -> StepExecutionResult:
-    plan_review_preview = (
-        _plan_review_implement_preview(controller, preflight, result, artifact)
-        if (
-            preflight.master_runtime is not None
-            and controller.state.state is LoopState.PLAN_REVIEW
-            and artifact is not None
-        )
-        else None
-    )
-    cross_confirm_preview = (
-        _cross_confirm_finish_preview(controller, preflight, result, artifact)
-        if (
-            preflight.master_runtime is not None
-            and controller.state.state is LoopState.CROSS_CONFIRM
-            and artifact is not None
-        )
-        else None
-    )
     if (
         preflight.master_runtime is None
         or result.signal.kind is not SignalKind.ARTIFACT_OK
@@ -876,20 +706,10 @@ def _route_worker_completion(
         not in {
             LoopState.PLAN,
             LoopState.PLAN_REVISE,
-            LoopState.PLAN_REVIEW,
             LoopState.IMPLEMENT,
             LoopState.FIX,
             LoopState.CODE_REVIEW,
-            LoopState.CROSS_CONFIRM,
         }
-        or (
-            controller.state.state is LoopState.PLAN_REVIEW
-            and plan_review_preview is None
-        )
-        or (
-            controller.state.state is LoopState.CROSS_CONFIRM
-            and cross_confirm_preview is None
-        )
     ):
         return result
     invoke = master_invoke
@@ -909,8 +729,6 @@ def _route_worker_completion(
                 role,
                 result,
                 artifact,
-                allow_plan_review_implement=(plan_review_preview is not None),
-                allow_cross_confirm_finish=(cross_confirm_preview is not None),
             ),
             invoke,
         )
@@ -925,35 +743,15 @@ def _route_worker_completion(
             result,
             artifact,
         ),
-        allow_plan_review_implement=(plan_review_preview is not None),
         allow_code_review_finish=_code_review_can_finish(
             controller,
             result,
             artifact,
         ),
-        allow_cross_confirm_finish=(cross_confirm_preview is not None),
     )
     if override is None:
         return result
     if override is LoopState.IMPLEMENT:
-        if controller.state.state is LoopState.PLAN_REVIEW:
-            assert plan_review_preview is not None
-            controller.commit(
-                stage=StepStage.TRANSITION_COMMITTED,
-                active=None,
-                reason=(
-                    "Master collapsed clean plan-review consensus evaluation "
-                    "and dispatched implementation: "
-                    f"{decision.reason}"
-                ),
-                signal=plan_review_preview.signal.kind,
-                state_value=LoopState.IMPLEMENT,
-                status=RunStatus.IN_PROGRESS,
-                ledger=plan_review_preview.ledger,
-                counters=controller.state.counters,
-                test_gate_status=result.test_gate_status,
-            )
-            return result
         controller.commit(
             stage=StepStage.TRANSITION_COMMITTED,
             active=None,
@@ -969,24 +767,6 @@ def _route_worker_completion(
         )
         return result
     if override is LoopState.HUMAN_GATE:
-        if controller.state.state is LoopState.CROSS_CONFIRM:
-            assert cross_confirm_preview is not None
-            controller.commit(
-                stage=StepStage.TRANSITION_COMMITTED,
-                active=None,
-                reason=(
-                    "Master collapsed clean cross-confirm consensus evaluation "
-                    "and requested final human disposition: "
-                    f"{decision.reason}"
-                ),
-                signal=cross_confirm_preview.signal.kind,
-                state_value=LoopState.HUMAN_GATE,
-                status=RunStatus.IN_PROGRESS,
-                ledger=cross_confirm_preview.ledger,
-                counters=controller.state.counters,
-                test_gate_status=result.test_gate_status,
-            )
-            return result
         controller.commit(
             stage=StepStage.TRANSITION_COMMITTED,
             active=None,
@@ -1002,16 +782,15 @@ def _route_worker_completion(
             test_gate_status=result.test_gate_status,
         )
         return result
-    routed_result = plan_review_preview or cross_confirm_preview or result
     return StepExecutionResult(
         TransitionSignal(
             override,
             f"Master escalated after {role.value}: {decision.reason}",
-            routed_result.signal.finding_ids,
+            result.signal.finding_ids,
         ),
-        routed_result.ledger,
-        routed_result.test_gate_status,
-        routed_result.escalations,
+        result.ledger,
+        result.test_gate_status,
+        result.escalations,
     )
 
 

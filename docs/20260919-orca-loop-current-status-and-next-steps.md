@@ -361,9 +361,9 @@ human final boundary는 유지된다.
 
 ---
 
-## 8.5 Phase 14 — clean cross-confirm에서 CONSENSUS_EVALUATE durable state 접기
+## 8.5 Phase 14 — clean cross-confirm에서 CONSENSUS_EVALUATE durable state 접기 [REVERTED]
 
-완료.
+2026-09-20 과설계 검토 후 철회했다. 실제 worker/provider 호출은 줄지 않고 deterministic state만 접으면서 preview/fallback 복잡도만 증가했기 때문이다.
 
 기존 경로:
 
@@ -407,9 +407,9 @@ CROSS_CONFIRM -> CONSENSUS_EVALUATE
 
 ---
 
-## 8.6 Phase 15 — clean plan review에서 PLAN_CONSENSUS_EVALUATE durable state 접기
+## 8.6 Phase 15 — clean plan review에서 PLAN_CONSENSUS_EVALUATE durable state 접기 [REVERTED]
 
-**현재 최신 완료 Phase.**
+2026-09-20 과설계 검토 후 철회했다. plan consensus evaluate는 로컬 deterministic 단계라 별도 Master preview로 접는 이득보다 코드·테스트 복잡도가 더 컸다.
 
 기존 경로:
 
@@ -578,14 +578,12 @@ dispatch implementer
 
 ### PLAN_REVIEW
 
-Phase 15 preview 성공 시에만:
+Master 추가 호출 없이 기존 deterministic 경로를 유지한다.
 
 ```text
-dispatch implementer
-escalate
+PLAN_REVIEW
+→ PLAN_CONSENSUS_EVALUATE
 ```
-
-preview 실패/부적격 시 Master 자체를 호출하지 않는다.
 
 ### IMPLEMENT / FIX
 
@@ -611,20 +609,19 @@ finish -> HUMAN_GATE
 
 ### CROSS_CONFIRM
 
-Phase 14 preview 성공 시에만:
+Master 추가 호출 없이 기존 deterministic 경로를 유지한다.
 
 ```text
-finish -> HUMAN_GATE
-escalate
+CROSS_CONFIRM
+→ CONSENSUS_EVALUATE
+→ HUMAN_GATE
 ```
-
-preview 실패/부적격 시 Master를 호출하지 않고 기존 consensus evaluate 경로를 유지한다.
 
 ---
 
 ## 10. 현재 검증 결과
 
-### 10.1 Phase 15 최종 focused suite
+### 10.1 과설계 제거 후 focused suite
 
 실행:
 
@@ -635,21 +632,13 @@ python -m pytest tests/test_cli.py -q -k worker_completion_master
 최종 결과:
 
 ```text
-13 passed, 34 deselected, 17 subtests passed in 15.58s
+13 passed, 29 deselected, 9 subtests passed
 EXIT=0
 ```
 
-포함된 Phase 15 fallback 검증:
+Phase 11~13의 실제 worker-call 절감 정책과 test-result routing을 검증한다.
 
-```text
-non-blocking suggestion
-API/schema E-03
-delete destructive E-03
-plan_review.json missing evidence
-plan consensus round limit exceeded
-```
-
-### 10.2 Phase 15 최종 related regression
+### 10.2 과설계 제거 후 related regression
 
 실행:
 
@@ -667,7 +656,7 @@ python -m pytest \
 최종 결과:
 
 ```text
-99 passed, 4 warnings, 43 subtests passed in 24.77s
+94 passed, 4 warnings, 35 subtests passed
 EXIT=0
 ```
 
@@ -689,12 +678,12 @@ TestContract __init__ (escalation)
 다음은 아직 수행하지 않았다.
 
 ```text
-full repository test suite
+full repository test suite — PASS: 125 passed, 8 warnings, 35 subtests passed
 actual Claude Master subprocess smoke test
 actual Codex Master subprocess smoke test
 ```
 
-따라서 위 항목은 PASS라고 주장하면 안 된다.
+전체 repository suite는 PASS다. 실제 Claude/Codex provider subprocess smoke만 아직 PASS라고 주장하지 않는다.
 
 ---
 
@@ -714,20 +703,15 @@ PLAN
 → HUMAN_GATE
 ```
 
-다만 Phase 11~15를 통해 다음 중간 단계들은 **조건부로** 생략/접기 시작했다.
+Phase 11~13에서 유지하는 shortcut은 **실제 worker 호출을 줄이는 경우만**이다.
 
 ```text
-PLAN_REVIEW
-PLAN_CONSENSUS_EVALUATE
-CODE_REVIEW 이후 CROSS_CONFIRM
-CROSS_CONFIRM 이후 CONSENSUS_EVALUATE
+safe PLAN -> IMPLEMENT
+safe verified TEST PASS -> HUMAN_GATE
+clean CODE_REVIEW -> HUMAN_GATE
 ```
 
-중요:
-
-- state를 무조건 삭제한 것이 아니다.
-- 조건이 맞을 때만 shortcut을 사용한다.
-- 조건이 맞지 않으면 기존 fixed path가 그대로 살아 있다.
+반면 `PLAN_CONSENSUS_EVALUATE`, `TEST_GATE`, `CONSENSUS_EVALUATE` 같은 deterministic durable state는 유지한다. 이들은 비용이 작고 resume/evidence/debug boundary로 유용하다.
 
 ---
 
@@ -813,20 +797,20 @@ revise
 
 는 아직 완료 상태가 아니다.
 
-Phase 15 이후에는 다음 후보를 하나씩 설계하고 검증해야 한다.
+Phase 번호를 더 늘리는 방식의 state-collapse 작업은 중단한다.
 
 ### 14.1 다음 Phase 후보 선정
 
-다음 Phase를 자동으로 시작하지 말고 먼저 실제 현재 state-machine에서 비용이 큰 durable state를 하나 선정한다.
+새 shortcut은 durable state 자체가 아니라 실제 worker/provider 호출을 최소 1회 줄일 수 있을 때만 검토한다.
 
 검토 기준:
 
 ```text
-해당 state가 실질적인 새로운 safety/evidence 의미를 갖는가?
-기존 evaluator를 in-place preview로 재사용할 수 있는가?
-shortcut 실패 시 old path를 완전히 보존할 수 있는가?
-Master에게 허용할 action을 좁게 제한할 수 있는가?
-human final boundary를 건드리지 않는가?
+실제 worker/provider 호출 감소가 있는가?
+외부/고비용 작업 감소가 있는가?
+correctness/recovery 개선이 있는가?
+기존 evidence/escalation/human boundary를 보존하는가?
+추가 분기와 테스트 비용이 절감 효과보다 작은가?
 ```
 
 ### 14.2 가능한 향후 방향
@@ -834,21 +818,23 @@ human final boundary를 건드리지 않는가?
 아직 구현되지 않은 방향의 예시는 다음과 같다.
 
 ```text
-불필요한 revise/re-review durable state 추가 축소
-동일 evidence가 이미 존재할 때 redundant evaluation state 축소
-Master 판단 직후 실제로 필요한 worker만 dispatch하도록 범위 확대
-일반 변경에서 review chain 길이 추가 축소
+실제 Claude/Codex Master subprocess smoke
+Master 호출 자체가 불필요한 경로 식별
+실행 한 건당 Master/worker dispatch 수 계측
+실제 worker를 하나 이상 줄일 수 있는 경로만 추가 최적화
 ```
 
 하지만 위 항목은 아직 설계/구현 완료 상태가 아니며 다음 Phase에서 하나씩 결정해야 한다.
 
 ### 14.3 전체 repository regression
 
-현재까지는 관련 suite 중심으로 검증했다.
+과설계 제거 후 전체 repository suite까지 검증했다.
 
-state-machine 완화를 충분히 진행한 뒤에는 한 번 전체 repository test suite를 실행하는 것이 필요하다.
+```text
+125 passed, 8 warnings, 35 subtests passed
+```
 
-단, 현재 작업 규칙상 매 Phase마다 full suite를 강제하지 않는다.
+큰 routing 변경을 다시 할 때만 전체 suite를 재실행한다.
 
 ### 14.4 provider smoke test
 
@@ -898,13 +884,14 @@ docs/20260919-orca-loop-current-status-and-next-steps.md
 ```text
 _worker_completion_master_context
 _plan_review_can_be_skipped
-_plan_review_implement_preview
 _code_review_can_finish
-_cross_confirm_finish_preview
 _validate_worker_completion_master_decision
 _route_worker_completion
-_round_evidence
+_test_result_can_finish
+_route_test_result
 ```
+
+preview/inline state-collapse helper는 더 이상 추가하지 않는다.
 
 다음 Phase에서는 먼저 현재 state-machine transition과 해당 state가 가진 실제 evidence/safety 의미를 읽고, 그 후에만 shortcut 설계를 한다.
 
@@ -945,20 +932,20 @@ Permission Feasibility Spike 제거
 정적 PermissionProfile 정책
 Master runtime/control layer
 safe plan direct implementation
-safe PASS direct human disposition
-clean code review shortcut
-clean cross-confirm consensus state collapse
-clean plan-review consensus state collapse
+safe verified PASS direct human disposition
+clean code review -> HUMAN_GATE shortcut
 ```
 
-현재 구조는 이제 단순히 state를 삭제하는 방향이 아니라:
+Phase 14~18에서 시도한 deterministic durable-state collapse는 과설계로 판단해 철회했다.
 
-> **기존 safety/evidence 의미를 그대로 실행한 뒤, durable intermediate state만 조건부로 접는 방식**
+현재 기준은 명확하다.
 
-으로 정리되고 있다.
+> **state 수를 줄이는 것이 아니라 실제 Master/worker 호출 수를 줄일 때만 경량화한다.**
 
-이 방식은 Orca loop를 가볍게 만들면서도 deterministic Coordinator boundary와 human final authority를 유지한다.
+`PLAN_CONSENSUS_EVALUATE`, `TEST_GATE`, `CONSENSUS_EVALUATE`는 비용이 작은 deterministic/resume boundary이므로 유지한다.
 
-현재 최신 완료 지점은 **Phase 15**다.
+과설계 제거 후 생산 코드에서는 HEAD 대비 약 225줄의 state-collapse 로직을 제거했고, 전용 테스트도 약 540줄 제거했다. 전체 repository test는 `125 passed, 8 warnings, 35 subtests passed`로 PASS했다.
 
-다음 작업은 **Phase 16 후보를 하나 선정하고, 해당 state의 실제 의미를 먼저 분석한 뒤 좁은 shortcut을 설계하는 것**이다.
+현재 안정 기준점은 **Phase 13까지의 실제 worker 절감 정책**이다.
+
+다음 우선순위는 Phase 번호를 늘리는 것이 아니라 **실제 provider smoke 또는 Master/worker 호출 수 계측**이다.

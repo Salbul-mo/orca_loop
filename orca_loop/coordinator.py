@@ -20,7 +20,6 @@ from .dispatcher import (
 from .generation import commit_generation
 from .guards import capture_file_state, guard_repository_delta
 from .ledger import (
-    InvalidRoundError,
     apply_implementation_artifact,
     apply_plan_document,
     apply_review_artifact,

@@ -1178,7 +1178,7 @@ exit code = 0
 위 regression은 관련 suite만 실행한 결과이며 전체 repository test 결과가 아니다.
 실제 Claude/Codex provider subprocess smoke test도 아직 실행하지 않았다.
 
-### Phase 14 — 4차 완화: clean cross-confirm의 consensus-evaluate 상태 접기
+### Phase 14 — 4차 완화: clean cross-confirm의 consensus-evaluate 상태 접기 [REVERTED]
 
 **상태: 부분 완료 (2026-09-19)**
 
@@ -1298,7 +1298,7 @@ exit code = 0
 위 regression은 관련 suite만 실행한 결과이며 전체 repository test 결과가 아니다.
 실제 Claude/Codex provider subprocess smoke test도 아직 실행하지 않았다.
 
-### Phase 15 — 5차 완화: clean plan review의 plan-consensus-evaluate 상태 접기
+### Phase 15 — 5차 완화: clean plan review의 plan-consensus-evaluate 상태 접기 [REVERTED]
 
 **상태: 부분 완료 (2026-09-19)**
 
@@ -1726,3 +1726,71 @@ Permission Report Digest
 핵심 원칙:
 
 > **Master는 작업을 지휘하고 필요한 권한을 요청한다. Coordinator는 허용된 권한만 집행한다. Permission Spike를 통한 반복 실측은 제거한다.**
+
+---
+
+## 2026-09-20 과설계 정정
+
+Phase 14~18에서 시도한 deterministic durable-state collapse는 현재 구현에서 철회됐다.
+
+이유:
+
+```text
+실제 LLM/worker 호출 감소 없음
+로컬 transition 자체 비용은 작음
+resume/debug boundary를 잃는 대신 preview/fallback 분기가 증가
+virtual source-state와 inline routing이 코드 복잡도를 증가
+전용 테스트 표면이 과도하게 확대
+```
+
+현재 유지하는 최적화 기준은 Phase 11~13처럼 실제 agent 작업을 줄이는 경우다.
+
+```text
+safe plan -> plan reviewer 생략 가능
+safe verified PASS -> review chain 생략 가능
+clean code review -> cross confirmer 생략 가능
+```
+
+과설계 제거 후 검증:
+
+```text
+focused Master routing: 13 passed, 29 deselected, 9 subtests passed
+related regression: 94 passed, 4 warnings, 35 subtests passed
+full repository: 125 passed, 8 warnings, 35 subtests passed
+```
+
+향후에는 durable state 개수를 줄이는 것 자체를 목표로 하지 않는다. 실제 worker/provider 호출 또는 고비용 외부 작업을 줄이는 경우에만 추가 shortcut을 검토한다.
+
+---
+
+## 2026-09-20 과설계 정정
+
+Phase 14~18에서 시도한 deterministic durable-state collapse는 현재 구현에서 철회됐다.
+
+이유:
+
+```text
+실제 LLM/worker 호출 감소 없음
+로컬 transition 자체 비용은 작음
+resume/debug boundary를 잃는 대신 preview/fallback 분기가 증가
+virtual source-state와 inline routing이 코드 복잡도를 증가
+전용 테스트 표면이 과도하게 확대
+```
+
+현재 유지하는 최적화 기준은 Phase 11~13처럼 실제 agent 작업을 줄이는 경우다.
+
+```text
+safe plan -> plan reviewer 생략 가능
+safe verified PASS -> review chain 생략 가능
+clean code review -> cross confirmer 생략 가능
+```
+
+과설계 제거 후 검증:
+
+```text
+focused Master routing: 13 passed, 29 deselected, 9 subtests passed
+related regression: 94 passed, 4 warnings, 35 subtests passed
+full repository: 125 passed, 8 warnings, 35 subtests passed
+```
+
+향후에는 durable state 개수를 줄이는 것 자체를 목표로 하지 않는다. 실제 worker/provider 호출 또는 고비용 외부 작업을 줄이는 경우에만 추가 shortcut을 검토한다.

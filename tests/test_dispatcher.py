@@ -56,7 +56,6 @@ class DispatcherTest(unittest.TestCase):
         profile = LaunchProfile(
             ("agent", "--add-dir", str(Path.cwd())),
             (),
-            DIGEST_A,
         )
         profiles = {key: profile for key in WorkerKey}
         pool = provision_workers(
@@ -201,7 +200,6 @@ class DispatcherTest(unittest.TestCase):
                 LaunchProfile(
                     ("codex", "exec", "-C", str(root), "-"),
                     (),
-                    DIGEST_A,
                 ),
                 coordinator_handle="term-coordinator",
                 orca_executable="C:\\fake\\orca.exe",
