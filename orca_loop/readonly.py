@@ -113,6 +113,7 @@ def prepare_readonly_mirror(
     generation: int,
     *,
     apply_permissions: bool = True,
+    trusted_runs_root: Path | None = None,
 ) -> Path:
     source = worktree.resolve()
     destination_parent = review_root.resolve()
@@ -121,9 +122,21 @@ def prepare_readonly_mirror(
             f"worktree is not a Git repository: {source}"
         )
     if not _inside(destination_parent, source):
-        raise ReadOnlyMirrorError(
-            "review_root must be inside the harness worktree"
-        )
+        # External target repositories have no reason to contain Harness runs.
+        # Trust only a review directory under the explicitly supplied Harness
+        # runs root; never relax this to an arbitrary destination.
+        trusted = None if trusted_runs_root is None else trusted_runs_root.resolve()
+        if (
+            trusted is None
+            or destination_parent.name != "review"
+            or destination_parent.parent.parent != trusted
+            or not trusted.is_dir()
+        ):
+            raise ReadOnlyMirrorError(
+                "external repository reviewer mirror requires an exact trusted Harness run directory"
+            )
+        if review_root.is_symlink() or destination_parent.is_symlink():
+            raise ReadOnlyMirrorError("review directory must not be a symlink")
     if generation < 0:
         raise ReadOnlyMirrorError("generation must be nonnegative")
     destination = destination_parent / f"repository-{generation}"

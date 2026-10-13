@@ -365,7 +365,10 @@ def apply_plan_document(
                 )
             ),
         ),
-        escalations=(),
+        escalations=_dedupe_escalations(
+            plan.escalation_signals,
+            ledger.approved_escalation_keys,
+        ),
         committed_round=False,
     )
 

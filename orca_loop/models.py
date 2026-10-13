@@ -19,6 +19,7 @@ class LoopState(StrEnum):
     CONSENSUS_EVALUATE = "CONSENSUS_EVALUATE"
     HUMAN_GATE = "HUMAN_GATE"
     READY_FOR_MERGE = "READY_FOR_MERGE"
+    FINISHED_PLAN = "FINISHED_PLAN"
     REJECTED = "REJECTED"
     USER_DECISION_REQUIRED = "USER_DECISION_REQUIRED"
     FAILED = "FAILED"
@@ -104,6 +105,7 @@ class WorkerKey(StrEnum):
 class AgentProvider(StrEnum):
     CLAUDE = "claude"
     CODEX = "codex"
+    WEB_GPT = "web_gpt"
 
 
 class Side(StrEnum):
@@ -548,6 +550,7 @@ class PlanDocument:
     out_of_scope: tuple[str, ...]
     reviewed_finding_ids: tuple[str, ...]
     finding_decisions: tuple[FindingDecision, ...]
+    escalation_signals: tuple[EscalationTrigger, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -889,3 +892,4 @@ class LoopConfig:
     max_transition_count: int
     step_timeout_ms: int
     total_timeout_ms: int
+    planning_only: bool = False

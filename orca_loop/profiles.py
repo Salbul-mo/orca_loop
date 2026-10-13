@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 from .contracts import default_agent_provider
@@ -107,6 +108,14 @@ def build_launch_profile(
             "--ephemeral",
             "--json",
             "-",
+        )
+    elif provider is AgentProvider.WEB_GPT:
+        if runtime_options is not None and (runtime_options.model is not None or runtime_options.effort is not None):
+            raise LaunchProfileError("web_gpt model and effort are selected in the browser, not by Orca")
+        adapter = Path(__file__).resolve().parents[1] / "tools" / "web_gpt_provider.py"
+        command = (
+            sys.executable, str(adapter.resolve()), "--role", role.value,
+            "--add-dir", str(root),
         )
     else:
         raise LaunchProfileError(f"unsupported role: {role.value}")

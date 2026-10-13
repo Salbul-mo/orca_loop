@@ -9,6 +9,7 @@ import re
 import signal
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from typing import Sequence
 
@@ -120,6 +121,36 @@ def _send(
     payload: dict[str, object],
     report_path: Path | None,
 ) -> None:
+    completion_dir = job.get("completion_dir")
+    if isinstance(completion_dir, str) and completion_dir:
+        queue = Path(completion_dir).resolve()
+        queue.mkdir(parents=True, exist_ok=True)
+        message: dict[str, object] = {
+            "type": message_type,
+            "subject": subject,
+            "taskId": str(job["task_id"]),
+            "dispatchId": str(job["dispatch_id"]),
+            "from": str(job["worker_handle"]),
+            "to": str(job["coordinator_handle"]),
+            "payload": payload,
+        }
+        if report_path is not None:
+            message["reportPath"] = str(report_path)
+        target = queue / f"{uuid.uuid4().hex}.json"
+        _write_atomic(
+            target,
+            (
+                json.dumps(
+                    {"message": message},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8"),
+        )
+        return
+
     command = [
         str(job["orca_executable"]),
         "orchestration",
@@ -186,8 +217,17 @@ def _load_job(encoded: str) -> dict[str, object]:
         "timeout_ms",
         "preamble",
     }
-    if not isinstance(value, dict) or set(value) != required:
+    if (
+        not isinstance(value, dict)
+        or not required.issubset(value)
+        or set(value) - required - {"completion_dir"}
+    ):
         raise WorkerRunnerError("worker job schema mismatch")
+    completion_dir = value.get("completion_dir")
+    if completion_dir is not None and (
+        not isinstance(completion_dir, str) or not completion_dir
+    ):
+        raise WorkerRunnerError("completion_dir must be a nonempty string")
     if (
         not isinstance(value["profile_command"], list)
         or not value["profile_command"]

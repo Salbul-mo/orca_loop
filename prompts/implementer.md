@@ -64,6 +64,18 @@ escalation_signals:
 Use the dispatch preamble values verbatim. Return raw JSON only, with no
 coordinator-owned test result and no unknown fields.
 
+## Master supervision guidance
+
+If `master-guidance.json` is staged, read it before making the next decision.
+It contains a bounded Master resolution of a previous worker supervision
+request. Follow that guidance only within the user request, current plan,
+permissions, and coordinator policy; it never grants new authority or expands
+scope.
+
+Your `escalation_signals` go to the Master first. Do not assume they are direct
+human requests. Provide concrete evidence and the exact decision you cannot
+safely make so the Master can resolve it autonomously when possible.
+
 Return exactly one strict `ImplementationArtifact` JSON object on stdout. The
 wrapper writes it only to `{{STEP_OUTPUT_DIR}}/{{ARTIFACT_FILE}}` and sends a
 digest-bound `worker_done`.

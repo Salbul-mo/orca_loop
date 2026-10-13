@@ -32,7 +32,11 @@ from .models import (
     AgentRuntimeConfig,
     AgentRuntimeOptions,
     LoopConfig,
+    MasterAction,
+    MasterDecision,
     MasterRuntimeConfig,
+    PermissionProfile,
+    Role,
     TestExecutionPolicy,
     WorkerKey,
 )
@@ -70,6 +74,7 @@ class RunArguments:
     dry_run: bool
     agent_runtime_request: AgentRuntimeRequest | None = None
     master_runtime_request: MasterRuntimeRequest | None = None
+    manual_master_decision: MasterDecision | None = None
 
 
 @dataclass(frozen=True)
@@ -195,7 +200,7 @@ def _parse_provider_assignments(
             provider = AgentProvider(value)
         except ValueError as exc:
             raise ConfigurationError(
-                "--agent-provider value must be claude or codex"
+                "--agent-provider value must be claude, codex or web_gpt"
             ) from exc
         parsed.append((worker, provider))
     return tuple(parsed)
@@ -352,7 +357,7 @@ def _read_interactive_provider(
         return AgentProvider(answer)
     except ValueError as exc:
         raise ConfigurationError(
-            "agent provider must be claude or codex"
+            "agent provider must be claude, codex or web_gpt"
         ) from exc
 
 
@@ -849,7 +854,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="WORKER_KEY=PROVIDER",
         help=(
-            "Override one agent provider (claude or codex) for this run; "
+            "Override one agent provider (claude, codex or web_gpt) for this run; "
             "may be repeated."
         ),
     )
@@ -904,6 +909,36 @@ def build_argument_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_TOTAL_TIMEOUT_MS,
     )
+    parser.add_argument(
+        "--master-decision",
+        choices=tuple(item.value for item in MasterAction),
+        help=(
+            "Inject one validated Master decision on --resume. "
+            "Intended for recovering an ARTIFACT_VERIFIED routing checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--master-role",
+        choices=tuple(item.value for item in Role),
+        help="Role for a manual dispatch Master decision.",
+    )
+    parser.add_argument(
+        "--master-permission-profile",
+        choices=tuple(item.value for item in PermissionProfile),
+        help="Permission profile for a manual dispatch Master decision.",
+    )
+    parser.add_argument(
+        "--master-reason",
+        help="Nonempty provenance reason for a manual Master decision.",
+    )
+    parser.add_argument(
+        "--planning-only",
+        action="store_true",
+        help=(
+            "Stop successfully after approved plan consensus; do not request "
+            "implementation-time schema or destructive approvals."
+        ),
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser
@@ -933,6 +968,57 @@ def parse_run_arguments(
     master_runtime_request = _read_master_runtime_request(
         namespace.master_config,
     )
+    manual_master_decision = None
+    manual_fields_used = any(
+        value is not None
+        for value in (
+            namespace.master_decision,
+            namespace.master_role,
+            namespace.master_permission_profile,
+            namespace.master_reason,
+        )
+    )
+    if manual_fields_used:
+        if namespace.master_decision is None:
+            raise ConfigurationError(
+                "--master-decision is required when manual Master options are used"
+            )
+        if not namespace.resume:
+            raise ConfigurationError(
+                "--master-decision is only allowed with --resume"
+            )
+        reason = (namespace.master_reason or "").strip()
+        if not reason:
+            raise ConfigurationError(
+                "--master-reason must be nonempty for a manual Master decision"
+            )
+        action = MasterAction(namespace.master_decision)
+        role = (
+            None
+            if namespace.master_role is None
+            else Role(namespace.master_role)
+        )
+        permission = (
+            None
+            if namespace.master_permission_profile is None
+            else PermissionProfile(namespace.master_permission_profile)
+        )
+        if action is MasterAction.DISPATCH:
+            if role is None or permission is None:
+                raise ConfigurationError(
+                    "dispatch --master-decision requires --master-role and "
+                    "--master-permission-profile"
+                )
+        elif role is not None or permission is not None:
+            raise ConfigurationError(
+                "non-dispatch --master-decision must not select role or permission"
+            )
+        manual_master_decision = MasterDecision(
+            action=action,
+            role=role,
+            permission_profile=permission,
+            reason=reason,
+        )
     config = validate_loop_config(
         LoopConfig(
             worktree_path=worktree,
@@ -950,6 +1036,7 @@ def parse_run_arguments(
             max_transition_count=namespace.max_transition_count,
             step_timeout_ms=namespace.step_timeout_ms,
             total_timeout_ms=namespace.total_timeout_ms,
+            planning_only=namespace.planning_only,
         )
     )
     return RunArguments(
@@ -960,6 +1047,7 @@ def parse_run_arguments(
         dry_run=namespace.dry_run,
         agent_runtime_request=agent_runtime_request,
         master_runtime_request=master_runtime_request,
+        manual_master_decision=manual_master_decision,
     )
 
 

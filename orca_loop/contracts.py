@@ -838,8 +838,12 @@ def parse_plan_document(
     expected_snapshot_digest: str | None = None,
     expected_round: int | None = None,
 ) -> PlanDocument:
+    decoded = _decode(raw_text)
+    if isinstance(decoded, dict) and "escalation_signals" not in decoded:
+        decoded = dict(decoded)
+        decoded["escalation_signals"] = []
     raw = _exact(
-        _decode(raw_text),
+        decoded,
         {
             "schema_version",
             "plan_version",
@@ -859,6 +863,7 @@ def parse_plan_document(
             "out_of_scope",
             "reviewed_finding_ids",
             "finding_decisions",
+            "escalation_signals",
         },
         context="plan",
     )
@@ -969,6 +974,11 @@ def parse_plan_document(
         ),
         reviewed_finding_ids=reviewed_ids,
         finding_decisions=decisions,
+        escalation_signals=_tuple(
+            raw["escalation_signals"],
+            _parse_escalation,
+            "plan.escalation_signals",
+        ),
     )
 
 

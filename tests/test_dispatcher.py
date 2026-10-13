@@ -219,6 +219,7 @@ class DispatcherTest(unittest.TestCase):
             self.assertEqual(["ctx-1"], dispatched)
             self.assertEqual(1, len(foreign))
             payload = json.loads(completion.payload_json or "{}")
+            self.assertEqual(1, payload["schema_version"])
             self.assertEqual("task-1", payload["taskId"])
             self.assertEqual(str(report_path), payload["reportPath"])
 

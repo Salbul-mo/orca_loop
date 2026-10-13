@@ -33,6 +33,7 @@ from orca_loop.models import (
     ArtifactKind,
     DispatchHandle,
     ExpectedProvenance,
+    EscalationCode,
     LoopCounters,
     MasterAction,
     MasterDecision,
@@ -444,10 +445,29 @@ class ArtifactContractTest(unittest.TestCase):
     def test_plan_accepts_rationale_word_but_rejects_unknown_section(self) -> None:
         parsed = parse_plan_document(json.dumps(plan_value()))
         self.assertEqual(1, parsed.plan_version)
+        self.assertEqual((), parsed.escalation_signals)
         value = plan_value()
         value["replacement_plan"] = ["unapproved"]
         with self.assertRaises(ContractViolationError):
             parse_plan_document(json.dumps(value))
+
+    def test_plan_parses_master_supervision_request(self) -> None:
+        value = plan_value()
+        value["escalation_signals"] = [
+            {
+                "code": "E-02",
+                "reason": "requirement choice needs Master supervision",
+                "evidence_refs": ["request.md"],
+                "deduplication_key": "planner-supervision-1",
+            }
+        ]
+        parsed = parse_plan_document(json.dumps(value))
+        self.assertEqual(1, len(parsed.escalation_signals))
+        self.assertIs(EscalationCode.E02, parsed.escalation_signals[0].code)
+        self.assertEqual(
+            "planner-supervision-1",
+            parsed.escalation_signals[0].deduplication_key,
+        )
 
     def test_worker_done_alias_roundtrip(self) -> None:
         raw = {

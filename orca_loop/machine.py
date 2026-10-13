@@ -16,6 +16,7 @@ class UndefinedTransitionError(RuntimeError):
 
 TERMINAL_STATES = {
     LoopState.READY_FOR_MERGE,
+    LoopState.FINISHED_PLAN,
     LoopState.REJECTED,
     LoopState.USER_DECISION_REQUIRED,
     LoopState.FAILED,

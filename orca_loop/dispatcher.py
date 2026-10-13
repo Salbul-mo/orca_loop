@@ -447,6 +447,9 @@ def dispatch_and_wait(
         "timeout_ms": step_timeout_ms,
         "preamble": preamble,
     }
+    completion_dir = getattr(client, "completion_dir", None)
+    if isinstance(completion_dir, Path):
+        job["completion_dir"] = str(completion_dir.resolve())
     command = _runner_command(job, runner_path)
     client.call(
         (
@@ -495,6 +498,7 @@ def dispatch_and_wait(
                 continue
             if message_type == "worker_done":
                 normalized_payload = dict(payload)
+                normalized_payload.setdefault("schema_version", 1)
                 normalized_payload.setdefault("taskId", prepared.task_id)
                 normalized_payload.setdefault("dispatchId", dispatch_id)
                 report_path = _field(value, "report_path", "reportPath")

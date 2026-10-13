@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -237,12 +238,17 @@ class ProfileTest(unittest.TestCase):
                                 None,
                             ),
                         )
-                        expected_command = (
-                            "claude"
-                            if provider is AgentProvider.CLAUDE
-                            else "codex"
-                        )
-                        self.assertEqual(expected_command, profile.command[0])
+                        if provider is AgentProvider.WEB_GPT:
+                            self.assertEqual(sys.executable, profile.command[0])
+                            self.assertIn("web_gpt_provider.py", profile.command[1])
+                            self.assertEqual(role.value, profile.command[3])
+                        else:
+                            expected_command = (
+                                "claude"
+                                if provider is AgentProvider.CLAUDE
+                                else "codex"
+                            )
+                            self.assertEqual(expected_command, profile.command[0])
                         expected_roots = (
                             (worktree,)
                             if role is Role.IMPLEMENTER

@@ -143,6 +143,12 @@ def build_user_decision_report(
         f"- Run ID: `{state.run_id}`",
         f"- Plan version: `{state.plan_version}`",
         f"- Snapshot digest: `{state.snapshot_digest}`",
+        "- Human supervision reason: "
+        + (
+            state.history[-1].reason
+            if state.history
+            else "No coordinator history is available."
+        ),
         "",
         "## 2. Consensus Round Totals",
         "",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 import time
 from dataclasses import replace
@@ -22,7 +23,9 @@ from orca_loop.config import (
 )
 from orca_loop.contracts import (
     ContractViolationError,
+    parse_implementation_artifact,
     parse_plan_document,
+    parse_review_artifact,
     to_wire_value,
 )
 from orca_loop.coordinator import (
@@ -55,6 +58,7 @@ from orca_loop.generation import (
     AtomicWriteError,
     commit_generation,
     load_committed,
+    write_atomic_bytes,
 )
 from orca_loop.ledger import empty_ledger, unresolved_scope
 from orca_loop.locking import (
@@ -75,12 +79,14 @@ from orca_loop.models import (
     CodeReviewVerdict,
     ConsensusKind,
     CoordinatorState,
+    ExpectedProvenance,
     GateKind,
     HumanDecisionKind,
     LaunchProfile,
     LoopCounters,
     LoopState,
     MasterAction,
+    MasterDecision,
     PlanDocument,
     ReviewArtifact,
     Role,
@@ -98,6 +104,7 @@ from orca_loop.models import (
     WorkerKey,
     WorkerPool,
 )
+from orca_loop.local_runtime import LocalCoordinatorClient
 from orca_loop.orca_client import OrcaClient, OrcaCommandError
 from orca_loop.profiles import build_launch_profile
 from orca_loop.readonly import prepare_readonly_mirror
@@ -115,6 +122,21 @@ EXIT_RUNTIME_FAILURE = 1
 EXIT_PREFLIGHT = 2
 EXIT_USER_REQUIRED = 3
 EXIT_REJECTED = 4
+
+
+class RecoverableMasterProviderError(OrcaLoopError):
+    """A provider outage that can be resumed without discarding verified work."""
+
+    def __init__(
+        self,
+        phase: str,
+        detail: str,
+        *,
+        resume_action: str,
+    ) -> None:
+        super().__init__(f"{phase} Master routing failed: {detail}")
+        self.phase = phase
+        self.resume_action = resume_action
 
 
 def _digest(path: Path) -> str:
@@ -230,7 +252,11 @@ def _commit_initial_route(
             invoke,
         )
     except MasterRuntimeAdapterError as exc:
-        raise OrcaLoopError(f"initial Master routing failed: {exc}") from exc
+        raise RecoverableMasterProviderError(
+            "initial",
+            str(exc),
+            resume_action="retry_initial_master",
+        ) from exc
     decision = validate_master_decision(decision)
     if decision.action is not MasterAction.DISPATCH:
         raise OrcaLoopError(
@@ -438,6 +464,51 @@ def _user_scope(
     )
 
 
+
+def _master_guidance_path(controller: GenerationController) -> Path:
+    return (
+        controller.workspace.control_dir
+        / f"master-guidance-g{controller.state.generation:04d}.json"
+    )
+
+
+def _persist_master_guidance(
+    controller: GenerationController,
+    *,
+    source_state: LoopState,
+    source_role: Role,
+    target_state: LoopState,
+    decision,
+    escalations,
+) -> None:
+    target_role = role_for_state(target_state)
+    payload = {
+        "schemaVersion": 1,
+        "runId": controller.state.run_id,
+        "generation": controller.state.generation,
+        "sourceState": source_state.value,
+        "sourceRole": source_role.value,
+        "targetState": target_state.value,
+        "targetRole": target_role.value,
+        "decision": to_wire_value(decision),
+        "workerSupervisionRequests": [
+            to_wire_value(item) for item in escalations
+        ],
+        "authority": (
+            "Bounded Master guidance. It may resolve the listed worker "
+            "supervision requests but cannot expand user scope, permissions, "
+            "or coordinator policy."
+        ),
+    }
+    output = _master_guidance_path(controller)
+    temporary = output.with_name(output.name + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(output)
+
+
 def _step_inputs(
     controller: GenerationController,
     preflight: PreflightResult,
@@ -450,6 +521,38 @@ def _step_inputs(
             None,
         )
     ]
+    guidance = _master_guidance_path(controller)
+    if guidance.is_file():
+        values.append(StagedInput("master-guidance.json", guidance, None))
+    if (
+        controller.state.history
+        and controller.state.history[-1].signal
+        is SignalKind.OPERATIONAL_RETRY
+    ):
+        retry = controller.state.history[-1]
+        retry_payload = {
+            "failureLayer": "artifact_contract",
+            "previousValidationError": retry.reason,
+            "requiredAction": (
+                "Repair the artifact contract first. Return the exact JSON "
+                "artifact only; do not repeat prose or the invalid shape."
+            ),
+            "operationalRetry": controller.state.counters.operational_retries,
+        }
+        values.append(
+            StagedInput(
+                "artifact-validation-error.json",
+                None,
+                (
+                    json.dumps(
+                        retry_payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                ).encode("utf-8"),
+            )
+        )
     for filename in (
         "plan.json",
         "plan_review.json",
@@ -500,6 +603,7 @@ def _profile_root(
         preflight.arguments.config.worktree_path,
         controller.workspace.review_dir,
         controller.state.generation + 1,
+        trusted_runs_root=preflight.arguments.harness_root / "runs",
     )
 
 
@@ -511,7 +615,18 @@ def _worker_completion_master_context(
     artifact: object,
 ) -> dict[str, object]:
     state = controller.state.state
-    if state in {LoopState.PLAN, LoopState.PLAN_REVISE}:
+    supervision_requested = bool(result.escalations)
+    escalation_codes = {item.code.value for item in result.escalations}
+
+    escalate = {
+        "action": MasterAction.ESCALATE.value,
+        "role": None,
+        "permissionProfile": None,
+    }
+    if supervision_requested and "E-03" in escalation_codes:
+        # E-03 is a policy-level contract/schema/external approval boundary.
+        allowed = [escalate]
+    elif state in {LoopState.PLAN, LoopState.PLAN_REVISE}:
         allowed = [
             {
                 "action": MasterAction.DISPATCH.value,
@@ -519,7 +634,16 @@ def _worker_completion_master_context(
                 "permissionProfile": "read_only",
             },
         ]
-        if _plan_review_can_be_skipped(result, artifact):
+        if supervision_requested:
+            allowed.insert(
+                0,
+                {
+                    "action": MasterAction.DISPATCH.value,
+                    "role": Role.PLANNER.value,
+                    "permissionProfile": "read_only",
+                },
+            )
+        elif _plan_review_can_be_skipped(result, artifact):
             allowed.append(
                 {
                     "action": MasterAction.DISPATCH.value,
@@ -527,26 +651,50 @@ def _worker_completion_master_context(
                     "permissionProfile": "workspace_write",
                 }
             )
-        allowed.append(
-            {
-                "action": MasterAction.ESCALATE.value,
-                "role": None,
-                "permissionProfile": None,
-            }
-        )
-    elif state in {LoopState.IMPLEMENT, LoopState.FIX}:
+        allowed.append(escalate)
+    elif state is LoopState.PLAN_REVIEW and supervision_requested:
         allowed = [
             {
-                "action": MasterAction.TEST.value,
-                "role": None,
-                "permissionProfile": None,
+                "action": MasterAction.DISPATCH.value,
+                "role": Role.PLANNER.value,
+                "permissionProfile": "read_only",
             },
-            {
-                "action": MasterAction.ESCALATE.value,
-                "role": None,
-                "permissionProfile": None,
-            },
+            escalate,
         ]
+    elif state in {LoopState.IMPLEMENT, LoopState.FIX}:
+        if supervision_requested:
+            allowed = [
+                {
+                    "action": MasterAction.DISPATCH.value,
+                    "role": Role.PLANNER.value,
+                    "permissionProfile": "read_only",
+                },
+            ]
+            if "E-08" not in escalation_codes:
+                allowed.extend(
+                    [
+                        {
+                            "action": MasterAction.DISPATCH.value,
+                            "role": Role.IMPLEMENTER.value,
+                            "permissionProfile": "workspace_write",
+                        },
+                        {
+                            "action": MasterAction.TEST.value,
+                            "role": None,
+                            "permissionProfile": None,
+                        },
+                    ]
+                )
+            allowed.append(escalate)
+        else:
+            allowed = [
+                {
+                    "action": MasterAction.TEST.value,
+                    "role": None,
+                    "permissionProfile": None,
+                },
+                escalate,
+            ]
     elif state is LoopState.CODE_REVIEW:
         allowed = [
             {
@@ -555,7 +703,10 @@ def _worker_completion_master_context(
                 "permissionProfile": "read_only",
             },
         ]
-        if _code_review_can_finish(controller, result, artifact):
+        if (
+            not supervision_requested
+            and _code_review_can_finish(controller, result, artifact)
+        ):
             allowed.append(
                 {
                     "action": MasterAction.FINISH.value,
@@ -563,17 +714,24 @@ def _worker_completion_master_context(
                     "permissionProfile": None,
                 }
             )
-        allowed.append(
+        allowed.append(escalate)
+    elif state is LoopState.CROSS_CONFIRM and supervision_requested:
+        allowed = [
             {
-                "action": MasterAction.ESCALATE.value,
-                "role": None,
-                "permissionProfile": None,
-            }
-        )
+                "action": MasterAction.DISPATCH.value,
+                "role": Role.IMPLEMENTER.value,
+                "permissionProfile": "workspace_write",
+            },
+            escalate,
+        ]
     else:
         allowed = []
     return {
-        "stage": "worker_completion",
+        "stage": (
+            "worker_supervision"
+            if supervision_requested
+            else "worker_completion"
+        ),
         "runId": controller.state.run_id,
         "currentState": state.value,
         "completedRole": role.value,
@@ -582,6 +740,14 @@ def _worker_completion_master_context(
         ),
         "artifact": to_wire_value(artifact),
         "resultSignal": result.signal.kind.value,
+        "supervisionRequested": supervision_requested,
+        "workerSupervisionRequests": [
+            to_wire_value(item) for item in result.escalations
+        ],
+        "supervisionRule": (
+            "Resolve autonomously when evidence/policy is sufficient. "
+            "Escalate only for genuinely human-owned decisions."
+        ),
         "allowedDecisions": allowed,
     }
 
@@ -591,6 +757,8 @@ def _plan_review_can_be_skipped(
     artifact: object,
 ) -> bool:
     if not isinstance(artifact, PlanDocument):
+        return False
+    if result.escalations or artifact.escalation_signals:
         return False
     if ledger_view(result.ledger).unresolved_count != 0:
         return False
@@ -689,6 +857,98 @@ def _validate_worker_completion_master_decision(
     )
 
 
+def _validate_worker_supervision_master_decision(
+    state: LoopState,
+    decision,
+    result: StepExecutionResult,
+) -> SignalKind | LoopState:
+    decision = validate_master_decision(decision)
+    codes = {item.code.value for item in result.escalations}
+    if decision.action is MasterAction.ESCALATE:
+        return SignalKind.ESCALATE
+    if "E-03" in codes:
+        raise OrcaLoopError(
+            "E-03 supervision is policy-bound and requires human escalation"
+        )
+    if state in {LoopState.PLAN, LoopState.PLAN_REVISE}:
+        if decision.action is MasterAction.DISPATCH:
+            if decision.role is Role.PLANNER:
+                return LoopState.PLAN_REVISE
+            if decision.role is Role.PLAN_REVIEWER:
+                return LoopState.PLAN_REVIEW
+    elif state is LoopState.PLAN_REVIEW:
+        if (
+            decision.action is MasterAction.DISPATCH
+            and decision.role is Role.PLANNER
+        ):
+            return LoopState.PLAN_REVISE
+    elif state in {LoopState.IMPLEMENT, LoopState.FIX}:
+        if (
+            decision.action is MasterAction.DISPATCH
+            and decision.role is Role.PLANNER
+        ):
+            return LoopState.PLAN_REVISE
+        if "E-08" not in codes:
+            if (
+                decision.action is MasterAction.DISPATCH
+                and decision.role is Role.IMPLEMENTER
+            ):
+                return LoopState.FIX
+            if decision.action is MasterAction.TEST:
+                return LoopState.TEST_GATE
+    elif state is LoopState.CODE_REVIEW:
+        if (
+            decision.action is MasterAction.DISPATCH
+            and decision.role is Role.CROSS_CONFIRMER
+        ):
+            return LoopState.CROSS_CONFIRM
+    elif state is LoopState.CROSS_CONFIRM:
+        if (
+            decision.action is MasterAction.DISPATCH
+            and decision.role is Role.IMPLEMENTER
+        ):
+            return LoopState.FIX
+    raise OrcaLoopError(
+        "Master supervision decision is not authorized for "
+        f"{state.value}: {decision.action.value}"
+    )
+
+
+def _commit_master_supervision_resolution(
+    controller: GenerationController,
+    *,
+    source_state: LoopState,
+    source_role: Role,
+    target_state: LoopState,
+    decision,
+    result: StepExecutionResult,
+) -> None:
+    controller.commit(
+        stage=StepStage.TRANSITION_COMMITTED,
+        active=None,
+        reason=(
+            f"Master resolved worker supervision after {source_role.value}: "
+            f"{decision.reason}"
+        ),
+        signal=SignalKind.OK,
+        state_value=target_state,
+        status=RunStatus.IN_PROGRESS,
+        ledger=result.ledger,
+        counters=controller.state.counters,
+        test_gate_status=result.test_gate_status,
+        pending_escalations=(),
+    )
+    if target_state in WORKER_STATES:
+        _persist_master_guidance(
+            controller,
+            source_state=source_state,
+            source_role=source_role,
+            target_state=target_state,
+            decision=decision,
+            escalations=result.escalations,
+        )
+
+
 def _route_worker_completion(
     controller: GenerationController,
     preflight: PreflightResult,
@@ -698,18 +958,40 @@ def _route_worker_completion(
     *,
     master_invoke: MasterInvoker | None = None,
 ) -> StepExecutionResult:
+    supervision_requested = bool(result.escalations)
+    normal_master_state = controller.state.state in {
+        LoopState.PLAN,
+        LoopState.PLAN_REVISE,
+        LoopState.IMPLEMENT,
+        LoopState.FIX,
+        LoopState.CODE_REVIEW,
+    }
+    supervision_master_state = controller.state.state in {
+        LoopState.PLAN,
+        LoopState.PLAN_REVIEW,
+        LoopState.PLAN_REVISE,
+        LoopState.IMPLEMENT,
+        LoopState.FIX,
+        LoopState.CODE_REVIEW,
+        LoopState.CROSS_CONFIRM,
+    }
     if (
         preflight.master_runtime is None
-        or result.signal.kind is not SignalKind.ARTIFACT_OK
         or artifact is None
-        or controller.state.state
-        not in {
-            LoopState.PLAN,
-            LoopState.PLAN_REVISE,
-            LoopState.IMPLEMENT,
-            LoopState.FIX,
-            LoopState.CODE_REVIEW,
-        }
+        or (
+            supervision_requested
+            and (
+                result.signal.kind is not SignalKind.ESCALATE
+                or not supervision_master_state
+            )
+        )
+        or (
+            not supervision_requested
+            and (
+                result.signal.kind is not SignalKind.ARTIFACT_OK
+                or not normal_master_state
+            )
+        )
     ):
         return result
     invoke = master_invoke
@@ -733,9 +1015,43 @@ def _route_worker_completion(
             invoke,
         )
     except MasterRuntimeAdapterError as exc:
-        raise OrcaLoopError(
-            f"worker-completion Master routing failed: {exc}"
+        raise RecoverableMasterProviderError(
+            "worker-completion",
+            str(exc),
+            resume_action="retry_master_only",
         ) from exc
+
+    if supervision_requested:
+        source_state = controller.state.state
+        override = _validate_worker_supervision_master_decision(
+            source_state,
+            decision,
+            result,
+        )
+        if override is SignalKind.ESCALATE:
+            return StepExecutionResult(
+                TransitionSignal(
+                    SignalKind.ESCALATE,
+                    (
+                        f"Master requires human supervision after {role.value}: "
+                        f"{decision.reason}"
+                    ),
+                    result.signal.finding_ids,
+                ),
+                result.ledger,
+                result.test_gate_status,
+                result.escalations,
+            )
+        _commit_master_supervision_resolution(
+            controller,
+            source_state=source_state,
+            source_role=role,
+            target_state=override,
+            decision=decision,
+            result=result,
+        )
+        return result
+
     override = _validate_worker_completion_master_decision(
         controller.state.state,
         decision,
@@ -948,8 +1264,10 @@ def _route_test_result(
             invoke,
         )
     except MasterRuntimeAdapterError as exc:
-        raise OrcaLoopError(
-            f"test-result Master routing failed: {exc}"
+        raise RecoverableMasterProviderError(
+            "test-result",
+            str(exc),
+            resume_action="resume_state",
         ) from exc
     override = _validate_test_result_master_decision(
         result.signal.kind,
@@ -1070,8 +1388,10 @@ def _route_final_decision(
             invoke,
         )
     except MasterRuntimeAdapterError as exc:
-        raise OrcaLoopError(
-            f"final Master routing failed: {exc}"
+        raise RecoverableMasterProviderError(
+            "final",
+            str(exc),
+            resume_action="resume_state",
         ) from exc
     override = _validate_final_master_decision(decision)
     if override is None:
@@ -1088,6 +1408,121 @@ def _route_final_decision(
     )
 
 
+def _load_verified_artifact(
+    controller: GenerationController,
+    role: Role,
+) -> object:
+    path = controller.workspace.artifact_dir / ARTIFACT_FILENAMES[role]
+    if not path.is_file():
+        raise OrcaLoopError(
+            f"verified artifact is missing during resume: {path}"
+        )
+    raw_text = path.read_text(encoding="utf-8")
+    if role is Role.PLANNER:
+        return parse_plan_document(raw_text)
+
+    active = controller.state.active
+    if (
+        active is None
+        or active.task_id is None
+        or active.dispatch_id is None
+        or active.role is not role
+    ):
+        raise OrcaLoopError(
+            "ARTIFACT_VERIFIED resume has no matching active dispatch provenance"
+        )
+    try:
+        raw = json.loads(raw_text)
+        consensus_round_value = int(raw["consensus_round"])
+        snapshot_digest = str(raw["snapshot_digest"])
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise ContractViolationError(
+            "verified artifact cannot be reloaded for routing"
+        ) from exc
+    expected = ExpectedProvenance(
+        run_id=controller.state.run_id,
+        task_id=active.task_id,
+        dispatch_id=active.dispatch_id,
+        consensus_round=consensus_round_value,
+        snapshot_digest=snapshot_digest,
+    )
+    if role is Role.IMPLEMENTER:
+        return parse_implementation_artifact(
+            raw_text,
+            expected,
+            delivered_finding_ids=_user_scope(controller).finding_ids,
+        )
+    kind_by_role = {
+        Role.PLAN_REVIEWER: ArtifactKind.PLAN_REVIEW,
+        Role.CODE_REVIEWER: ArtifactKind.CODE_REVIEW,
+        Role.CROSS_CONFIRMER: ArtifactKind.CROSS_REVIEW,
+    }
+    kind = kind_by_role.get(role)
+    if kind is None:
+        raise OrcaLoopError(
+            f"unsupported verified artifact role during resume: {role.value}"
+        )
+    reviewed = raw.get("reviewed_finding_ids", [])
+    delivered = (
+        tuple(str(item) for item in reviewed)
+        if isinstance(reviewed, list)
+        else _user_scope(controller).finding_ids
+    )
+    return parse_review_artifact(
+        raw_text,
+        kind,
+        expected,
+        delivered_finding_ids=delivered,
+    )
+
+
+def _resume_verified_worker_routing(
+    controller: GenerationController,
+    preflight: PreflightResult,
+    role: Role,
+    *,
+    master_invoke: MasterInvoker | None,
+) -> object:
+    artifact = _load_verified_artifact(controller, role)
+    escalations = controller.state.pending_escalations
+    if not escalations:
+        escalations = tuple(getattr(artifact, "escalation_signals", ()))
+    result = StepExecutionResult(
+        TransitionSignal(
+            (
+                SignalKind.ESCALATE
+                if escalations
+                else SignalKind.ARTIFACT_OK
+            ),
+            (
+                "; ".join(item.reason for item in escalations)
+                if escalations
+                else "verified artifact routing resumed without worker re-dispatch"
+            ),
+            _user_scope(controller).finding_ids,
+        ),
+        controller.ledger,
+        controller.state.test_gate_status,
+        escalations,
+    )
+    source_state = controller.state.state
+    result = _route_worker_completion(
+        controller,
+        preflight,
+        role,
+        result,
+        artifact,
+        master_invoke=master_invoke,
+    )
+    if controller.state.state is source_state:
+        commit_step_transition(
+            controller,
+            result,
+            preflight.arguments.config,
+        )
+    return artifact
+
+
 def _execute_worker(
     controller: GenerationController,
     pool: WorkerPool,
@@ -1098,6 +1533,13 @@ def _execute_worker(
 ) -> object | None:
     state = controller.state.state
     role = role_for_state(state)
+    if controller.state.step_stage is StepStage.ARTIFACT_VERIFIED:
+        return _resume_verified_worker_routing(
+            controller,
+            preflight,
+            role,
+            master_invoke=master_invoke,
+        )
     step_id = (
         f"g{controller.state.generation + 1:04d}-"
         f"{state.value.lower().replace('_', '-')}"
@@ -1321,9 +1763,12 @@ def _create_decision_task(
 def _gate_options(
     controller: GenerationController,
     plan,
+    kind: GateKind,
 ) -> tuple[str, ...]:
-    if controller.state.state is LoopState.HUMAN_GATE:
+    if kind is GateKind.FINAL:
         return ("merge", "reject", "revise_code", "revise_design")
+    if kind is GateKind.DESTRUCTIVE:
+        return ("merge", "reject", "revise_design")
     if any(
         trigger.code.value == "E-03"
         for trigger in controller.state.pending_escalations
@@ -1343,6 +1788,76 @@ def _gate_options(
     ):
         return ("merge", "reject", "revise_design")
     return ("revise_code", "revise_design", "reject")
+
+
+def _gate_question(
+    controller: GenerationController,
+    kind: GateKind,
+    options: tuple[str, ...],
+) -> str:
+    merge_meaning = "현재 방향을 승인하고 계속"
+    if kind is GateKind.FINAL:
+        merge_meaning = "최종 결과를 승인하고 종료 단계로 진행"
+    elif kind is GateKind.DESTRUCTIVE:
+        merge_meaning = "삭제/이름 변경 작업만 승인하고 계속"
+    elif any(
+        item.code.value == "E-03"
+        for item in controller.state.pending_escalations
+    ):
+        merge_meaning = (
+            "현재 방향을 승인하고 계속 "
+            "(외부 계약/제품 권한 판단 승인 후 중단 지점부터 재개)"
+        )
+    option_meanings = {
+        "merge": merge_meaning,
+        "reject": "승인하지 않고 이 실행을 종료",
+        "revise_code": "코드를 수정한 뒤 다시 검토",
+        "revise_design": "설계를 수정한 뒤 다시 검토",
+    }
+    rendered_options = " / ".join(
+        f"{item}={option_meanings.get(item, item)}" for item in options
+    )
+
+    if kind is GateKind.FINAL:
+        return (
+            "최종 결정 필요: 현재 결과를 최종 승인할지 선택하세요. "
+            f"선택: {rendered_options}"
+        )
+    if kind is GateKind.DESTRUCTIVE:
+        return (
+            "결정 필요: 삭제 또는 이름 변경 같은 파괴적 변경을 승인할지 "
+            f"선택하세요. 선택: {rendered_options}"
+        )
+
+    triggers = controller.state.pending_escalations
+    if any(item.code.value == "E-03" for item in triggers):
+        trigger = next(
+            item for item in triggers if item.code.value == "E-03"
+        )
+        reason = " ".join(trigger.reason.split())
+        if len(reason) > 320:
+            reason = reason[:317].rstrip() + "..."
+        return (
+            "결정 필요(E-03): 외부 API/스키마/계약 변경을 승인할지 "
+            f"선택하세요. 실제 판단 사유: {reason} "
+            "이 승인은 파괴적 파일 변경 승인과 별개입니다. "
+            f"선택: {rendered_options}"
+        )
+
+    if triggers:
+        trigger = triggers[0]
+        reason = " ".join(trigger.reason.split())
+        if len(reason) > 220:
+            reason = reason[:217].rstrip() + "..."
+        return (
+            f"결정 필요({trigger.code.value}): {reason} "
+            f"선택: {rendered_options}"
+        )
+
+    return (
+        "결정 필요: 자동으로 확정할 수 없는 사항이 있습니다. "
+        f"선택: {rendered_options}"
+    )
 
 
 def _ensure_gate(
@@ -1372,6 +1887,9 @@ def _ensure_gate(
     plan = _load_plan(controller.workspace.root)
     destructive_pending = (
         controller.state.state is not LoopState.HUMAN_GATE
+        and controller.state.blocked_from_state
+        is LoopState.PLAN_CONSENSUS_EVALUATE
+        and not controller.state.pending_escalations
         and plan is not None
         and any(
             item.operation.value in {"delete", "rename"}
@@ -1383,25 +1901,31 @@ def _ensure_gate(
         GateKind.FINAL
         if controller.state.state is LoopState.HUMAN_GATE
         else (
-            GateKind.DESTRUCTIVE
-            if destructive_pending
-            else GateKind.ESCALATION
+            GateKind.ESCALATION
+            if controller.state.pending_escalations
+            else (
+                GateKind.DESTRUCTIVE
+                if destructive_pending
+                else GateKind.ESCALATION
+            )
         )
+    )
+    options = _gate_options(
+        controller,
+        plan,
+        kind,
     )
     binding = create_gate(
         client,
         task_id=task_id,
         report=report,
         gate_kind=kind,
-        question=(
-            "Choose the final disposition."
-            if kind is GateKind.FINAL
-            else "Resolve the bounded disagreement or stop the run."
-        ),
-        options=_gate_options(
+        question=_gate_question(
             controller,
-            plan,
+            kind,
+            options,
         ),
+        options=options,
         timeout_ms=30_000,
     )
     controller.commit(
@@ -1411,6 +1935,29 @@ def _ensure_gate(
         status=RunStatus.BLOCKED,
         gate_binding=binding,
     )
+
+
+def _resume_target_after_approval(
+    blocked: LoopState | None,
+) -> LoopState:
+    mapping = {
+        LoopState.PLAN: LoopState.PLAN_REVIEW,
+        LoopState.PLAN_REVISE: LoopState.PLAN_REVIEW,
+        LoopState.PLAN_REVIEW: LoopState.PLAN_CONSENSUS_EVALUATE,
+        LoopState.PLAN_CONSENSUS_EVALUATE: LoopState.IMPLEMENT,
+        LoopState.IMPLEMENT: LoopState.TEST_GATE,
+        LoopState.FIX: LoopState.TEST_GATE,
+        LoopState.CODE_REVIEW: LoopState.CROSS_CONFIRM,
+        LoopState.CROSS_CONFIRM: LoopState.CONSENSUS_EVALUATE,
+        LoopState.CONSENSUS_EVALUATE: LoopState.HUMAN_GATE,
+    }
+    target = mapping.get(blocked)
+    if target is None:
+        raise OrcaLoopError(
+            "approved gate has no deterministic continuation for "
+            f"{None if blocked is None else blocked.value}"
+        )
+    return target
 
 
 def _resume_gate(
@@ -1453,6 +2000,9 @@ def _resume_gate(
         return True
 
     blocked = controller.state.blocked_from_state
+    ledger = controller.ledger
+    destructive_approval = controller.state.destructive_approval
+
     if decision.decision is HumanDecisionKind.REJECT:
         target = LoopState.REJECTED
         status = RunStatus.REJECTED
@@ -1464,53 +2014,78 @@ def _resume_gate(
         status = RunStatus.IN_PROGRESS
     elif (
         decision.decision is HumanDecisionKind.MERGE
-        and any(
-            item.code.value == "E-03"
-            for item in controller.state.pending_escalations
-        )
+        and binding.gate_kind is GateKind.DESTRUCTIVE
     ):
         plan = _load_plan(controller.workspace.root)
-        updated_ledger = approve_escalation_keys(
+        if plan is None:
+            raise OrcaLoopError(
+                "destructive approval gate has no promoted plan"
+            )
+        snapshot = capture_snapshot(
+            preflight.arguments.config.worktree_path
+        )
+        destructive_approval, signal = destructive_gate(
+            run_id=controller.state.run_id,
+            plan=plan,
+            manifest=ScopeManifest(
+                snapshot.snapshot_digest,
+                plan.affected_files,
+                None,
+            ),
+            snapshot=snapshot,
+            binding=binding,
+            decision=decision,
+        )
+        if signal.kind is not SignalKind.OK:
+            raise OrcaLoopError(
+                "destructive approval did not produce an OK signal"
+            )
+        target = _resume_target_after_approval(blocked)
+        status = RunStatus.IN_PROGRESS
+    elif (
+        decision.decision is HumanDecisionKind.MERGE
+        and binding.gate_kind is GateKind.ESCALATION
+        and controller.state.pending_escalations
+    ):
+        ledger = approve_escalation_keys(
             controller.ledger,
             controller.state.pending_escalations,
         )
-        approval = controller.state.destructive_approval
-        if plan is not None and any(
-            item.operation.value in {"delete", "rename"}
-            for item in plan.affected_files
-        ):
-            snapshot = capture_snapshot(
-                preflight.arguments.config.worktree_path
+        plan = _load_plan(controller.workspace.root)
+        destructive_pending = (
+            blocked is LoopState.PLAN_CONSENSUS_EVALUATE
+            and plan is not None
+            and controller.state.destructive_approval is None
+            and any(
+                item.operation.value in {"delete", "rename"}
+                for item in plan.affected_files
             )
-            approval, signal = destructive_gate(
-                run_id=controller.state.run_id,
-                plan=plan,
-                manifest=ScopeManifest(
-                    snapshot.snapshot_digest,
-                    plan.affected_files,
-                    None,
+        )
+        if destructive_pending:
+            controller.commit(
+                stage=StepStage.TRANSITION_COMMITTED,
+                active=None,
+                reason=(
+                    "external contract/product decision approved; "
+                    "destructive implementation approval remains"
                 ),
-                snapshot=snapshot,
-                binding=binding,
-                decision=decision,
+                signal=SignalKind.OK,
+                state_value=LoopState.USER_DECISION_REQUIRED,
+                status=RunStatus.BLOCKED,
+                ledger=ledger,
+                human_decision=decision,
+                blocked_from_state=blocked,
+                pending_escalations=(),
+                clear_gate=True,
             )
-            if signal.kind is not SignalKind.OK:
-                return False
-        target = (
-            LoopState.IMPLEMENT
-            if blocked is LoopState.PLAN_CONSENSUS_EVALUATE
-            else LoopState.HUMAN_GATE
-        )
+            return True
+        target = _resume_target_after_approval(blocked)
         status = RunStatus.IN_PROGRESS
-        controller.ledger = updated_ledger
-        controller.state = replace(
-            controller.state,
-            destructive_approval=approval,
-        )
     else:
         raise OrcaLoopError(
-            "gate resolution is not valid for the blocked state"
+            "gate resolution is not valid for the gate kind and blocked state"
         )
+
     controller.commit(
         stage=StepStage.TRANSITION_COMMITTED,
         active=None,
@@ -1530,13 +2105,13 @@ def _resume_gate(
         ),
         state_value=target,
         status=status,
-        ledger=controller.ledger,
+        ledger=ledger,
         human_decision=decision,
+        destructive_approval=destructive_approval,
         clear_gate=True,
         clear_blocked_context=True,
     )
     return True
-
 
 def _run_loop(
     controller: GenerationController,
@@ -1576,6 +2151,14 @@ def _run_loop(
         if state in TERMINAL_STATES:
             return controller.state
         try:
+            if state is LoopState.INIT:
+                _commit_initial_route(
+                    controller,
+                    preflight,
+                    master_invoke=master_invoke,
+                )
+                transitions += 1
+                continue
             if state in WORKER_STATES:
                 _execute_worker(
                     controller,
@@ -1672,6 +2255,71 @@ def _run_loop(
     return controller.state
 
 
+def _record_manual_master_override(
+    controller: GenerationController,
+    decision: MasterDecision,
+) -> None:
+    target = (
+        controller.workspace.control_dir
+        / f"manual-master-override.{controller.state.generation}.json"
+    )
+    payload = {
+        "schemaVersion": 1,
+        "runId": controller.state.run_id,
+        "generation": controller.state.generation,
+        "state": controller.state.state.value,
+        "stepStage": controller.state.step_stage.value,
+        "source": "cli_manual_master_override",
+        "decision": to_wire_value(decision),
+    }
+    raw = (
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+    if target.exists():
+        if not target.is_file() or target.is_symlink():
+            raise OrcaLoopError(
+                f"manual Master provenance target is invalid: {target}"
+            )
+        if target.read_bytes() != raw:
+            raise OrcaLoopError(
+                "manual Master provenance already exists with different content"
+            )
+        return
+    write_atomic_bytes(target, raw)
+
+
+def _manual_master_invoker(
+    decision: MasterDecision,
+    *,
+    timeout_ms: int,
+) -> MasterInvoker:
+    raw = json.dumps(
+        to_wire_value(decision),
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    used = False
+
+    def invoke(options, prompt: str) -> str:
+        nonlocal used
+        if not used:
+            used = True
+            return raw
+        return invoke_master_provider(
+            options,
+            prompt,
+            timeout_ms=timeout_ms,
+        )
+
+    return invoke
+
+
 def run_coordinator(
     preflight: PreflightResult,
     client: OrcaClient,
@@ -1680,11 +2328,38 @@ def run_coordinator(
         controller, pool = _resume(preflight)
     else:
         controller, pool = _initialize(preflight, client)
-    return _run_loop(controller, pool, preflight, client)
+    manual = preflight.arguments.manual_master_decision
+    master_invoke = None
+    if manual is not None:
+        manual_checkpoint_ok = (
+            controller.state.step_stage is StepStage.ARTIFACT_VERIFIED
+            or controller.state.state is LoopState.INIT
+        )
+        if not manual_checkpoint_ok:
+            raise OrcaLoopError(
+                "manual Master override requires an INIT or "
+                "ARTIFACT_VERIFIED resume checkpoint"
+            )
+        validate_master_decision(manual)
+        _record_manual_master_override(controller, manual)
+        master_invoke = _manual_master_invoker(
+            manual,
+            timeout_ms=preflight.arguments.config.step_timeout_ms,
+        )
+    return _run_loop(
+        controller,
+        pool,
+        preflight,
+        client,
+        master_invoke=master_invoke,
+    )
 
 
 def exit_code(state: CoordinatorState) -> int:
-    if state.state is LoopState.READY_FOR_MERGE:
+    if state.state in {
+        LoopState.READY_FOR_MERGE,
+        LoopState.FINISHED_PLAN,
+    }:
         return EXIT_READY
     if state.state is LoopState.REJECTED:
         return EXIT_REJECTED
@@ -1704,7 +2379,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             argv,
             harness_root=harness_root,
         )
-        client = OrcaClient(cwd=harness_root)
+        if os.environ.get("ORCA_LOOP_RUNTIME") == "local":
+            client = LocalCoordinatorClient(
+                cwd=harness_root,
+                run_id=arguments.run_id,
+                coordinator_handle=arguments.config.coordinator_handle,
+            )
+        else:
+            try:
+                client = OrcaClient(cwd=harness_root)
+            except OrcaCommandError as exc:
+                raise PreflightError(str(exc)) from exc
         preflight = run_preflight(
             arguments,
             client,
@@ -1761,6 +2446,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         return EXIT_PREFLIGHT
+    except RecoverableMasterProviderError as exc:
+        print(
+            json.dumps(
+                {
+                    "status": "BLOCKED_PROVIDER",
+                    "failureLayer": "master_provider",
+                    "recoverable": True,
+                    "resumeAction": exc.resume_action,
+                    "phase": exc.phase,
+                    "error": str(exc),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return EXIT_USER_REQUIRED
     except (
         OrcaLoopError,
         OrcaCommandError,

@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from orca_loop.config import (
@@ -45,7 +46,11 @@ from orca_loop.models import (
     DecisionValue,
     EscalationCode,
     EscalationTrigger,
+    GateKind,
     InformationalFinding,
+    ImplementationArtifact,
+    ImplementationStatus,
+    ConsensusLedger,
     LoopState,
     MasterAction,
     MasterDecision,
@@ -58,6 +63,7 @@ from orca_loop.models import (
     SignalKind,
     StepExecutionResult,
     TestGateStatus as GateStatus,
+    TestFailureAttribution as FailureAttribution,
     TransitionSignal,
     WorkerKey,
 )
@@ -67,6 +73,7 @@ from run_loop import (
     EXIT_REJECTED,
     EXIT_RUNTIME_FAILURE,
     EXIT_USER_REQUIRED,
+    _gate_question,
     _initialize,
     _route_final_decision,
     _route_test_result,
@@ -74,6 +81,7 @@ from run_loop import (
     _validate_final_master_decision,
     _validate_test_result_master_decision,
     _validate_worker_completion_master_decision,
+    _validate_worker_supervision_master_decision,
     _resume,
     exit_code,
 )
@@ -85,6 +93,28 @@ from orca_loop.locking import (
 from tests.fakes import FakeOrcaClient
 from tests.test_coordinator import plan as coordinator_plan
 from tests.test_ledger import decision as ledger_decision, finding as ledger_finding
+
+
+class HumanGateQuestionTest(unittest.TestCase):
+    def test_e03_question_explains_decision_and_option_meanings(self) -> None:
+        trigger = EscalationTrigger(
+            EscalationCode.E03,
+            "external contract approval is required",
+            ("api-contract.md",),
+            "external-contract",
+        )
+        controller = SimpleNamespace(
+            state=SimpleNamespace(pending_escalations=(trigger,))
+        )
+        question = _gate_question(
+            controller,
+            GateKind.ESCALATION,
+            ("merge", "reject", "revise_design"),
+        )
+        self.assertIn("외부 API/스키마/계약 변경을 승인할지", question)
+        self.assertIn("merge=현재 방향을 승인하고 계속", question)
+        self.assertIn("reject=승인하지 않고 이 실행을 종료", question)
+        self.assertIn("revise_design=설계를 수정한 뒤 다시 검토", question)
 
 
 class CliConfigurationTest(unittest.TestCase):
@@ -180,7 +210,7 @@ class CliConfigurationTest(unittest.TestCase):
                     "--agent-effort",
                     "unknown=high",
                 )
-            with self.assertRaisesRegex(ConfigurationError, "claude or codex"):
+            with self.assertRaisesRegex(ConfigurationError, "claude, codex or web_gpt"):
                 self.arguments(
                     root,
                     "--agent-provider",
@@ -1560,20 +1590,6 @@ class RunEntryPointTest(unittest.TestCase):
                 for index, review in enumerate(nonclean_reviews)
             ),
             (
-                "result_escalation",
-                clean_review,
-                GateStatus.PASS,
-                coordinator_plan(),
-                (
-                    EscalationTrigger(
-                        code=EscalationCode.E01,
-                        reason="result requires escalation",
-                        evidence_refs=("result",),
-                        deduplication_key="phase13-result-escalation",
-                    ),
-                ),
-            ),
-            (
                 "risky_schema_plan",
                 clean_review,
                 GateStatus.PASS,
@@ -1641,6 +1657,112 @@ class RunEntryPointTest(unittest.TestCase):
                 self.assertEqual(1, len(observed_prompt))
                 self.assertIn('"role":"cross_confirmer"', observed_prompt[0])
                 self.assertNotIn('"action":"finish"', observed_prompt[0])
+
+    def test_worker_supervision_master_can_resolve_without_human_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            preflight = self._master_preflight(root)
+            controller, _ = _initialize(
+                preflight,
+                self._provision_client(),  # type: ignore[arg-type]
+                master_invoke=lambda _options, _prompt: (
+                    '{"action":"dispatch","role":"planner",'
+                    '"permissionProfile":"read_only",'
+                    '"reason":"re-plan using the existing repository evidence"}'
+                ),
+            )
+            controller.state = replace(controller.state, state=LoopState.IMPLEMENT)
+            trigger = EscalationTrigger(
+                code=EscalationCode.E08,
+                reason="approved plan must change",
+                evidence_refs=("implementation.json",),
+                deduplication_key="supervision-e08",
+            )
+            result = StepExecutionResult(
+                TransitionSignal(SignalKind.ESCALATE, "worker requested supervision", ()),
+                controller.ledger,
+                None,
+                (trigger,),
+            )
+            artifact = ImplementationArtifact(
+                schema_version=1,
+                run_id="run-1",
+                task_id="task-1",
+                dispatch_id="dispatch-1",
+                consensus_round=1,
+                snapshot_digest=controller.state.snapshot_digest,
+                status=ImplementationStatus.HALTED_FOR_ESCALATION,
+                addressed_findings=(),
+                changed_files=(),
+                summary="plan must change",
+                test_failure_attribution=FailureAttribution.NONE,
+                plan_change_required=True,
+                escalation_signals=(trigger,),
+            )
+            observed_prompt: list[str] = []
+
+            _route_worker_completion(
+                controller,
+                preflight,
+                Role.IMPLEMENTER,
+                result,
+                artifact,
+                master_invoke=lambda _options, prompt: (
+                    observed_prompt.append(prompt)
+                    or '{"action":"dispatch","role":"planner",'
+                    '"permissionProfile":"read_only",'
+                    '"reason":"re-plan using the existing repository evidence"}'
+                ),
+            )
+
+            self.assertEqual(LoopState.PLAN_REVISE, controller.state.state)
+            self.assertEqual((), controller.state.pending_escalations)
+            self.assertEqual(1, len(observed_prompt))
+            self.assertIn('"stage":"worker_supervision"', observed_prompt[0])
+            self.assertIn('"code":"E-08"', observed_prompt[0])
+            guidance = tuple(controller.workspace.control_dir.glob("master-guidance-g*.json"))
+            self.assertEqual(1, len(guidance))
+            guidance_value = json.loads(guidance[0].read_text(encoding="utf-8"))
+            self.assertEqual("PLAN_REVISE", guidance_value["targetState"])
+            self.assertEqual("planner", guidance_value["targetRole"])
+
+    def test_worker_supervision_e03_cannot_be_autonomously_approved(self) -> None:
+        trigger = EscalationTrigger(
+            code=EscalationCode.E03,
+            reason="external contract needs approval",
+            evidence_refs=("plan.json",),
+            deduplication_key="supervision-e03",
+        )
+        result = StepExecutionResult(
+            TransitionSignal(SignalKind.ESCALATE, "worker requested supervision", ()),
+            ConsensusLedger(1, "run-1", 0, (), 0, 0, (), (), ()),
+            None,
+            (trigger,),
+        )
+        with self.assertRaisesRegex(OrcaLoopError, "requires human escalation"):
+            _validate_worker_supervision_master_decision(
+                LoopState.PLAN,
+                MasterDecision(
+                    MasterAction.DISPATCH,
+                    Role.PLAN_REVIEWER,
+                    PermissionProfile.READ_ONLY,
+                    "approve contract locally",
+                ),
+                result,
+            )
+        self.assertIs(
+            SignalKind.ESCALATE,
+            _validate_worker_supervision_master_decision(
+                LoopState.PLAN,
+                MasterDecision(
+                    MasterAction.ESCALATE,
+                    None,
+                    None,
+                    "human owns the external contract decision",
+                ),
+                result,
+            ),
+        )
 
     def test_test_result_master_policy_matches_fixed_transitions(self) -> None:
         self.assertIsNone(

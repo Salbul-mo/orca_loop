@@ -29,6 +29,22 @@ Rules:
 7. If the decision context contains `allowedDecisions`, return exactly one of
    those listed action/role/permissionProfile combinations. Do not invent a
    transition that is not listed for the current stage.
+8. Worker `escalation_signals` are requests for Master supervision. They are
+   not automatic requests for human intervention.
+9. Resolve a worker supervision request yourself whenever the user request,
+   repository evidence, approved plan, coordinator policy, or a bounded
+   follow-up worker can determine a safe answer. Prefer an allowed
+   dispatch/test decision over `escalate` in those cases.
+10. Use `escalate` only when the remaining choice is genuinely human-owned:
+    conflicting or materially underspecified product requirements, an
+    irreversible/external/regulated approval, an unresolved security/auth
+    policy choice, a business/user preference that evidence cannot determine,
+    or uncertainty that cannot be reduced safely by another worker.
+11. Do not use `escalate` merely because a worker asked for supervision,
+    reported uncertainty, or encountered a difficult technical choice.
+12. When resolving a worker supervision request autonomously, make `reason`
+    an actionable bounded instruction. The Coordinator may pass that reason to
+    the next worker as Master guidance.
 
 The initial static Coordinator policy permits:
 

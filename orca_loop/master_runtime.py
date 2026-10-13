@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import os
 import signal
+import sys
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Callable, Mapping
 
@@ -23,6 +25,8 @@ class MasterRuntimeAdapterError(RuntimeError):
 
 MasterInvoker = Callable[[MasterRuntimeOptions, str], str]
 MAX_MASTER_TIMEOUT_MS = 14_400_000
+MASTER_PROVIDER_MAX_ATTEMPTS = 3
+MASTER_PROVIDER_BACKOFF_SECONDS = (0.25, 0.75)
 
 
 def build_master_command(options: MasterRuntimeOptions) -> tuple[str, ...]:
@@ -67,6 +71,11 @@ def build_master_command(options: MasterRuntimeOptions) -> tuple[str, ...]:
             "--ephemeral",
             "-",
         )
+    if options.provider is AgentProvider.WEB_GPT:
+        if options.model is not None or options.effort is not None:
+            raise MasterRuntimeAdapterError("web_gpt model and effort are selected in the browser")
+        adapter = Path(__file__).resolve().parents[1] / "tools" / "web_gpt_provider.py"
+        return (sys.executable, str(adapter.resolve()), "--role", "master")
     raise MasterRuntimeAdapterError(
         f"unsupported master provider: {options.provider}"
     )
@@ -89,7 +98,7 @@ def _terminate_tree(process: subprocess.Popen[bytes]) -> None:
         return
 
 
-def invoke_master_provider(
+def _invoke_master_provider_once(
     options: MasterRuntimeOptions,
     prompt: str,
     *,
@@ -142,6 +151,52 @@ def invoke_master_provider(
     return stdout
 
 
+def invoke_master_provider(
+    options: MasterRuntimeOptions,
+    prompt: str,
+    *,
+    timeout_ms: int,
+) -> str:
+    """Invoke Master with bounded retry while respecting one overall timeout."""
+    if not 1 <= timeout_ms <= MAX_MASTER_TIMEOUT_MS:
+        raise MasterRuntimeAdapterError(
+            f"timeout_ms must be 1..{MAX_MASTER_TIMEOUT_MS}"
+        )
+    deadline = time.monotonic() + (timeout_ms / 1000)
+    failures: list[str] = []
+    last_error: MasterRuntimeAdapterError | None = None
+    for attempt in range(1, MASTER_PROVIDER_MAX_ATTEMPTS + 1):
+        remaining_ms = (
+            timeout_ms
+            if attempt == 1
+            else int(max(0.0, deadline - time.monotonic()) * 1000)
+        )
+        if remaining_ms < 1:
+            break
+        try:
+            return _invoke_master_provider_once(
+                options,
+                prompt,
+                timeout_ms=remaining_ms,
+            )
+        except MasterRuntimeAdapterError as exc:
+            last_error = exc
+            failures.append(f"attempt {attempt}: {exc}")
+            if attempt >= MASTER_PROVIDER_MAX_ATTEMPTS:
+                break
+            delay = MASTER_PROVIDER_BACKOFF_SECONDS[
+                min(attempt - 1, len(MASTER_PROVIDER_BACKOFF_SECONDS) - 1)
+            ]
+            if time.monotonic() + delay >= deadline:
+                break
+            time.sleep(delay)
+    detail = " | ".join(failures) if failures else "overall timeout exhausted"
+    raise MasterRuntimeAdapterError(
+        "master provider invocation failed after "
+        f"{max(1, len(failures))} attempt(s): {detail}"
+    ) from last_error
+
+
 def render_master_prompt(
     template_path: Path,
     context: Mapping[str, object],
@@ -180,8 +235,13 @@ def invoke_master(
     prompt = render_master_prompt(template_path, context)
     try:
         raw = invoke(config.master, prompt)
+    except MasterRuntimeAdapterError:
+        raise
     except Exception as exc:
-        raise MasterRuntimeAdapterError("master provider invocation failed") from exc
+        raise MasterRuntimeAdapterError(
+            "master provider invocation failed: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
     if not isinstance(raw, str) or not raw.strip():
         raise MasterRuntimeAdapterError("master provider output must be nonempty text")
     try:

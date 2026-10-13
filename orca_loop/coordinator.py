@@ -612,6 +612,7 @@ def execute_worker_step(
         ledger=update.ledger,
         plan_version=plan_version,
         snapshot_digest=after_snapshot.snapshot_digest,
+        pending_escalations=update.escalations,
     )
     signal = TransitionSignal(
         (
@@ -678,10 +679,12 @@ def execute_evaluate(
         )
     escalations = list(update.escalations)
     view = ledger_view(update.ledger)
+    destructive_pending = False
     if (
         kind is ConsensusKind.PLAN
         and view.unresolved_count == 0
         and plan is not None
+        and not config.planning_only
     ):
         if plan.data_api_schema_changes.strip() not in {"", "없음", "none", "None"}:
             key = (
@@ -697,23 +700,13 @@ def execute_evaluate(
                         key,
                     )
                 )
-        destructive = tuple(
-            item
-            for item in plan.affected_files
-            if item.operation.value in {"delete", "rename"}
-        )
-        if destructive and destructive_approval is None:
-            escalations.append(
-                EscalationTrigger(
-                    EscalationCode.E03,
-                    "planned delete or rename requires destructive approval",
-                    tuple(item.path for item in destructive),
-                    (
-                        f"E-03:destructive:{plan.plan_version}:"
-                        f"{evidence.artifact_digests[0]}"
-                    ),
-                )
+        destructive_pending = (
+            destructive_approval is None
+            and any(
+                item.operation.value in {"delete", "rename"}
+                for item in plan.affected_files
             )
+        )
     if escalations:
         return StepExecutionResult(
             TransitionSignal(
@@ -728,6 +721,17 @@ def execute_evaluate(
             update.ledger,
             None,
             tuple(escalations),
+        )
+    if destructive_pending:
+        return StepExecutionResult(
+            TransitionSignal(
+                SignalKind.ESCALATE,
+                "planned delete or rename requires destructive approval",
+                (),
+            ),
+            update.ledger,
+            None,
+            (),
         )
     signal_kind = (
         SignalKind.UNRESOLVED_ZERO
@@ -880,6 +884,24 @@ def commit_step_transition(
     result: StepExecutionResult,
     config: LoopConfig,
 ) -> CoordinatorState:
+    if (
+        config.planning_only
+        and controller.state.state is LoopState.PLAN_CONSENSUS_EVALUATE
+        and result.signal.kind is SignalKind.UNRESOLVED_ZERO
+        and ledger_view(result.ledger).unresolved_count == 0
+    ):
+        return controller.commit(
+            stage=StepStage.TRANSITION_COMMITTED,
+            active=None,
+            reason="planning-only plan consensus reached",
+            signal=result.signal.kind,
+            state_value=LoopState.FINISHED_PLAN,
+            status=RunStatus.READY,
+            ledger=result.ledger,
+            counters=controller.state.counters,
+            test_gate_status=result.test_gate_status,
+            pending_escalations=(),
+        )
     outcome = transition(
         controller.state.state,
         result.signal,
@@ -891,7 +913,10 @@ def commit_step_transition(
         operational_retry_limit=config.operational_retry_limit,
     )
     status = RunStatus.IN_PROGRESS
-    if outcome.next_state is LoopState.READY_FOR_MERGE:
+    if outcome.next_state in {
+        LoopState.READY_FOR_MERGE,
+        LoopState.FINISHED_PLAN,
+    }:
         status = RunStatus.READY
     elif outcome.next_state is LoopState.REJECTED:
         status = RunStatus.REJECTED
