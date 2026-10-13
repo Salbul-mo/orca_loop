@@ -1,0 +1,23 @@
+{
+  "allowed_commands": [
+    {
+      "argv": [
+        "C:/Program Files/PowerShell/7/pwsh.exe",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "C:/Users/mhj/Desktop/mhj_workspace/personal/orca_harness/tools/run-media-mock-smoke.ps1"
+      ],
+      "cwd": "mock/media-server",
+      "timeout_ms": 120000,
+      "kind": "integration"
+    }
+  ],
+  "allowed_env_keys": [],
+  "allowed_output_paths": [],
+  "approved_kinds": [
+    "integration"
+  ],
+  "policy_digest": "sha256:b42a73577b48c6d5c67272bd4cb9322007dd0985a05a0abab6cbd07670d8b8fa"
+}
