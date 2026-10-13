@@ -7,3 +7,8 @@ dist/
 build/
 runs/
 *.log
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/runs/codex-mhj_26_09_22_05_graft-cache/
+# Graft 0.12.1 stores runtime statistics here even with a custom --dir.
+/graft/
