@@ -1,0 +1,360 @@
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import time
+import uuid
+from pathlib import Path
+from typing import Sequence
+
+from .models import OrcaResponse
+from .orca_client import OrcaCommandError
+
+
+LOCAL_RUNTIME_VERSION = "1.4.159"
+
+
+def _option(argv: Sequence[str], name: str) -> str | None:
+    try:
+        index = argv.index(name)
+    except ValueError:
+        return None
+    if index + 1 >= len(argv):
+        raise OrcaCommandError(f"missing value for {name}")
+    return argv[index + 1]
+
+
+class LocalCoordinatorClient:
+    """Orca transport replacement used by the Web GPT-only loop.
+
+    Contracts, snapshots, provenance validation, consensus and human gates stay
+    in the existing coordinator. This class replaces only terminal/task/message
+    transport with local logical terminals and a filesystem completion queue.
+    """
+
+    executable = "<local-runtime>"
+
+    def __init__(
+        self,
+        *,
+        cwd: Path,
+        run_id: str,
+        coordinator_handle: str,
+    ) -> None:
+        self.cwd = cwd.resolve()
+        self.run_id = run_id
+        self.coordinator_handle = coordinator_handle
+        self.runtime_root = (
+            self.cwd / "runs" / ".local-runtime" / run_id
+        ).resolve()
+        self.completion_dir = self.runtime_root / "messages"
+        self.gate_dir = self.runtime_root / "gates"
+        self.state_path = self.runtime_root / "state.json"
+
+    def _initial_state(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "run_id": self.run_id,
+            "terminals": {
+                self.coordinator_handle: {
+                    "handle": self.coordinator_handle,
+                    "kind": "coordinator",
+                }
+            },
+            "tasks": {},
+            "dispatches": {},
+            "terminal_counter": 0,
+        }
+
+    def _response(self, value: dict[str, object]) -> OrcaResponse:
+        raw = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return OrcaResponse(raw, raw, "")
+
+    def _load_state(self) -> dict[str, object]:
+        if not self.state_path.exists():
+            return self._initial_state()
+        try:
+            value = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise OrcaCommandError("local runtime state is unreadable") from exc
+        if not isinstance(value, dict):
+            raise OrcaCommandError("local runtime state must be an object")
+        terminals = value.setdefault("terminals", {})
+        if isinstance(terminals, dict):
+            terminals.setdefault(
+                self.coordinator_handle,
+                {
+                    "handle": self.coordinator_handle,
+                    "kind": "coordinator",
+                },
+            )
+        return value
+
+    def _save_state(self, value: dict[str, object]) -> None:
+        self.runtime_root.mkdir(parents=True, exist_ok=True)
+        temporary = self.state_path.with_name(self.state_path.name + ".tmp")
+        temporary.write_text(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(self.state_path)
+
+    def _terminal(self, argv: tuple[str, ...]) -> OrcaResponse:
+        action = argv[1] if len(argv) > 1 else ""
+        state = self._load_state()
+        terminals = state.get("terminals")
+        if not isinstance(terminals, dict):
+            raise OrcaCommandError("local terminal state is invalid")
+        if action == "create":
+            worktree = _option(argv, "--worktree")
+            if not worktree:
+                raise OrcaCommandError("local terminal create requires worktree")
+            counter = int(state.get("terminal_counter", 0)) + 1
+            state["terminal_counter"] = counter
+            handle = f"local-{self.run_id}-worker-{counter}"
+            terminal = {
+                "handle": handle,
+                "worktreeId": worktree,
+                "tabId": f"local-tab-{counter}",
+                "leafId": f"local-leaf-{counter}",
+                "title": _option(argv, "--title") or "",
+            }
+            terminals[handle] = terminal
+            self._save_state(state)
+            return self._response({"terminal": terminal})
+        if action == "show":
+            handle = _option(argv, "--terminal")
+            if not handle or handle not in terminals:
+                raise OrcaCommandError(
+                    f"local terminal does not exist: {handle or '<missing>'}"
+                )
+            terminal = terminals[handle]
+            return self._response(
+                {
+                    "terminal": (
+                        terminal
+                        if isinstance(terminal, dict)
+                        else {"handle": handle}
+                    )
+                }
+            )
+        if action == "send":
+            handle = _option(argv, "--terminal")
+            text = _option(argv, "--text")
+            if not handle or handle not in terminals:
+                raise OrcaCommandError("local terminal send target is unknown")
+            if not text:
+                raise OrcaCommandError("local terminal send text is empty")
+            shell = Path(r"C:\Program Files\PowerShell\7\pwsh.exe")
+            executable = (
+                str(shell)
+                if shell.is_file()
+                else (shutil.which("pwsh") or shutil.which("powershell"))
+            )
+            if not executable:
+                raise OrcaCommandError(
+                    "PowerShell is unavailable for local worker launch"
+                )
+            creationflags = (
+                subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+            )
+            subprocess.Popen(
+                (
+                    executable,
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    text,
+                ),
+                cwd=self.cwd,
+                shell=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+                start_new_session=os.name != "nt",
+            )
+            return self._response({"sent": True, "terminal": handle})
+        raise OrcaCommandError(f"unsupported local terminal action: {action}")
+
+    def _task_create(self, argv: tuple[str, ...]) -> OrcaResponse:
+        state = self._load_state()
+        tasks = state.setdefault("tasks", {})
+        if not isinstance(tasks, dict):
+            raise OrcaCommandError("local task state is invalid")
+        task_id = "local-task-" + uuid.uuid4().hex
+        tasks[task_id] = {
+            "id": task_id,
+            "title": _option(argv, "--task-title") or "",
+            "displayName": _option(argv, "--display-name") or "",
+            "spec": _option(argv, "--spec") or "",
+        }
+        self._save_state(state)
+        return self._response({"task": {"id": task_id}})
+
+    def _dispatch(self, argv: tuple[str, ...]) -> OrcaResponse:
+        task_id = _option(argv, "--task")
+        target = _option(argv, "--to")
+        source = _option(argv, "--from")
+        state = self._load_state()
+        tasks = state.get("tasks")
+        terminals = state.get("terminals")
+        if not isinstance(tasks, dict) or not task_id or task_id not in tasks:
+            raise OrcaCommandError(
+                "local dispatch references an unknown task"
+            )
+        if (
+            not isinstance(terminals, dict)
+            or not target
+            or target not in terminals
+        ):
+            raise OrcaCommandError(
+                "local dispatch references an unknown worker"
+            )
+        if source != self.coordinator_handle:
+            raise OrcaCommandError(
+                "local dispatch source is not the coordinator"
+            )
+        dispatch_id = "local-dispatch-" + uuid.uuid4().hex
+        dispatches = state.setdefault("dispatches", {})
+        if not isinstance(dispatches, dict):
+            raise OrcaCommandError("local dispatch state is invalid")
+        dispatches[dispatch_id] = {
+            "id": dispatch_id,
+            "taskId": task_id,
+            "to": target,
+            "from": source,
+        }
+        self._save_state(state)
+        preamble = (
+            "LOCAL ORCA DISPATCH PROVENANCE\n"
+            f"task_id={task_id}\n"
+            f"dispatch_id={dispatch_id}\n"
+            "Use these task_id and dispatch_id values verbatim in the JSON artifact."
+        )
+        return self._response(
+            {"dispatch": {"id": dispatch_id}, "preamble": preamble}
+        )
+
+    def _check(self, argv: tuple[str, ...]) -> OrcaResponse:
+        raw_types = _option(argv, "--types") or ""
+        accepted = {item for item in raw_types.split(",") if item}
+        raw_wait = _option(argv, "--timeout-ms")
+        wait_ms = int(raw_wait) if raw_wait and raw_wait.isdigit() else 0
+        deadline = time.monotonic() + wait_ms / 1000
+        while True:
+            messages: list[dict[str, object]] = []
+            for path in sorted(self.completion_dir.glob("*.json")):
+                try:
+                    value = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if not isinstance(value, dict):
+                    continue
+                message = value.get("message", value)
+                message_type = (
+                    message.get("type")
+                    if isinstance(message, dict)
+                    else None
+                )
+                if accepted and message_type not in accepted:
+                    continue
+                messages.append(value)
+                archive = self.completion_dir / "archive"
+                archive.mkdir(exist_ok=True)
+                path.replace(archive / path.name)
+            if messages or time.monotonic() >= deadline:
+                return self._response({"messages": messages})
+            time.sleep(0.1)
+
+    def _gate_create(self, argv: tuple[str, ...]) -> OrcaResponse:
+        task_id = _option(argv, "--task")
+        if not task_id:
+            raise OrcaCommandError("local gate requires a task")
+        gate_id = "local-gate-" + uuid.uuid4().hex
+        try:
+            options = json.loads(_option(argv, "--options") or "[]")
+        except json.JSONDecodeError as exc:
+            raise OrcaCommandError("local gate options are malformed") from exc
+        gate = {
+            "id": gate_id,
+            "taskId": task_id,
+            "question": _option(argv, "--question") or "",
+            "options": options,
+            "status": "pending",
+        }
+        self.gate_dir.mkdir(parents=True, exist_ok=True)
+        path = self.gate_dir / f"{gate_id}.json"
+        path.write_text(
+            json.dumps(gate, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return self._response({"id": gate_id, "taskId": task_id})
+
+    def _gate_list(self, argv: tuple[str, ...]) -> OrcaResponse:
+        task_id = _option(argv, "--task")
+        status = _option(argv, "--status")
+        gates: list[dict[str, object]] = []
+        for path in sorted(self.gate_dir.glob("*.json")):
+            try:
+                gate = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(gate, dict):
+                continue
+            if task_id and gate.get("taskId") != task_id:
+                continue
+            if status and gate.get("status") != status:
+                continue
+            gates.append(gate)
+        return self._response({"gates": gates})
+
+    def call(
+        self,
+        argv: Sequence[str],
+        *,
+        timeout_ms: int,
+    ) -> OrcaResponse:
+        del timeout_ms
+        args = tuple(argv)
+        if args == ("status",):
+            return self._response(
+                {
+                    "runtime": {
+                        "state": "ready",
+                        "reachable": True,
+                        "appVersion": LOCAL_RUNTIME_VERSION,
+                    },
+                    "graph": {"state": "ready"},
+                    "transport": "local",
+                }
+            )
+        if args[:1] == ("terminal",):
+            return self._terminal(args)
+        if args[:2] == ("orchestration", "task-create"):
+            return self._task_create(args)
+        if args[:2] == ("orchestration", "dispatch"):
+            return self._dispatch(args)
+        if args[:2] == ("orchestration", "check"):
+            return self._check(args)
+        if args[:2] == ("orchestration", "gate-create"):
+            return self._gate_create(args)
+        if args[:2] == ("orchestration", "gate-list"):
+            return self._gate_list(args)
+        raise OrcaCommandError(
+            "unsupported local coordinator command: " + " ".join(args)
+        )

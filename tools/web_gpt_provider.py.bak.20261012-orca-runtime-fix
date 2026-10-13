@@ -1,0 +1,159 @@
+"""Explicitly authorized local-bridge adapter for web ChatGPT Orca roles.
+
+The bridge and Chrome extension own conversation creation and attribution. This
+program never uses browser cookies or attempts to infer an active conversation.
+Its stdin/stdout protocol matches the existing deterministic Orca wrappers.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+ROLES = (
+    "master", "planner", "plan_reviewer", "implementer",
+    "code_reviewer", "cross_confirmer",
+)
+
+
+class BrowserProviderError(RuntimeError):
+    pass
+
+
+def _endpoint() -> str:
+    raw = os.environ.get("ORCA_WEB_AGENT_BRIDGE_URL", "http://127.0.0.1:8765")
+    parsed = urllib.parse.urlsplit(raw)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or not parsed.port
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise BrowserProviderError("bridge URL must be loopback HTTP with an explicit port")
+    return raw.rstrip("/")
+
+
+def _request(endpoint: str, token: str, method: str, path: str, payload=None) -> dict:
+    raw = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        endpoint + path,
+        data=raw,
+        method=method,
+        headers={
+            "x-orca-web-agent-token": token,
+            "content-type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            value = json.load(response)
+    except urllib.error.HTTPError as exc:
+        raise BrowserProviderError(
+            "bridge rejected request (HTTP " + str(exc.code) + ")"
+        ) from exc
+    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        raise BrowserProviderError("browser bridge is unavailable or returned invalid JSON") from exc
+    if not isinstance(value, dict) or not isinstance(value.get("job"), dict):
+        raise BrowserProviderError("bridge response does not contain a job")
+    return value["job"]
+
+
+def invoke(role: str, prompt: str, timeout_seconds: float, *,
+           terminal_policy: str | None = None,
+           proof_sha256: str | None = None) -> str:
+    if role not in ROLES:
+        raise BrowserProviderError("unrecognized web agent role")
+    if not prompt.strip():
+        raise BrowserProviderError("empty agent prompt")
+    token = os.environ.get("ORCA_WEB_AGENT_TOKEN", "")
+    if len(token) < 32:
+        token = os.environ.get("MCP_WEB_AGENT_CONTROL_TOKEN", "")
+    if len(token) < 32:
+        raise BrowserProviderError(
+            "ORCA_WEB_AGENT_TOKEN or inherited MCP web-agent control token "
+            "must be available"
+        )
+    if terminal_policy not in (None, "sentinel_dom", "orca_terminal", "read_tool_probe", "multi_read_probe", "inspect_read_probe"):
+        raise BrowserProviderError("unsupported browser terminal policy")
+    if terminal_policy in ("read_tool_probe", "multi_read_probe", "inspect_read_probe"):
+        import re
+        if role != "planner" or not isinstance(proof_sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", proof_sha256):
+            raise BrowserProviderError("read-only tool verification requires a valid private SHA-256")
+    elif proof_sha256 is not None:
+        raise BrowserProviderError("SHA-256 proof is reserved for read-only tool verification")
+    endpoint = _endpoint()
+    payload = {"role": role, "prompt": prompt}
+    if terminal_policy:
+        payload["terminalPolicy"] = terminal_policy
+    if proof_sha256 is not None:
+        payload["proofSha256"] = proof_sha256
+    job = _request(endpoint, token, "POST", "/automation/jobs", payload)
+    job_id = job.get("id")
+    if not isinstance(job_id, str) or not job_id:
+        raise BrowserProviderError("bridge failed to assign a job id")
+    # stderr is human-facing diagnostic only; never print the credential/prompt.
+    print("web_agent job id: " + job_id, file=sys.stderr, flush=True)
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        while time.monotonic() < deadline:
+            job = _request(endpoint, token, "GET", "/automation/jobs/" + job_id)
+            state = job.get("state")
+            if state == "completed":
+                result = job.get("result")
+                if not isinstance(result, str) or not result.strip():
+                    raise BrowserProviderError("completed browser job has no result")
+                return result
+            if state in {"failed", "cancelled"}:
+                raise BrowserProviderError(
+                    "web agent " + str(state) + ": " + str(job.get("error") or "no details")
+                )
+            if state not in {"pending", "running"}:
+                raise BrowserProviderError("bridge returned an unknown web agent state")
+            time.sleep(min(1.5, max(0.05, deadline - time.monotonic())))
+    except KeyboardInterrupt:
+        _request(endpoint, token, "POST", "/automation/jobs/" + job_id + "/cancel", {})
+        raise
+    # Best effort: marking the task cancelled prevents any subsequent result
+    # from being promoted, though an in-flight ChatGPT turn cannot be recalled.
+    try:
+        _request(endpoint, token, "POST", "/automation/jobs/" + job_id + "/cancel", {})
+    except BrowserProviderError:
+        pass
+    raise BrowserProviderError("web agent timed out")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--role", choices=ROLES, required=True)
+    # Consumed by dispatcher._profile_working_directory; not a permission grant.
+    parser.add_argument("--add-dir", default=None)
+    options = parser.parse_args()
+    try:
+        timeout = float(os.environ.get("ORCA_WEB_AGENT_TIMEOUT_SECONDS", "3600"))
+        if not 1 <= timeout <= 14400:
+            raise BrowserProviderError("invalid ORCA_WEB_AGENT_TIMEOUT_SECONDS")
+        output = invoke(
+            options.role,
+            sys.stdin.read(),
+            timeout,
+            terminal_policy="orca_terminal",
+        )
+        sys.stdout.write(output + "\n")
+        sys.stdout.flush()
+        return 0
+    except BrowserProviderError as exc:
+        print("web agent error: " + str(exc), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

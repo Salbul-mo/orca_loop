@@ -1,0 +1,407 @@
+"""Web GPT preset, Orca dry-run and worker-boundary integration tests."""
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import io
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import threading
+import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+TOOLS = ROOT / "tools"
+sys.path.insert(0, str(TOOLS))
+
+import run_web_gpt_loop
+import worker_runner
+from orca_loop.models import OrcaResponse, WorkerKey
+from orca_loop.orca_client import OrcaCommandError
+
+DEMO_SECRET = "integration-test-bridge-secret-1234567890123456"
+
+
+class StubBrowserBridge(BaseHTTPRequestHandler):
+    received_roles: list[str] = []
+    received_policies: list[str | None] = []
+    def log_message(self, _format: str, *_args: object) -> None:
+        pass
+
+    def respond(self, status: int, body: dict[str, object]) -> None:
+        raw = json.dumps(body).encode("utf-8")
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_POST(self) -> None:
+        if self.headers.get("x-orca-web-agent-token") != DEMO_SECRET:
+            return self.respond(401, {"error": "unauthorized"})
+        if self.path != "/automation/jobs":
+            return self.respond(404, {"error": "not_found"})
+        size = int(self.headers.get("content-length", "0"))
+        body = json.loads(self.rfile.read(size))
+        if not body.get("prompt"):
+            return self.respond(422, {"error": "no_prompt"})
+        self.received_roles.append(str(body["role"]))
+        self.received_policies.append(body.get("terminalPolicy"))
+        return self.respond(202, {"job": {"id": "test-browser-job-1", "state": "pending"}})
+
+    def do_GET(self) -> None:
+        if self.headers.get("x-orca-web-agent-token") != DEMO_SECRET:
+            return self.respond(401, {"error": "unauthorized"})
+        if self.path != "/automation/jobs/test-browser-job-1":
+            return self.respond(404, {"error": "not_found"})
+        return self.respond(200, {"job": {
+            "id": "test-browser-job-1",
+            "state": "completed",
+            "result": '{"schema_version":1,"summary":"Web GPT worker result"}',
+        }})
+
+
+class FakeOrcaClient:
+    """Preflight-only fake; does NOT claim real Orca desktop integration."""
+    def call(self, argv: tuple[str, ...], *, timeout_ms: int) -> OrcaResponse:
+        if argv == ("status",):
+            data = {
+                "runtime": {"state": "ready", "reachable": True,
+                            "appVersion": "1.4.159"},
+                "graph": {"state": "ready"},
+            }
+        elif argv[:2] == ("terminal", "show"):
+            data = {"terminal": {"handle": "fixture-coordinator"}}
+        else:
+            raise AssertionError("unexpected Orca CLI call: " + repr(argv))
+        return OrcaResponse(json.dumps(data), "", "")
+
+
+def git_fixture(root: Path) -> tuple[Path, Path]:
+    source = root / "independent-target"
+    source.mkdir()
+    commands = (
+        ("git", "init"),
+        ("git", "config", "user.email", "integration@example.invalid"),
+        ("git", "config", "user.name", "Integration Fixture"),
+    )
+    for command in commands:
+        subprocess.run(command, cwd=source, check=True, capture_output=True)
+    request = source / "request.md"
+    request.write_text("Read-only review of this disposable fixture.\n",
+                       encoding="utf-8")
+    subprocess.run(("git", "add", "request.md"),
+                   cwd=source, check=True, capture_output=True)
+    subprocess.run(("git", "commit", "-m", "temporary test fixture"),
+                   cwd=source, check=True, capture_output=True)
+    return source, request
+
+
+class WebGptLaunchTest(unittest.TestCase):
+    def test_preset_configures_master_and_all_workers(self) -> None:
+        config = run_web_gpt_loop.validate_preset()
+        self.assertEqual(config["master"], "web_gpt")
+        self.assertEqual(len(WorkerKey), len(config["workers"]))
+        self.assertEqual({"web_gpt"}, set(config["workers"].values()))
+        self.assertEqual(0, run_web_gpt_loop.main(["--check-config"]))
+
+    def test_real_run_loop_dry_run_with_simulated_orca_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            target, request = git_fixture(Path(temp))
+            args = [
+                "--run-id", "web-gpt-dry-fixture",
+                "--request", str(request),
+                "--worktree", str(target),
+                "--coordinator-handle", "fixture-coordinator",
+                "--dry-run",
+            ]
+            with patch("run_loop.OrcaClient", return_value=FakeOrcaClient()):
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    code = run_web_gpt_loop.main(args)
+                self.assertEqual(code, 0, output.getvalue())
+                result = json.loads(output.getvalue())
+                self.assertEqual(result["mode"], "dry-run")
+                self.assertEqual(result["status"], "PASS")
+                self.assertEqual(result["run_id"], "web-gpt-dry-fixture")
+
+    def test_missing_real_orca_cli_is_reported_as_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            target, request = git_fixture(Path(temp))
+            args = [
+                "--run-id", "web-gpt-missing-cli-fixture",
+                "--request", str(request),
+                "--worktree", str(target),
+                "--coordinator-handle", "fixture-coordinator",
+                "--dry-run",
+            ]
+            with patch(
+                "run_loop.OrcaClient",
+                side_effect=OrcaCommandError(
+                    "selected Orca executable is not on PATH: orca"
+                ),
+            ):
+                error = io.StringIO()
+                with contextlib.redirect_stderr(error):
+                    code = run_web_gpt_loop.main(args)
+            self.assertEqual(code, 2)
+            self.assertEqual(json.loads(error.getvalue())["status"], "BLOCKED")
+
+    def test_live_run_requires_token_without_leaking_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            target, request = git_fixture(Path(temp))
+            args = [
+                "--request", str(request),
+                "--worktree", str(target),
+                "--coordinator-handle", "fixture-coordinator",
+            ]
+            with patch.dict(os.environ, {"ORCA_WEB_AGENT_TOKEN": ""}):
+                error = io.StringIO()
+                with contextlib.redirect_stderr(error):
+                    code = run_web_gpt_loop.main(args)
+            self.assertEqual(code, 2)
+            self.assertIn("ORCA_WEB_AGENT_TOKEN", error.getvalue())
+
+    def test_variable_answer_no_tools_probe_uses_scoped_completion_protocol(self) -> None:
+        with patch("run_web_gpt_loop.secrets.randbelow", side_effect=[3, 5]):
+            with patch("run_web_gpt_loop.invoke", return_value="48") as run:
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(run_web_gpt_loop.main(["--probe-general"]), 0)
+                self.assertEqual(json.loads(out.getvalue())["mode"], "generic-no-tools")
+                args, kwargs = run.call_args
+                self.assertEqual(args[0], "planner")
+                self.assertIn("23 + 25", args[1])
+                self.assertEqual(kwargs["terminal_policy"], "sentinel_dom")
+
+    def test_multiline_probe_requires_original_paragraph_boundaries(self) -> None:
+        expected = "FIRST_CAFEBABE\n\nSECOND_CAFEBABE\n\nTHIRD_CAFEBABE"
+        with patch("run_web_gpt_loop.secrets.token_hex", return_value="cafebabe"):
+            with patch("run_web_gpt_loop.invoke", return_value=expected) as invoke:
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(run_web_gpt_loop.main(["--probe-format"]), 0)
+                self.assertEqual(json.loads(output.getvalue())["mode"], "multiline-no-tools")
+                args, kwargs = invoke.call_args
+                self.assertIn(expected, args[1])
+                self.assertEqual(kwargs["terminal_policy"], "sentinel_dom")
+            with patch("run_web_gpt_loop.invoke",
+                       return_value=expected.replace("\n", "")):
+                output = io.StringIO()
+                with contextlib.redirect_stderr(output):
+                    self.assertEqual(run_web_gpt_loop.main(["--probe-format"]), 2)
+                self.assertIn("paragraph boundaries", output.getvalue())
+
+    def test_read_only_tool_probe_uses_unpublished_ephemeral_file_proof(self) -> None:
+        secret = "d" * 48
+        checked = []
+        def tool_stub(role, prompt, timeout, *, terminal_policy, proof_sha256):
+            self.assertEqual(role, "planner")
+            self.assertEqual(terminal_policy, "read_tool_probe")
+            self.assertEqual(proof_sha256, hashlib.sha256(secret.encode("ascii")).hexdigest())
+            self.assertNotIn(secret, prompt)
+            location = prompt.split("file at: ", 1)[1].split("\n", 1)[0]
+            file = Path(location)
+            self.assertTrue(file.exists())
+            self.assertEqual(file.read_text(encoding="ascii"), secret)
+            checked.append(file)
+            return secret
+        with patch("run_web_gpt_loop.secrets.token_hex", return_value=secret):
+            with patch("run_web_gpt_loop.invoke", side_effect=tool_stub):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(run_web_gpt_loop.main(["--probe-read-tool"]), 0)
+        self.assertEqual(json.loads(out.getvalue())["mode"], "real-read-only-mcp-tool")
+        self.assertEqual(len(checked), 1)
+        self.assertFalse(checked[0].exists())
+
+    def test_multi_read_probe_requires_directory_then_file_and_cleans_fixture(self) -> None:
+        secret = "e" * 48
+        checked: list[tuple[Path, Path]] = []
+
+        def multi_stub(role, prompt, timeout, *, terminal_policy, proof_sha256):
+            self.assertEqual(role, "planner")
+            self.assertEqual(terminal_policy, "multi_read_probe")
+            self.assertEqual(
+                proof_sha256,
+                hashlib.sha256(secret.encode("ascii")).hexdigest(),
+            )
+            self.assertNotIn(secret, prompt)
+            directory = Path(
+                prompt.split("temporary directory at: ", 1)[1].split("\n", 1)[0]
+            )
+            file = Path(
+                prompt.split("temporary file at: ", 1)[1].split("\n", 1)[0]
+            )
+            self.assertTrue(directory.is_dir())
+            self.assertEqual(file.parent, directory)
+            self.assertTrue(file.is_file())
+            self.assertEqual(file.read_text(encoding="ascii"), secret)
+            self.assertLess(
+                prompt.index("list_directory"),
+                prompt.index("read_file"),
+            )
+            checked.append((directory, file))
+            return secret
+
+        with patch("run_web_gpt_loop.secrets.token_hex", return_value=secret):
+            with patch("run_web_gpt_loop.invoke", side_effect=multi_stub):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(
+                        run_web_gpt_loop.main(["--probe-multi-read-tool"]), 0
+                    )
+        self.assertEqual(
+            json.loads(out.getvalue())["mode"],
+            "real-multi-read-only-mcp-tools",
+        )
+        self.assertEqual(len(checked), 1)
+        self.assertFalse(checked[0][0].exists())
+        self.assertFalse(checked[0][1].exists())
+
+    def test_inspect_read_probe_requires_list_stat_read_and_cleans_fixture(self) -> None:
+        secret = "f" * 48
+        checked: list[tuple[Path, Path]] = []
+
+        def inspect_stub(role, prompt, timeout, *, terminal_policy, proof_sha256):
+            self.assertEqual(role, "planner")
+            self.assertEqual(terminal_policy, "inspect_read_probe")
+            self.assertEqual(
+                proof_sha256,
+                hashlib.sha256(secret.encode("ascii")).hexdigest(),
+            )
+            self.assertNotIn(secret, prompt)
+            directory = Path(
+                prompt.split("temporary directory at: ", 1)[1].split("\n", 1)[0]
+            )
+            stat_file = Path(
+                prompt.split("stat_path tool on the exact temporary file at: ", 1)[1]
+                .split("\n", 1)[0]
+            )
+            read_file = Path(
+                prompt.split("read_file tool to read the exact temporary file at: ", 1)[1]
+                .split("\n", 1)[0]
+            )
+            self.assertEqual(stat_file, read_file)
+            self.assertEqual(stat_file.parent, directory)
+            self.assertTrue(directory.is_dir())
+            self.assertTrue(read_file.is_file())
+            self.assertEqual(read_file.read_text(encoding="ascii"), secret)
+            self.assertLess(prompt.index("list_directory"), prompt.index("stat_path"))
+            self.assertLess(prompt.index("stat_path"), prompt.index("read_file"))
+            checked.append((directory, read_file))
+            return secret
+
+        with patch("run_web_gpt_loop.secrets.token_hex", return_value=secret):
+            with patch("run_web_gpt_loop.invoke", side_effect=inspect_stub):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(
+                        run_web_gpt_loop.main(["--probe-inspect-read-tool"]), 0
+                    )
+        self.assertEqual(
+            json.loads(out.getvalue())["mode"],
+            "real-inspect-read-only-mcp-tools",
+        )
+        self.assertEqual(len(checked), 1)
+        self.assertFalse(checked[0][0].exists())
+        self.assertFalse(checked[0][1].exists())
+
+    def test_read_only_tool_probe_rejects_fabricated_file_content(self) -> None:
+        with patch("run_web_gpt_loop.secrets.token_hex", return_value="d" * 48):
+            with patch("run_web_gpt_loop.invoke", return_value="FAKE_CONTENT"):
+                error = io.StringIO()
+                with contextlib.redirect_stderr(error):
+                    self.assertEqual(run_web_gpt_loop.main(["--probe-read-tool"]), 2)
+                self.assertIn("incorrect temporary file token", error.getvalue())
+                self.assertNotIn("d" * 48, error.getvalue())
+
+    def test_provider_only_sends_terminal_policy_when_opted_in(self) -> None:
+        from tools.web_gpt_provider import invoke
+        StubBrowserBridge.received_policies.clear()
+        server = ThreadingHTTPServer(("127.0.0.1", 0), StubBrowserBridge)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            env = {
+                "ORCA_WEB_AGENT_TOKEN": DEMO_SECRET,
+                "ORCA_WEB_AGENT_BRIDGE_URL": "http://127.0.0.1:" + str(server.server_port),
+            }
+            with patch.dict(os.environ, env):
+                self.assertTrue(invoke("planner", "ordinary", 5))
+                self.assertTrue(invoke("planner", "read-only no-tools", 5,
+                                       terminal_policy="sentinel_dom"))
+                self.assertTrue(invoke("planner", "multi read", 5,
+                                       terminal_policy="multi_read_probe",
+                                       proof_sha256="a" * 64))
+            self.assertEqual(
+                StubBrowserBridge.received_policies,
+                [None, "sentinel_dom", "multi_read_probe"],
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
+    def test_provider_and_worker_runner_share_existing_artifact_contract(self) -> None:
+        StubBrowserBridge.received_roles.clear()
+        server = ThreadingHTTPServer(("127.0.0.1", 0), StubBrowserBridge)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                contract = root / "contract.md"
+                contract.write_text("IMPLEMENTER CONTRACT\nProvide JSON.\n", encoding="utf-8")
+                output = root / "out" / "implementation.json"
+                adapter = TOOLS / "web_gpt_provider.py"
+                env = {
+                    "ORCA_WEB_AGENT_TOKEN": DEMO_SECRET,
+                    "ORCA_WEB_AGENT_BRIDGE_URL":
+                        "http://127.0.0.1:" + str(server.server_port),
+                    "ORCA_WEB_AGENT_TIMEOUT_SECONDS": "10",
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                }
+                job = {
+                    "contract_path": str(contract),
+                    "output_path": str(output),
+                    "profile_command": [
+                        sys.executable, str(adapter), "--role", "implementer",
+                        "--add-dir", str(root),
+                    ],
+                    "agent_cwd": str(root),
+                    "timeout_ms": 20_000,
+                    "preamble": "task_id=test-web-worker",
+                    "task_id": "test-web-worker",
+                    "dispatch_id": "test-web-dispatch",
+                    "coordinator_handle": "test-coordinator",
+                    "worker_handle": "test-worker",
+                    "orca_executable": "stub-orca",
+                }
+                with patch.dict(os.environ, env), patch.object(
+                    worker_runner, "_send"
+                ) as send:
+                    result = worker_runner.run_job(job)
+                self.assertEqual(result["status"], "PASS")
+                self.assertEqual(
+                    json.loads(output.read_text(encoding="utf-8"))["summary"],
+                    "Web GPT worker result",
+                )
+                self.assertTrue(result["artifact_digest"].startswith("sha256:"))
+                self.assertEqual(send.call_args.kwargs["message_type"],
+                                 "worker_done")
+                self.assertEqual(StubBrowserBridge.received_roles,
+                                 ["implementer"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
+
+if __name__ == "__main__":
+    unittest.main()
