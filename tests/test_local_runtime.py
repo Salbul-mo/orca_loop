@@ -174,6 +174,13 @@ class LocalRuntimeTest(unittest.TestCase):
             )
             publisher = publisher_patch.start()
             self.addCleanup(publisher_patch.stop)
+            probe_patch = mock.patch.object(
+                client,
+                "_probe_supervision_notification",
+                return_value=True,
+            )
+            probe_patch.start()
+            self.addCleanup(probe_patch.stop)
             task = json.loads(
                 client.call(
                     (
@@ -314,11 +321,18 @@ class LocalRuntimeTest(unittest.TestCase):
                 run_id="publish-retry-test",
                 coordinator_handle="local-coordinator",
             )
-            with mock.patch.object(
-                client,
-                "_publish_supervision",
-                side_effect=[False, True],
-            ) as publisher:
+            with (
+                mock.patch.object(
+                    client,
+                    "_publish_supervision",
+                    side_effect=[False, True],
+                ) as publisher,
+                mock.patch.object(
+                    client,
+                    "_probe_supervision_notification",
+                    return_value=True,
+                ),
+            ):
                 task = json.loads(
                     client.call(
                         (
@@ -359,11 +373,18 @@ class LocalRuntimeTest(unittest.TestCase):
                 run_id="resolved-retry-test",
                 coordinator_handle="local-coordinator",
             )
-            with mock.patch.object(
-                client,
-                "_publish_supervision",
-                side_effect=[True, False, True],
-            ) as publisher:
+            with (
+                mock.patch.object(
+                    client,
+                    "_publish_supervision",
+                    side_effect=[True, False, True],
+                ) as publisher,
+                mock.patch.object(
+                    client,
+                    "_probe_supervision_notification",
+                    return_value=True,
+                ),
+            ):
                 task = json.loads(
                     client.call(
                         (
@@ -497,6 +518,198 @@ class LocalRuntimeTest(unittest.TestCase):
             self.assertEqual(message["taskId"], "task-process")
             self.assertEqual(message["dispatchId"], "dispatch-process")
             self.assertTrue(output.is_file())
+            persisted = json.loads(client.state_path.read_text(encoding="utf-8"))
+            self.assertEqual({}, persisted["worker_processes"])
+
+    def test_orphan_recovery_kills_only_matching_persisted_process_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            client = LocalCoordinatorClient(
+                cwd=root,
+                run_id="orphan-test",
+                coordinator_handle="local-coordinator",
+            )
+            state = client._initial_state()
+            state["worker_processes"] = {
+                "worker-1": {
+                    "pid": 4242,
+                    "process_identity": "windows-filetime:123",
+                    "dispatch_id": "dispatch-1",
+                    "started_at_ns": 1,
+                }
+            }
+            client._save_state(state)
+            live = {"value": True}
+
+            def identity(pid: int) -> str | None:
+                self.assertEqual(4242, pid)
+                return "windows-filetime:123" if live["value"] else None
+
+            def terminate(pid: int) -> None:
+                self.assertEqual(4242, pid)
+                live["value"] = False
+
+            with (
+                mock.patch(
+                    "orca_loop.local_runtime.process_identity",
+                    side_effect=identity,
+                ),
+                mock.patch.object(
+                    client,
+                    "_terminate_pid_tree",
+                    side_effect=terminate,
+                ) as terminator,
+            ):
+                recovered = client.recover_orphan_worker_processes()
+
+            self.assertEqual(("worker-1",), recovered)
+            terminator.assert_called_once_with(4242)
+            persisted = json.loads(client.state_path.read_text(encoding="utf-8"))
+            self.assertEqual({}, persisted["worker_processes"])
+
+    def test_orphan_recovery_does_not_kill_reused_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            client = LocalCoordinatorClient(
+                cwd=root,
+                run_id="pid-reuse-test",
+                coordinator_handle="local-coordinator",
+            )
+            state = client._initial_state()
+            state["worker_processes"] = {
+                "worker-1": {
+                    "pid": 4242,
+                    "process_identity": "windows-filetime:old",
+                    "dispatch_id": "dispatch-1",
+                    "started_at_ns": 1,
+                }
+            }
+            client._save_state(state)
+
+            with (
+                mock.patch(
+                    "orca_loop.local_runtime.process_identity",
+                    return_value="windows-filetime:new",
+                ),
+                mock.patch.object(client, "_terminate_pid_tree") as terminator,
+            ):
+                recovered = client.recover_orphan_worker_processes()
+
+            self.assertEqual((), recovered)
+            terminator.assert_not_called()
+            persisted = json.loads(client.state_path.read_text(encoding="utf-8"))
+            self.assertEqual({}, persisted["worker_processes"])
+
+    def test_supervision_ack_republishes_when_remote_copy_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            client = LocalCoordinatorClient(
+                cwd=root,
+                run_id="supervision-resync-test",
+                coordinator_handle="local-coordinator",
+            )
+            gate_id = "local-gate-resync"
+            client.gate_dir.mkdir(parents=True, exist_ok=True)
+            client.notification_dir.mkdir(parents=True, exist_ok=True)
+            client.notification_ack_dir.mkdir(parents=True, exist_ok=True)
+            gate = {
+                "id": gate_id,
+                "taskId": "task-1",
+                "status": "pending",
+            }
+            notification = {
+                "type": "human_supervision_required",
+                "gateId": gate_id,
+                "runId": client.run_id,
+                "taskId": "task-1",
+                "status": "pending",
+                "question": "Approve?",
+                "options": ["approve", "reject"],
+            }
+            notification_path = client.notification_dir / f"{gate_id}.json"
+            ack_path = client.notification_ack_dir / f"{gate_id}.json"
+            client._write_json_atomic(client.gate_dir / f"{gate_id}.json", gate)
+            client._write_json_atomic(notification_path, notification)
+            client._write_json_atomic(
+                ack_path,
+                {
+                    "gateId": gate_id,
+                    "status": "pending",
+                    "digest": client._notification_digest(notification),
+                },
+            )
+
+            with (
+                mock.patch.object(
+                    client,
+                    "_probe_supervision_notification",
+                    return_value=False,
+                ) as probe,
+                mock.patch.object(
+                    client,
+                    "_publish_supervision",
+                    return_value=True,
+                ) as publisher,
+            ):
+                self.assertTrue(
+                    client._reconcile_supervision_notification(notification_path)
+                )
+
+            probe.assert_called_once()
+            publisher.assert_called_once()
+
+    def test_supervision_ack_skips_republish_when_remote_copy_still_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            client = LocalCoordinatorClient(
+                cwd=root,
+                run_id="supervision-present-test",
+                coordinator_handle="local-coordinator",
+            )
+            gate_id = "local-gate-present"
+            client.gate_dir.mkdir(parents=True, exist_ok=True)
+            client.notification_dir.mkdir(parents=True, exist_ok=True)
+            client.notification_ack_dir.mkdir(parents=True, exist_ok=True)
+            gate = {
+                "id": gate_id,
+                "taskId": "task-1",
+                "status": "pending",
+            }
+            notification = {
+                "type": "human_supervision_required",
+                "gateId": gate_id,
+                "runId": client.run_id,
+                "taskId": "task-1",
+                "status": "pending",
+                "question": "Approve?",
+                "options": ["approve", "reject"],
+            }
+            notification_path = client.notification_dir / f"{gate_id}.json"
+            client._write_json_atomic(client.gate_dir / f"{gate_id}.json", gate)
+            client._write_json_atomic(notification_path, notification)
+            client._write_json_atomic(
+                client.notification_ack_dir / f"{gate_id}.json",
+                {
+                    "gateId": gate_id,
+                    "status": "pending",
+                    "digest": client._notification_digest(notification),
+                },
+            )
+
+            with (
+                mock.patch.object(
+                    client,
+                    "_probe_supervision_notification",
+                    return_value=True,
+                ) as probe,
+                mock.patch.object(client, "_publish_supervision") as publisher,
+            ):
+                self.assertTrue(
+                    client._reconcile_supervision_notification(notification_path)
+                )
+
+            probe.assert_called_once()
+            publisher.assert_not_called()
 
 
 if __name__ == "__main__":

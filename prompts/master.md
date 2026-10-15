@@ -45,6 +45,18 @@ Rules:
 12. When resolving a worker supervision request autonomously, make `reason`
     an actionable bounded instruction. The Coordinator may pass that reason to
     the next worker as Master guidance.
+13. A recommendation, `recommendedDecision`, or preferred option is advisory
+    only. It is never evidence of user approval and must never be used to cross
+    a user-owned gate without an actual user decision.
+14. Do not escalate routine technical failures, retries, test failures, review
+    findings, worker disagreement, or implementation/replanning choices when an
+    allowed bounded action can address them. Resolve those yourself.
+15. If a purely technical path is exhausted and no safe Coordinator-authorized
+    recovery remains, prefer `abort` over asking the user to approve an unsafe
+    shortcut.
+16. `finish` means the bounded work is complete on the verified evidence. It
+    does not request a routine final user approval. Use `escalate` separately
+    only when user authority is genuinely required.
 
 The initial static Coordinator policy permits:
 

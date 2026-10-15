@@ -15,6 +15,7 @@ from orca_loop.contracts import (
     parse_agent_runtime_config,
     parse_agent_runtime_snapshot,
     parse_human_decision,
+    parse_implementation_artifact,
     parse_master_decision,
     parse_master_runtime_config,
     parse_master_runtime_snapshot,
@@ -503,6 +504,46 @@ class ArtifactContractTest(unittest.TestCase):
             delivered_finding_ids=("F-1",),
         )
         self.assertTrue(parsed.agrees_with_reviewer)
+
+    def test_implementation_e08_requires_plan_change(self) -> None:
+        value = {
+            "schema_version": 1,
+            "run_id": "run-1",
+            "task_id": "task-1",
+            "dispatch_id": "dispatch-1",
+            "consensus_round": 1,
+            "snapshot_digest": DIGEST_A,
+            "status": "HALTED_FOR_ESCALATION",
+            "addressed_findings": [],
+            "changed_files": [],
+            "summary": "Plan remains valid but worker requested continuation.",
+            "test_failure_attribution": "none",
+            "plan_change_required": False,
+            "escalation_signals": [
+                {
+                    "code": "E-08",
+                    "reason": "generic continuation request",
+                    "evidence_refs": ["src/example.py"],
+                    "deduplication_key": "invalid-e08",
+                }
+            ],
+        }
+        with self.assertRaisesRegex(
+            ContractViolationError,
+            "E-08 requires plan_change_required=true",
+        ):
+            parse_implementation_artifact(
+                json.dumps(value),
+                self.expected,
+                delivered_finding_ids=(),
+            )
+        value["plan_change_required"] = True
+        parsed = parse_implementation_artifact(
+            json.dumps(value),
+            self.expected,
+            delivered_finding_ids=(),
+        )
+        self.assertTrue(parsed.plan_change_required)
 
     def test_oversized_artifact_is_rejected(self) -> None:
         with self.assertRaisesRegex(ContractViolationError, "artifact size"):

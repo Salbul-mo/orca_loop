@@ -123,6 +123,12 @@ def _process_identity(pid: int) -> str | None:
     return f"pid-live:{pid}"
 
 
+def process_identity(pid: int) -> str | None:
+    """Return a stable process identity suitable for PID-reuse checks."""
+
+    return _process_identity(pid)
+
+
 def _lock_is_stale(value: object) -> bool:
     if not isinstance(value, dict):
         raise RunLockError("coordinator lock payload is invalid")
@@ -182,6 +188,17 @@ def acquire_run_lock(
             if not _lock_is_stale(existing):
                 raise RunLockError(
                     f"worktree already has a coordinator lock: {path}"
+                )
+            existing_run_id = existing.get("run_id")
+            if not isinstance(existing_run_id, str) or not existing_run_id:
+                raise RunLockError(
+                    "stale coordinator lock run_id is invalid"
+                )
+            if existing_run_id != run_id:
+                raise RunLockError(
+                    "stale coordinator lock belongs to run "
+                    f"{existing_run_id!r}; resume that run before starting "
+                    f"new run {run_id!r}"
                 )
             try:
                 path.unlink()

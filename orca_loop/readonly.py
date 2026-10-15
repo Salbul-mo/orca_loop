@@ -80,7 +80,7 @@ def _lock_windows(path: Path) -> None:
             str(path),
             "/inheritance:r",
             "/grant:r",
-            f"{identity}:(OI)(CI)(RX)",
+            f"{identity}:(RX)",
             "/T",
             "/C",
         ),

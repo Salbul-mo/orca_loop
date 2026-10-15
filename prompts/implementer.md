@@ -41,6 +41,13 @@ Delivered finding IDs:
 6. Address only delivered unresolved findings and cite concrete evidence.
 7. If the approved plan must change, stop with
    `HALTED_FOR_ESCALATION`, `plan_change_required=true`, and `E-08`.
+8. Never emit `E-08` when `plan_change_required=false`. Implementation size,
+   remaining work, or the need for coordinated edits is not a reason to stop;
+   if the approved plan is sufficient, perform the implementation in the
+   writable worktree and return `IMPLEMENTED`.
+9. If you return `HALTED_FOR_ESCALATION` for any reason other than a required
+   plan change, use the escalation code that matches that actual blocker; do
+   not use `E-08` as a generic continuation request.
 
 ## Exact output fields
 

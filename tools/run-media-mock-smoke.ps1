@@ -1,28 +1,33 @@
 $ErrorActionPreference = 'Stop'
 
+# ORCA test runner intentionally sanitizes the child environment. Recreate only
+# the Windows process environment required by PowerShell/Node crypto startup.
+$env:SystemRoot = 'C:\Windows'
+$env:WINDIR = 'C:\Windows'
+$env:COMSPEC = 'C:\Windows\System32\cmd.exe'
+$env:PATHEXT = '.COM;.EXE;.BAT;.CMD'
+$env:PATH = 'C:\Windows\System32;C:\Windows;C:\Program Files\nodejs'
+$env:TEMP = 'C:\Windows\Temp'
+$env:TMP = 'C:\Windows\Temp'
+
 $node = 'C:\Program Files\nodejs\node.exe'
-$npm = 'C:\Program Files\nodejs\npm.cmd'
 $launcher = 'C:\Users\mhj\Desktop\mhj_workspace\personal\orca_harness\tools\run-media-mock-server-isolated.mjs'
+$netstat = 'C:\Windows\System32\netstat.exe'
 $cwd = (Get-Location).Path
 $controlPort = 27100
 $mediaPort = 27101
 $zlmPort = 8898
 
-function Test-PortOpen([string]$HostName, [int]$Port, [int]$TimeoutMs = 250) {
-    $client = [System.Net.Sockets.TcpClient]::new()
-    try {
-        $task = $client.ConnectAsync($HostName, $Port)
-        if (-not $task.Wait($TimeoutMs)) { return $false }
-        return $client.Connected
-    } catch {
-        return $false
-    } finally {
-        $client.Dispose()
+function Test-PortOpen([int]$Port) {
+    if (-not (Test-Path $netstat)) {
+        throw "netstat.exe not found at $netstat"
     }
+    $pattern = ('^\s*TCP\s+\S+:' + $Port + '\s+\S+\s+LISTENING\s+\d+\s*$')
+    return [bool](& $netstat -ano -p tcp | Select-String -Pattern $pattern -Quiet)
 }
 
 foreach ($port in @($controlPort, $mediaPort, $zlmPort)) {
-    if (Test-PortOpen '127.0.0.1' $port 200) {
+    if (Test-PortOpen $port) {
         throw "Test port $port is already in use; refusing to test against an unknown process."
     }
 }
@@ -36,7 +41,7 @@ try {
         if ($server.HasExited) {
             throw "Mock server exited before readiness with code $($server.ExitCode)."
         }
-        if (Test-PortOpen '127.0.0.1' $controlPort 250) {
+        if (Test-PortOpen $controlPort) {
             $ready = $true
             break
         }

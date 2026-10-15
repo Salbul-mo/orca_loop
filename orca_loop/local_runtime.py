@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Sequence
 
 from .contracts import ContractViolationError, parse_human_decision
+from .locking import process_identity
 from .models import OrcaResponse
 from .orca_client import OrcaCommandError, OrcaProtocolError
 
@@ -104,6 +105,7 @@ class LocalCoordinatorClient:
             },
             "tasks": {},
             "dispatches": {},
+            "worker_processes": {},
             "terminal_counter": 0,
         }
 
@@ -126,6 +128,7 @@ class LocalCoordinatorClient:
         if not isinstance(value, dict):
             raise OrcaCommandError("local runtime state must be an object")
         terminals = value.setdefault("terminals", {})
+        value.setdefault("worker_processes", {})
         if isinstance(terminals, dict):
             terminals.setdefault(
                 self.coordinator_handle,
@@ -163,6 +166,75 @@ class LocalCoordinatorClient:
             handle.flush()
             os.fsync(handle.fileno())
         temporary.replace(path)
+
+    @staticmethod
+    def _terminate_pid_tree(pid: int) -> None:
+        if os.name == "nt":
+            subprocess.run(
+                ("taskkill", "/PID", str(pid), "/T", "/F"),
+                shell=False,
+                capture_output=True,
+                check=False,
+            )
+        else:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
+
+    def _remove_worker_process_record(self, terminal_handle: str) -> None:
+        state = self._load_state()
+        records = state.setdefault("worker_processes", {})
+        if not isinstance(records, dict):
+            raise OrcaCommandError("local worker process state is invalid")
+        if records.pop(terminal_handle, None) is not None:
+            self._save_state(state)
+
+    def recover_orphan_worker_processes(self) -> tuple[str, ...]:
+        """Kill recorded workers only after the caller owns the run lock."""
+
+        state = self._load_state()
+        records = state.setdefault("worker_processes", {})
+        if not isinstance(records, dict):
+            raise OrcaCommandError("local worker process state is invalid")
+        recovered: list[str] = []
+        changed = False
+        for terminal_handle, raw in tuple(records.items()):
+            if not isinstance(terminal_handle, str) or not isinstance(raw, dict):
+                records.pop(terminal_handle, None)
+                changed = True
+                continue
+            pid = raw.get("pid")
+            stored_identity = raw.get("process_identity")
+            if (
+                not isinstance(pid, int)
+                or isinstance(pid, bool)
+                or pid <= 0
+                or not isinstance(stored_identity, str)
+                or not stored_identity
+            ):
+                records.pop(terminal_handle, None)
+                changed = True
+                continue
+            current_identity = process_identity(pid)
+            if current_identity is None or current_identity != stored_identity:
+                records.pop(terminal_handle, None)
+                changed = True
+                continue
+            self._terminate_pid_tree(pid)
+            deadline = time.monotonic() + 5
+            while process_identity(pid) == stored_identity and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if process_identity(pid) == stored_identity:
+                raise OrcaCommandError(
+                    f"failed to terminate orphan worker process {pid} for {terminal_handle}"
+                )
+            records.pop(terminal_handle, None)
+            recovered.append(terminal_handle)
+            changed = True
+        if changed:
+            self._save_state(state)
+        return tuple(recovered)
 
     @staticmethod
     def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
@@ -206,6 +278,7 @@ class LocalCoordinatorClient:
                     self._terminate_process_tree(process)
         finally:
             self._worker_processes.pop(terminal_handle, None)
+            self._remove_worker_process_record(terminal_handle)
 
     def _finish_message_worker(self, value: dict[str, object]) -> None:
         message = value.get("message", value)
@@ -282,6 +355,7 @@ class LocalCoordinatorClient:
                     )
                 existing.wait()
                 self._worker_processes.pop(handle, None)
+                self._remove_worker_process_record(handle)
             process = subprocess.Popen(
                 (
                     executable,
@@ -300,6 +374,36 @@ class LocalCoordinatorClient:
                 start_new_session=os.name != "nt",
             )
             self._worker_processes[handle] = process
+            identity = process_identity(process.pid)
+            if identity is None:
+                self._terminate_process_tree(process)
+                self._worker_processes.pop(handle, None)
+                raise OrcaCommandError(
+                    "cannot establish local worker process identity"
+                )
+            records = state.setdefault("worker_processes", {})
+            if not isinstance(records, dict):
+                self._terminate_process_tree(process)
+                self._worker_processes.pop(handle, None)
+                raise OrcaCommandError("local worker process state is invalid")
+            terminal = terminals.get(handle)
+            dispatch_id = (
+                terminal.get("lastDispatchId")
+                if isinstance(terminal, dict)
+                else None
+            )
+            records[handle] = {
+                "pid": process.pid,
+                "process_identity": identity,
+                "dispatch_id": dispatch_id,
+                "started_at_ns": time.time_ns(),
+            }
+            try:
+                self._save_state(state)
+            except Exception:
+                self._terminate_process_tree(process)
+                self._worker_processes.pop(handle, None)
+                raise
             return self._response({"sent": True, "terminal": handle})
         raise OrcaCommandError(f"unsupported local terminal action: {action}")
 
@@ -351,6 +455,9 @@ class LocalCoordinatorClient:
             "to": target,
             "from": source,
         }
+        target_terminal = terminals.get(target)
+        if isinstance(target_terminal, dict):
+            target_terminal["lastDispatchId"] = dispatch_id
         self._save_state(state)
         preamble = (
             "LOCAL ORCA DISPATCH PROVENANCE\n"
@@ -394,17 +501,13 @@ class LocalCoordinatorClient:
                 return self._response({"messages": messages})
             time.sleep(0.1)
 
-    def _publish_supervision(
-        self,
-        notification: dict[str, object],
-    ) -> bool:
-        """Best-effort presentation bridge; never authoritative for gate state."""
-
+    @staticmethod
+    def _supervision_bridge_config() -> tuple[str, str] | None:
         token = os.environ.get("ORCA_WEB_AGENT_TOKEN", "")
         if len(token) < 32:
             token = os.environ.get("MCP_WEB_AGENT_CONTROL_TOKEN", "")
         if len(token) < 32:
-            return False
+            return None
         raw_endpoint = os.environ.get(
             "ORCA_WEB_AGENT_BRIDGE_URL",
             "http://127.0.0.1:8765",
@@ -412,13 +515,25 @@ class LocalCoordinatorClient:
         try:
             parsed = urllib.parse.urlsplit(raw_endpoint)
         except ValueError:
-            return False
+            return None
         if (
             parsed.scheme != "http"
             or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
             or parsed.port is None
         ):
+            return None
+        return raw_endpoint.rstrip("/"), token
+
+    def _publish_supervision(
+        self,
+        notification: dict[str, object],
+    ) -> bool:
+        """Best-effort presentation bridge; never authoritative for gate state."""
+
+        config = self._supervision_bridge_config()
+        if config is None:
             return False
+        base_endpoint, token = config
         payload = {
             "id": notification.get("gateId"),
             "runId": notification.get("runId"),
@@ -431,7 +546,7 @@ class LocalCoordinatorClient:
             "status": notification.get("status"),
         }
         request = urllib.request.Request(
-            raw_endpoint.rstrip("/") + "/automation/supervision",
+            base_endpoint + "/automation/supervision",
             data=json.dumps(
                 payload,
                 ensure_ascii=False,
@@ -454,6 +569,65 @@ class LocalCoordinatorClient:
                 flush=True,
             )
             return False
+
+    def _probe_supervision_notification(
+        self,
+        notification: dict[str, object],
+    ) -> bool | None:
+        """Check whether remote-mcp still has the authoritative presentation copy.
+
+        True means the remote state is present and compatible, False means it is
+        definitely missing/stale and should be re-published, and None means the
+        bridge could not be checked so the durable local ACK remains usable.
+        """
+
+        config = self._supervision_bridge_config()
+        if config is None:
+            return None
+        base_endpoint, token = config
+        gate_id = notification.get("gateId")
+        if not isinstance(gate_id, str) or not gate_id:
+            return False
+        encoded_gate_id = urllib.parse.quote(gate_id, safe="")
+        request = urllib.request.Request(
+            base_endpoint
+            + f"/automation/supervision/{encoded_gate_id}/decision",
+            headers={"x-orca-web-agent-token": token},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=2) as response:
+                status = response.status
+                if status == 204:
+                    return notification.get("status") != "resolved"
+                if status != 200:
+                    return None
+                try:
+                    remote = json.loads(response.read().decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    return None
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return False
+            return None
+        except (urllib.error.URLError, TimeoutError, ValueError, OSError):
+            return None
+        if not isinstance(remote, dict):
+            return None
+        if (
+            remote.get("id") != gate_id
+            or remote.get("gateId") != gate_id
+            or remote.get("runId") != self.run_id
+        ):
+            return False
+        local_status = notification.get("status")
+        remote_status = remote.get("status")
+        if local_status == "resolved":
+            return (
+                remote_status == "resolved"
+                and isinstance(remote.get("decision"), dict)
+            )
+        return remote_status in {"pending", "answered", "resolved"}
 
     @staticmethod
     def _notification_digest(notification: dict[str, object]) -> str:
@@ -532,7 +706,9 @@ class LocalCoordinatorClient:
             except (OSError, json.JSONDecodeError):
                 ack = None
             if isinstance(ack, dict) and ack.get("digest") == digest:
-                return True
+                remote_present = self._probe_supervision_notification(notification)
+                if remote_present is not False:
+                    return True
         if not self._publish_supervision(notification):
             return False
         self._write_json_atomic(

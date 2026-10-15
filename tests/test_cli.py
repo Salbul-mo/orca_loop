@@ -891,7 +891,7 @@ class RunLockTest(unittest.TestCase):
             release_run_lock(lock)
             self.assertFalse(lock.path.exists())
 
-    def test_stale_lock_is_recovered_after_owner_process_is_gone(self) -> None:
+    def test_stale_lock_is_recovered_only_for_the_same_run(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             original = acquire_run_lock(root, root, "run-1")
@@ -902,7 +902,7 @@ class RunLockTest(unittest.TestCase):
                     {
                         "schema_version": 2,
                         "token": "stale-token",
-                        "run_id": "stale-run",
+                        "run_id": "run-1",
                         "pid": 2_000_000_000,
                         "process_identity": "windows-filetime:1",
                         "started_at_ns": 1,
@@ -912,10 +912,39 @@ class RunLockTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            recovered = acquire_run_lock(root, root, "run-2")
-            self.assertEqual("run-2", recovered.run_id)
+            recovered = acquire_run_lock(root, root, "run-1")
+            self.assertEqual("run-1", recovered.run_id)
             release_run_lock(recovered)
             self.assertFalse(path.exists())
+
+    def test_stale_lock_from_another_run_requires_resuming_that_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            original = acquire_run_lock(root, root, "run-a")
+            path = original.path
+            release_run_lock(original)
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "token": "stale-token",
+                        "run_id": "run-a",
+                        "pid": 2_000_000_000,
+                        "process_identity": "windows-filetime:1",
+                        "started_at_ns": 1,
+                        "worktree": str(root),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                RunLockError,
+                "resume that run before starting new run",
+            ):
+                acquire_run_lock(root, root, "run-b")
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual("run-a", persisted["run_id"])
 
 
 class RunEntryPointTest(unittest.TestCase):

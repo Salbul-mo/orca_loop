@@ -1431,6 +1431,22 @@ def parse_implementation_artifact(
         raise ContractViolationError(
             "implementation addressed an undelivered finding"
         )
+    plan_change_required = _boolean(
+        raw["plan_change_required"],
+        "implementation.plan_change_required",
+    )
+    escalation_signals = _tuple(
+        raw["escalation_signals"],
+        _parse_escalation,
+        "implementation.escalation_signals",
+    )
+    if (
+        any(item.code is EscalationCode.E08 for item in escalation_signals)
+        and not plan_change_required
+    ):
+        raise ContractViolationError(
+            "implementation E-08 requires plan_change_required=true"
+        )
     return ImplementationArtifact(
         schema_version=SCHEMA_VERSION,
         run_id=_identifier(raw["run_id"], "implementation.run_id"),
@@ -1464,15 +1480,8 @@ def parse_implementation_artifact(
             raw["test_failure_attribution"],
             "implementation.test_failure_attribution",
         ),
-        plan_change_required=_boolean(
-            raw["plan_change_required"],
-            "implementation.plan_change_required",
-        ),
-        escalation_signals=_tuple(
-            raw["escalation_signals"],
-            _parse_escalation,
-            "implementation.escalation_signals",
-        ),
+        plan_change_required=plan_change_required,
+        escalation_signals=escalation_signals,
     )
 
 

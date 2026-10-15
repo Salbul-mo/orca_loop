@@ -2973,6 +2973,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.config.worktree_path,
             arguments.run_id,
         )
+        if isinstance(client, LocalCoordinatorClient):
+            client.recover_orphan_worker_processes()
         final = run_coordinator(preflight, client)
         print(
             json.dumps(
