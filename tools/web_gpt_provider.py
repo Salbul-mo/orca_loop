@@ -104,6 +104,24 @@ def invoke(role: str, prompt: str, timeout_seconds: float, *,
             raise BrowserProviderError("read-only tool verification requires a valid private SHA-256")
     elif proof_sha256 is not None:
         raise BrowserProviderError("SHA-256 proof is reserved for read-only tool verification")
+    if terminal_policy == "orca_terminal":
+        prompt = prompt.replace(
+            "- stdout must begin with `{` and end with `}`.",
+            "- Worker stdout after transport framing is removed must begin with `{` and end with `}`.",
+        ).replace(
+            "Return exactly one JSON object. Never return prose, Markdown, a code fence,",
+            "The artifact content returned to the worker must be exactly one JSON object. Never put prose, Markdown, a code fence,",
+        ).replace(
+            "Return the artifact JSON only on stdout.",
+            "Return the artifact JSON only in worker stdout after transport framing is removed.",
+        ).replace(
+            "Return exactly one JSON object with exactly these fields:",
+            "The decision artifact returned after transport framing is removed must be exactly one JSON object with exactly these fields:",
+        )
+        prompt = (
+            prompt.rstrip()
+            + "\n\nTRANSPORT COMPATIBILITY NOTE: The browser response is a transport envelope, not worker stdout. The requested artifact itself must obey every JSON-only rule above and end at its closing }. After that artifact closing }, the browser response MUST continue with the exact ORCA_WEB_RESULT_END marker required by the following FINAL OUTPUT PROTOCOL. The bridge strips that marker before producing worker stdout or validating the artifact. A browser response that ends at } without the marker is incomplete and must not be returned."
+        )
     endpoint = _endpoint()
     payload = {"role": role, "prompt": prompt}
     if terminal_policy:
@@ -119,11 +137,13 @@ def invoke(role: str, prompt: str, timeout_seconds: float, *,
     # stderr is human-facing diagnostic only; never print the credential/prompt.
     print("web_agent job id: " + job_id, file=sys.stderr, flush=True)
     deadline = time.monotonic() + timeout_seconds
+    terminal_state_observed = False
     try:
         while time.monotonic() < deadline:
             job = _request(endpoint, token, "GET", "/automation/jobs/" + job_id)
             state = job.get("state")
             if state == "completed":
+                terminal_state_observed = True
                 result = job.get("result")
                 if not isinstance(result, str) or not result.strip():
                     raise BrowserProviderError(
@@ -131,6 +151,7 @@ def invoke(role: str, prompt: str, timeout_seconds: float, *,
                     )
                 return result
             if state in {"failed", "cancelled"}:
+                terminal_state_observed = True
                 raise BrowserProviderError(
                     "model_or_browser: web agent "
                     + str(state)
@@ -143,18 +164,23 @@ def invoke(role: str, prompt: str, timeout_seconds: float, *,
                     + repr(state)
                 )
             time.sleep(min(1.5, max(0.05, deadline - time.monotonic())))
-    except KeyboardInterrupt:
-        _request(endpoint, token, "POST", "/automation/jobs/" + job_id + "/cancel", {})
-        raise
-    # Best effort: marking the task cancelled prevents any subsequent result
-    # from being promoted, though an in-flight ChatGPT turn cannot be recalled.
-    try:
-        _request(endpoint, token, "POST", "/automation/jobs/" + job_id + "/cancel", {})
-    except BrowserProviderError:
-        pass
-    raise BrowserProviderError(
-        "provider_timeout: web agent timed out before a terminal result"
-    )
+        raise BrowserProviderError(
+            "provider_timeout: web agent timed out before a terminal result"
+        )
+    finally:
+        if not terminal_state_observed:
+            # Best effort: abnormal polling exits must not leave an old browser
+            # job running while the coordinator retries with a new one.
+            try:
+                _request(
+                    endpoint,
+                    token,
+                    "POST",
+                    "/automation/jobs/" + job_id + "/cancel",
+                    {},
+                )
+            except BrowserProviderError:
+                pass
 
 
 def main() -> int:

@@ -422,6 +422,42 @@ class WebGptLaunchTest(unittest.TestCase):
             server.server_close()
             thread.join(timeout=3)
 
+    def test_provider_cancels_created_job_when_polling_fails(self) -> None:
+        from tools.web_gpt_provider import BrowserProviderError, invoke
+
+        calls: list[tuple[str, str]] = []
+
+        def request_stub(_endpoint, _token, method, path, payload=None):
+            del payload
+            calls.append((method, path))
+            if method == "POST" and path == "/automation/jobs":
+                return {"id": "job-poll-failure"}
+            if method == "GET":
+                raise BrowserProviderError("bridge_transport: poll failed")
+            if method == "POST" and path.endswith("/cancel"):
+                return {"id": "job-poll-failure", "state": "cancelled"}
+            raise AssertionError((method, path))
+
+        env = {
+            "ORCA_WEB_AGENT_TOKEN": DEMO_SECRET,
+            "ORCA_WEB_AGENT_BRIDGE_URL": "http://127.0.0.1:8765",
+        }
+        with patch.dict(os.environ, env), patch(
+            "tools.web_gpt_provider._request",
+            side_effect=request_stub,
+        ):
+            with self.assertRaisesRegex(BrowserProviderError, "poll failed"):
+                invoke("planner", "ordinary", 5)
+
+        self.assertEqual(
+            [
+                ("POST", "/automation/jobs"),
+                ("GET", "/automation/jobs/job-poll-failure"),
+                ("POST", "/automation/jobs/job-poll-failure/cancel"),
+            ],
+            calls,
+        )
+
     def test_provider_and_worker_runner_share_existing_artifact_contract(self) -> None:
         StubBrowserBridge.received_roles.clear()
         server = ThreadingHTTPServer(("127.0.0.1", 0), StubBrowserBridge)

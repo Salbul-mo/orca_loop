@@ -223,6 +223,82 @@ class DispatcherTest(unittest.TestCase):
             self.assertEqual("task-1", payload["taskId"])
             self.assertEqual(str(report_path), payload["reportPath"])
 
+    def test_timeout_terminates_local_outer_worker_process(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            _, step = create_run_workspace(
+                root,
+                "run-timeout",
+                "step-timeout",
+                resume=False,
+            )
+            (step.input_dir / "contract.md").write_text(
+                "contract",
+                encoding="utf-8",
+            )
+            worker = WorkerHandle(
+                WorkerKey.CODEX_REVIEW,
+                "term-timeout",
+                "wt-1",
+                "tab-1",
+                "leaf-1",
+            )
+            prepared = PreparedTask(
+                "step-timeout",
+                "task-timeout",
+                worker,
+                Role.PLAN_REVIEWER,
+                DIGEST_A,
+            )
+            (step.root / "binding.json").write_text(
+                json.dumps({"task_id": "task-timeout"}),
+                encoding="utf-8",
+            )
+
+            def handler(
+                argv: tuple[str, ...],
+                timeout_ms: int,
+            ) -> dict[str, object]:
+                del timeout_ms
+                if argv[:2] == ("orchestration", "dispatch"):
+                    return {
+                        "dispatch": {"id": "dispatch-timeout"},
+                        "preamble": "task_id=task-timeout",
+                    }
+                if argv[:2] == ("terminal", "send"):
+                    return {"send": {"accepted": True}}
+                self.fail(f"unexpected call: {argv}")
+
+            class CleanupClient(FakeOrcaClient):
+                def __init__(self) -> None:
+                    super().__init__(handler)
+                    self.cleaned: list[tuple[str, bool]] = []
+
+                def finish_worker_process(
+                    self,
+                    terminal_handle: str,
+                    *,
+                    terminate: bool = False,
+                ) -> None:
+                    self.cleaned.append((terminal_handle, terminate))
+
+            client = CleanupClient()
+            _handle, completion = dispatch_and_wait(
+                client,  # type: ignore[arg-type]
+                prepared,
+                step,
+                LaunchProfile(("agent", "--add-dir", str(root)), ()),
+                coordinator_handle="term-coordinator",
+                orca_executable="<local-runtime>",
+                runner_path=Path.cwd() / "worker_runner.py",
+                step_timeout_ms=0,
+                artifact_filename="plan-review.json",
+                commit_dispatched=lambda _item: None,
+            )
+
+            self.assertEqual(CompletionKind.STEP_TIMEOUT, completion.kind)
+            self.assertEqual([("term-timeout", True)], client.cleaned)
+
 
 class WorkerRunnerExtractionTest(unittest.TestCase):
     def test_extracts_claude_and_codex_artifacts(self) -> None:

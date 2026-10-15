@@ -9,6 +9,7 @@ from unittest import mock
 
 from orca_loop.dispatcher import _runner_command
 from orca_loop.local_runtime import LocalCoordinatorClient
+from orca_loop.orca_client import OrcaProtocolError
 from worker_runner import _send
 
 
@@ -241,6 +242,176 @@ class LocalRuntimeTest(unittest.TestCase):
                 "resolved",
                 publisher.call_args_list[1].args[0]["status"],
             )
+
+    def test_gate_rejects_stale_resolution_without_consuming_pending_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            client = LocalCoordinatorClient(
+                cwd=root,
+                run_id="stale-decision-test",
+                coordinator_handle="local-coordinator",
+            )
+            with mock.patch.object(client, "_publish_supervision", return_value=True):
+                task = json.loads(
+                    client.call(
+                        (
+                            "orchestration", "task-create",
+                            "--task-title", "decision",
+                            "--display-name", "decision",
+                            "--spec", "human decision",
+                        ),
+                        timeout_ms=1000,
+                    ).result_json
+                )["task"]["id"]
+                expected_digest = "sha256:" + "a" * 64
+                created = json.loads(
+                    client.call(
+                        (
+                            "orchestration", "gate-create",
+                            "--task", task,
+                            "--question", "Choose.",
+                            "--options", '["reject"]',
+                            "--report-digest", expected_digest,
+                        ),
+                        timeout_ms=1000,
+                    ).result_json
+                )
+                gate_id = created["id"]
+                stale = {
+                    "decision": "reject",
+                    "decision_note": "stale",
+                    "affected_acceptance_criteria": [],
+                    "affected_finding_ids": [],
+                    "report_digest": "sha256:" + "b" * 64,
+                }
+                with self.assertRaisesRegex(
+                    OrcaProtocolError,
+                    "stale human decision report digest",
+                ):
+                    client.resolve_gate(
+                        gate_id=gate_id,
+                        resolution=stale,
+                        expected_report_digest=expected_digest,
+                    )
+                gate_path = client.gate_dir / f"{gate_id}.json"
+                pending = json.loads(gate_path.read_text(encoding="utf-8"))
+                self.assertEqual("pending", pending["status"])
+
+                valid = dict(stale)
+                valid["report_digest"] = expected_digest
+                resolved = client.resolve_gate(
+                    gate_id=gate_id,
+                    resolution=valid,
+                    expected_report_digest=expected_digest,
+                )
+                self.assertEqual("resolved", resolved["status"])
+
+    def test_gate_list_retries_unacknowledged_supervision_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            client = LocalCoordinatorClient(
+                cwd=root,
+                run_id="publish-retry-test",
+                coordinator_handle="local-coordinator",
+            )
+            with mock.patch.object(
+                client,
+                "_publish_supervision",
+                side_effect=[False, True],
+            ) as publisher:
+                task = json.loads(
+                    client.call(
+                        (
+                            "orchestration", "task-create",
+                            "--task-title", "decision",
+                            "--display-name", "decision",
+                            "--spec", "human decision",
+                        ),
+                        timeout_ms=1000,
+                    ).result_json
+                )["task"]["id"]
+                client.call(
+                    (
+                        "orchestration", "gate-create",
+                        "--task", task,
+                        "--question", "Choose.",
+                        "--options", '["reject"]',
+                    ),
+                    timeout_ms=1000,
+                )
+                self.assertEqual(1, publisher.call_count)
+                client.call(
+                    ("orchestration", "gate-list", "--task", task),
+                    timeout_ms=1000,
+                )
+                self.assertEqual(2, publisher.call_count)
+                client.call(
+                    ("orchestration", "gate-list", "--task", task),
+                    timeout_ms=1000,
+                )
+                self.assertEqual(2, publisher.call_count)
+
+    def test_resolved_supervision_publish_is_retried_until_acknowledged(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            client = LocalCoordinatorClient(
+                cwd=root,
+                run_id="resolved-retry-test",
+                coordinator_handle="local-coordinator",
+            )
+            with mock.patch.object(
+                client,
+                "_publish_supervision",
+                side_effect=[True, False, True],
+            ) as publisher:
+                task = json.loads(
+                    client.call(
+                        (
+                            "orchestration", "task-create",
+                            "--task-title", "decision",
+                            "--display-name", "decision",
+                            "--spec", "human decision",
+                        ),
+                        timeout_ms=1000,
+                    ).result_json
+                )["task"]["id"]
+                created = json.loads(
+                    client.call(
+                        (
+                            "orchestration", "gate-create",
+                            "--task", task,
+                            "--question", "Choose.",
+                            "--options", '["reject"]',
+                        ),
+                        timeout_ms=1000,
+                    ).result_json
+                )
+                resolution = {
+                    "decision": "reject",
+                    "decision_note": "stop",
+                    "affected_acceptance_criteria": [],
+                    "affected_finding_ids": [],
+                    "report_digest": "sha256:" + "c" * 64,
+                }
+                client.resolve_gate(
+                    gate_id=created["id"],
+                    resolution=resolution,
+                )
+                self.assertEqual(2, publisher.call_count)
+                client.call(
+                    ("orchestration", "gate-list", "--task", task),
+                    timeout_ms=1000,
+                )
+                self.assertEqual(3, publisher.call_count)
+                self.assertEqual(
+                    "resolved",
+                    publisher.call_args_list[-1].args[0]["status"],
+                )
+                client.call(
+                    ("orchestration", "gate-list", "--task", task),
+                    timeout_ms=1000,
+                )
+                self.assertEqual(3, publisher.call_count)
 
     def test_local_terminal_launches_worker_runner_and_receives_completion(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

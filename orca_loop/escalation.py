@@ -361,26 +361,48 @@ def create_gate(
     gate_kind: GateKind,
     question: str,
     options: tuple[str, ...],
+    decision_support: Mapping[str, object] | None = None,
     timeout_ms: int,
 ) -> GateBinding:
     if not task_id or not question or not options:
         raise GateProtocolError(
             "gate task, question and options must be nonempty"
         )
-    response = client.call(
+    command = [
+        "orchestration",
+        "gate-create",
+        "--task",
+        task_id,
+        "--question",
         (
-            "orchestration",
-            "gate-create",
-            "--task",
-            task_id,
-            "--question",
-            (
-                f"{question} Review {report.path} for "
-                f"{','.join(report.finding_ids) or 'the final decision'}."
-            ),
-            "--options",
-            json.dumps(options, ensure_ascii=False),
+            f"{question} Review {report.path} for "
+            f"{','.join(report.finding_ids) or 'the final decision'}."
         ),
+        "--options",
+        json.dumps(options, ensure_ascii=False),
+    ]
+    if getattr(client, "executable", "") == "<local-runtime>":
+        command.extend(
+            (
+                "--report-path",
+                str(report.path),
+                "--report-digest",
+                report.digest,
+            )
+        )
+        if decision_support is not None:
+            command.extend(
+                (
+                    "--decision-support-json",
+                    json.dumps(
+                        decision_support,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                )
+            )
+    response = client.call(
+        tuple(command),
         timeout_ms=timeout_ms,
     )
     value = _result_object(response.result_json)

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import signal
 import shutil
 import subprocess
 import sys
@@ -10,14 +12,44 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Sequence
 
+from .contracts import ContractViolationError, parse_human_decision
 from .models import OrcaResponse
 from .orca_client import OrcaCommandError, OrcaProtocolError
 
 
 LOCAL_RUNTIME_VERSION = "1.4.159"
+
+
+@contextmanager
+def _exclusive_file_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _option(argv: Sequence[str], name: str) -> str | None:
@@ -56,7 +88,9 @@ class LocalCoordinatorClient:
         self.completion_dir = self.runtime_root / "messages"
         self.gate_dir = self.runtime_root / "gates"
         self.notification_dir = self.runtime_root / "notifications"
+        self.notification_ack_dir = self.runtime_root / "notification-acks"
         self.state_path = self.runtime_root / "state.json"
+        self._worker_processes: dict[str, subprocess.Popen[bytes]] = {}
 
     def _initial_state(self) -> dict[str, object]:
         return {
@@ -117,6 +151,70 @@ class LocalCoordinatorClient:
         )
         temporary.replace(self.state_path)
 
+    @staticmethod
+    def _write_json_atomic(path: Path, value: dict[str, object]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        raw = (
+            json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        temporary = path.with_name(path.name + ".tmp")
+        with temporary.open("wb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+
+    @staticmethod
+    def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
+        if process.poll() is not None:
+            process.wait()
+            return
+        if os.name == "nt":
+            subprocess.run(
+                ("taskkill", "/PID", str(process.pid), "/T", "/F"),
+                shell=False,
+                capture_output=True,
+                check=False,
+            )
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+    def finish_worker_process(
+        self,
+        terminal_handle: str,
+        *,
+        terminate: bool = False,
+    ) -> None:
+        process = self._worker_processes.get(terminal_handle)
+        if process is None:
+            return
+        try:
+            if terminate:
+                self._terminate_process_tree(process)
+            else:
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self._terminate_process_tree(process)
+        finally:
+            self._worker_processes.pop(terminal_handle, None)
+
+    def _finish_message_worker(self, value: dict[str, object]) -> None:
+        message = value.get("message", value)
+        if not isinstance(message, dict):
+            return
+        worker = message.get("from")
+        if isinstance(worker, str) and worker:
+            self.finish_worker_process(worker)
+
     def _terminal(self, argv: tuple[str, ...]) -> OrcaResponse:
         action = argv[1] if len(argv) > 1 else ""
         state = self._load_state()
@@ -176,7 +274,15 @@ class LocalCoordinatorClient:
             creationflags = (
                 subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
             )
-            subprocess.Popen(
+            existing = self._worker_processes.get(handle)
+            if existing is not None:
+                if existing.poll() is None:
+                    raise OrcaCommandError(
+                        "local terminal already has a running worker process"
+                    )
+                existing.wait()
+                self._worker_processes.pop(handle, None)
+            process = subprocess.Popen(
                 (
                     executable,
                     "-NoLogo",
@@ -193,6 +299,7 @@ class LocalCoordinatorClient:
                 creationflags=creationflags,
                 start_new_session=os.name != "nt",
             )
+            self._worker_processes[handle] = process
             return self._response({"sent": True, "terminal": handle})
         raise OrcaCommandError(f"unsupported local terminal action: {action}")
 
@@ -282,6 +389,7 @@ class LocalCoordinatorClient:
                 archive = self.completion_dir / "archive"
                 archive.mkdir(exist_ok=True)
                 path.replace(archive / path.name)
+                self._finish_message_worker(value)
             if messages or time.monotonic() >= deadline:
                 return self._response({"messages": messages})
             time.sleep(0.1)
@@ -318,6 +426,8 @@ class LocalCoordinatorClient:
             "question": notification.get("question"),
             "options": notification.get("options"),
             "reportPath": notification.get("reportPath"),
+            "decisionSupport": notification.get("decisionSupport"),
+            "resolution": notification.get("resolution"),
             "status": notification.get("status"),
         }
         request = urllib.request.Request(
@@ -345,6 +455,100 @@ class LocalCoordinatorClient:
             )
             return False
 
+    @staticmethod
+    def _notification_digest(notification: dict[str, object]) -> str:
+        raw = json.dumps(
+            notification,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+    def _reconcile_supervision_notification(
+        self,
+        path: Path,
+        *,
+        gate_locked: bool = False,
+    ) -> bool:
+        if not gate_locked:
+            lock_path = self.gate_dir / f"{path.stem}.resolve.lock"
+            with _exclusive_file_lock(lock_path):
+                return self._reconcile_supervision_notification(
+                    path,
+                    gate_locked=True,
+                )
+        try:
+            notification = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise OrcaProtocolError(
+                "local supervision notification is invalid"
+            ) from exc
+        if not isinstance(notification, dict):
+            raise OrcaProtocolError(
+                "local supervision notification must be an object"
+            )
+        gate_id = notification.get("gateId")
+        if (
+            not isinstance(gate_id, str)
+            or not gate_id
+            or notification.get("runId") != self.run_id
+        ):
+            raise OrcaProtocolError(
+                "local supervision notification provenance mismatch"
+            )
+        gate_path = self.gate_dir / f"{gate_id}.json"
+        try:
+            gate = json.loads(gate_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise OrcaProtocolError(
+                "local supervision gate provenance is unavailable"
+            ) from exc
+        if (
+            not isinstance(gate, dict)
+            or gate.get("id") != gate_id
+            or gate.get("taskId") != notification.get("taskId")
+        ):
+            raise OrcaProtocolError(
+                "local supervision gate provenance mismatch"
+            )
+        changed = False
+        for key in ("status", "resolution"):
+            source = gate.get(key)
+            if notification.get(key) != source:
+                if source is None:
+                    notification.pop(key, None)
+                else:
+                    notification[key] = source
+                changed = True
+        if changed:
+            self._write_json_atomic(path, notification)
+
+        digest = self._notification_digest(notification)
+        ack_path = self.notification_ack_dir / f"{gate_id}.json"
+        if ack_path.is_file():
+            try:
+                ack = json.loads(ack_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                ack = None
+            if isinstance(ack, dict) and ack.get("digest") == digest:
+                return True
+        if not self._publish_supervision(notification):
+            return False
+        self._write_json_atomic(
+            ack_path,
+            {
+                "gateId": gate_id,
+                "status": notification.get("status"),
+                "digest": digest,
+            },
+        )
+        return True
+
+    def _reconcile_supervision_notifications(self) -> None:
+        for path in sorted(self.notification_dir.glob("*.json")):
+            self._reconcile_supervision_notification(path)
+
     def _gate_create(self, argv: tuple[str, ...]) -> OrcaResponse:
         task_id = _option(argv, "--task")
         if not task_id:
@@ -354,19 +558,44 @@ class LocalCoordinatorClient:
             options = json.loads(_option(argv, "--options") or "[]")
         except json.JSONDecodeError as exc:
             raise OrcaCommandError("local gate options are malformed") from exc
+        if (
+            not isinstance(options, list)
+            or not options
+            or any(not isinstance(item, str) or not item for item in options)
+        ):
+            raise OrcaCommandError("local gate options must be nonempty strings")
+        raw_support = _option(argv, "--decision-support-json")
+        decision_support: dict[str, object] | None = None
+        if raw_support is not None:
+            if len(raw_support.encode("utf-8")) > 65_536:
+                raise OrcaCommandError("local gate decision support is too large")
+            try:
+                parsed_support = json.loads(raw_support)
+            except json.JSONDecodeError as exc:
+                raise OrcaCommandError(
+                    "local gate decision support is malformed"
+                ) from exc
+            if not isinstance(parsed_support, dict):
+                raise OrcaCommandError(
+                    "local gate decision support must be an object"
+                )
+            decision_support = parsed_support
+        report_path = _option(argv, "--report-path")
+        report_digest = _option(argv, "--report-digest")
         gate = {
             "id": gate_id,
+            "runId": self.run_id,
             "taskId": task_id,
             "question": _option(argv, "--question") or "",
             "options": options,
+            "reportPath": report_path,
+            "reportDigest": report_digest,
+            "decisionSupport": decision_support,
             "status": "pending",
         }
         self.gate_dir.mkdir(parents=True, exist_ok=True)
         path = self.gate_dir / f"{gate_id}.json"
-        path.write_text(
-            json.dumps(gate, ensure_ascii=False, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        self._write_json_atomic(path, gate)
         notification = {
             "schemaVersion": 1,
             "type": "human_supervision_required",
@@ -375,21 +604,20 @@ class LocalCoordinatorClient:
             "taskId": task_id,
             "question": gate["question"],
             "options": options,
+            "reportPath": report_path,
+            "decisionSupport": decision_support,
             "status": "pending",
         }
         self.notification_dir.mkdir(parents=True, exist_ok=True)
         notification_path = self.notification_dir / f"{gate_id}.json"
-        notification_path.write_text(
-            json.dumps(notification, ensure_ascii=False, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        self._write_json_atomic(notification_path, notification)
         print(
             "[ORCA HUMAN SUPERVISION REQUIRED] "
             f"run={self.run_id} gate={gate_id}: {gate['question']}",
             file=sys.stderr,
             flush=True,
         )
-        self._publish_supervision(notification)
+        self._reconcile_supervision_notification(notification_path)
         return self._response(
             {
                 "id": gate_id,
@@ -403,52 +631,96 @@ class LocalCoordinatorClient:
         *,
         gate_id: str,
         resolution: dict[str, object],
+        expected_report_digest: str | None = None,
     ) -> dict[str, object]:
         path = self.gate_dir / f"{gate_id}.json"
-        try:
-            gate = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise OrcaCommandError(f"local gate does not exist: {gate_id}") from exc
-        if not isinstance(gate, dict) or gate.get("id") != gate_id:
-            raise OrcaProtocolError("local gate payload is invalid")
-        if gate.get("status") != "pending":
-            raise OrcaProtocolError("local gate is not pending")
-        gate["status"] = "resolved"
-        gate["resolution"] = resolution
-        temporary = path.with_name(path.name + ".tmp")
-        temporary.write_text(
-            json.dumps(gate, ensure_ascii=False, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        temporary.replace(path)
-        notification_path = self.notification_dir / f"{gate_id}.json"
-        if notification_path.is_file():
+        lock_path = self.gate_dir / f"{gate_id}.resolve.lock"
+        with _exclusive_file_lock(lock_path):
             try:
-                notification = json.loads(
-                    notification_path.read_text(encoding="utf-8")
-                )
+                gate = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
-                raise OrcaProtocolError(
-                    "local supervision notification is invalid"
+                raise OrcaCommandError(
+                    f"local gate does not exist: {gate_id}"
                 ) from exc
-            if not isinstance(notification, dict):
-                raise OrcaProtocolError(
-                    "local supervision notification must be an object"
+            if not isinstance(gate, dict) or gate.get("id") != gate_id:
+                raise OrcaProtocolError("local gate payload is invalid")
+            if gate.get("runId") not in {None, self.run_id}:
+                raise OrcaProtocolError("local gate run provenance mismatch")
+            if gate.get("status") != "pending":
+                raise OrcaProtocolError("local gate is not pending")
+
+            options = gate.get("options")
+            if not isinstance(options, list):
+                raise OrcaProtocolError("local gate options are invalid")
+            try:
+                decision = parse_human_decision(
+                    json.dumps(
+                        resolution,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
                 )
-            notification["status"] = "resolved"
-            notification["resolution"] = resolution
-            notification_tmp = notification_path.with_name(
-                notification_path.name + ".tmp"
+            except ContractViolationError as exc:
+                raise OrcaProtocolError(
+                    f"local gate resolution is invalid: {exc}"
+                ) from exc
+            if decision.decision.value not in options:
+                raise OrcaProtocolError(
+                    "local gate resolution is not an allowed option"
+                )
+
+            stored_digest = gate.get("reportDigest")
+            if stored_digest is not None and not isinstance(stored_digest, str):
+                raise OrcaProtocolError("local gate report digest is invalid")
+            if (
+                stored_digest is not None
+                and expected_report_digest is not None
+                and stored_digest != expected_report_digest
+            ):
+                raise OrcaProtocolError("local gate report provenance mismatch")
+            required_digest = (
+                stored_digest
+                if isinstance(stored_digest, str) and stored_digest
+                else expected_report_digest
             )
-            notification_tmp.write_text(
-                json.dumps(notification, ensure_ascii=False, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
-            notification_tmp.replace(notification_path)
-            self._publish_supervision(notification)
-        return gate
+            if (
+                required_digest is not None
+                and decision.report_digest != required_digest
+            ):
+                raise OrcaProtocolError("stale human decision report digest")
+
+            notification_path = self.notification_dir / f"{gate_id}.json"
+            if notification_path.is_file():
+                try:
+                    notification = json.loads(
+                        notification_path.read_text(encoding="utf-8")
+                    )
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise OrcaProtocolError(
+                        "local supervision notification is invalid"
+                    ) from exc
+                if (
+                    not isinstance(notification, dict)
+                    or notification.get("runId") != self.run_id
+                    or notification.get("gateId") != gate_id
+                    or notification.get("taskId") != gate.get("taskId")
+                ):
+                    raise OrcaProtocolError(
+                        "local supervision notification provenance mismatch"
+                    )
+
+            gate["status"] = "resolved"
+            gate["resolution"] = resolution
+            self._write_json_atomic(path, gate)
+            if notification_path.is_file():
+                self._reconcile_supervision_notification(
+                    notification_path,
+                    gate_locked=True,
+                )
+            return gate
 
     def _gate_list(self, argv: tuple[str, ...]) -> OrcaResponse:
+        self._reconcile_supervision_notifications()
         task_id = _option(argv, "--task")
         status = _option(argv, "--status")
         gates: list[dict[str, object]] = []

@@ -62,6 +62,7 @@ from orca_loop.models import (
     Side,
     SignalKind,
     StepExecutionResult,
+    StepStage,
     TestGateStatus as GateStatus,
     TestFailureAttribution as FailureAttribution,
     TransitionSignal,
@@ -75,6 +76,8 @@ from run_loop import (
     EXIT_USER_REQUIRED,
     _gate_question,
     _initialize,
+    _route_blocked_before_user_gate,
+    _resume_target_after_approval,
     _route_final_decision,
     _route_test_result,
     _route_worker_completion,
@@ -888,6 +891,32 @@ class RunLockTest(unittest.TestCase):
             release_run_lock(lock)
             self.assertFalse(lock.path.exists())
 
+    def test_stale_lock_is_recovered_after_owner_process_is_gone(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            original = acquire_run_lock(root, root, "run-1")
+            path = original.path
+            release_run_lock(original)
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "token": "stale-token",
+                        "run_id": "stale-run",
+                        "pid": 2_000_000_000,
+                        "process_identity": "windows-filetime:1",
+                        "started_at_ns": 1,
+                        "worktree": str(root),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            recovered = acquire_run_lock(root, root, "run-2")
+            self.assertEqual("run-2", recovered.run_id)
+            release_run_lock(recovered)
+            self.assertFalse(path.exists())
+
 
 class RunEntryPointTest(unittest.TestCase):
     def _master_preflight(self, root: Path) -> PreflightResult:
@@ -1439,7 +1468,7 @@ class RunEntryPointTest(unittest.TestCase):
             self.assertIn('"role":"plan_reviewer"', observed_prompt[0])
             self.assertNotIn('"role":"implementer"', observed_prompt[0])
 
-    def test_worker_completion_master_can_finish_clean_code_review_through_human_gate(
+    def test_worker_completion_master_can_finish_clean_code_review_autonomously(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1508,14 +1537,16 @@ class RunEntryPointTest(unittest.TestCase):
             )
 
             self.assertIs(routed, result)
-            self.assertEqual(LoopState.HUMAN_GATE, controller.state.state)
+            self.assertEqual(LoopState.READY_FOR_MERGE, controller.state.state)
+            self.assertEqual(RunStatus.READY, controller.state.status)
             self.assertEqual(
                 "TRANSITION_COMMITTED",
                 controller.state.step_stage.value,
             )
             self.assertEqual(GateStatus.PASS, controller.state.test_gate_status)
+            self.assertIsNone(controller.state.gate_binding)
             self.assertIn(
-                "skipped cross-confirm for clean low-risk code review",
+                "autonomously completed the clean low-risk code review",
                 controller.state.history[-1].reason,
             )
             self.assertEqual(1, len(observed_prompt))
@@ -1726,10 +1757,10 @@ class RunEntryPointTest(unittest.TestCase):
             self.assertEqual("PLAN_REVISE", guidance_value["targetState"])
             self.assertEqual("planner", guidance_value["targetRole"])
 
-    def test_worker_supervision_e03_cannot_be_autonomously_approved(self) -> None:
+    def test_worker_supervision_e03_is_master_routed_before_human_escalation(self) -> None:
         trigger = EscalationTrigger(
             code=EscalationCode.E03,
-            reason="external contract needs approval",
+            reason="external contract needs review",
             evidence_refs=("plan.json",),
             deduplication_key="supervision-e03",
         )
@@ -1739,17 +1770,19 @@ class RunEntryPointTest(unittest.TestCase):
             None,
             (trigger,),
         )
-        with self.assertRaisesRegex(OrcaLoopError, "requires human escalation"):
+        self.assertIs(
+            LoopState.PLAN_REVIEW,
             _validate_worker_supervision_master_decision(
                 LoopState.PLAN,
                 MasterDecision(
                     MasterAction.DISPATCH,
                     Role.PLAN_REVIEWER,
                     PermissionProfile.READ_ONLY,
-                    "approve contract locally",
+                    "review the external contract evidence within existing scope",
                 ),
                 result,
-            )
+            ),
+        )
         self.assertIs(
             SignalKind.ESCALATE,
             _validate_worker_supervision_master_decision(
@@ -1758,7 +1791,7 @@ class RunEntryPointTest(unittest.TestCase):
                     MasterAction.ESCALATE,
                     None,
                     None,
-                    "human owns the external contract decision",
+                    "the remaining contract authority belongs to the user",
                 ),
                 result,
             ),
@@ -1811,7 +1844,7 @@ class RunEntryPointTest(unittest.TestCase):
             ),
         )
         self.assertEqual(
-            LoopState.HUMAN_GATE,
+            LoopState.READY_FOR_MERGE,
             _validate_test_result_master_decision(
                 SignalKind.PASS,
                 MasterDecision(
@@ -1897,7 +1930,7 @@ class RunEntryPointTest(unittest.TestCase):
             self.assertIn('"resultSignal":"PASS"', observed_prompt[0])
             self.assertIn('"role":"code_reviewer"', observed_prompt[0])
 
-    def test_test_result_master_can_finish_safe_passing_change_through_human_gate(self) -> None:
+    def test_test_result_master_can_finish_safe_passing_change_autonomously(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             preflight = self._master_preflight(root)
@@ -1934,19 +1967,21 @@ class RunEntryPointTest(unittest.TestCase):
                     observed_prompt.append(prompt)
                     or '{"action":"finish","role":null,'
                     '"permissionProfile":null,'
-                    '"reason":"safe passing change can go to final human gate"}'
+                    '"reason":"safe passing change is complete on verified evidence"}'
                 ),
             )
 
             self.assertIs(routed, result)
-            self.assertEqual(LoopState.HUMAN_GATE, controller.state.state)
+            self.assertEqual(LoopState.READY_FOR_MERGE, controller.state.state)
+            self.assertEqual(RunStatus.READY, controller.state.status)
             self.assertEqual(
                 "TRANSITION_COMMITTED",
                 controller.state.step_stage.value,
             )
             self.assertEqual(GateStatus.PASS, controller.state.test_gate_status)
+            self.assertIsNone(controller.state.gate_binding)
             self.assertIn(
-                "skipped code review for safe passing change",
+                "autonomously completed the safe verified change",
                 controller.state.history[-1].reason,
             )
             self.assertEqual(1, len(observed_prompt))
@@ -2070,16 +2105,104 @@ class RunEntryPointTest(unittest.TestCase):
             self.assertIs(routed, result)
             self.assertEqual([], called)
 
-    def test_final_master_policy_preserves_human_gate_boundary(self) -> None:
-        self.assertIsNone(
+    def test_final_escalation_approval_returns_to_master_not_second_human_gate(self) -> None:
+        self.assertEqual(
+            LoopState.CONSENSUS_EVALUATE,
+            _resume_target_after_approval(LoopState.CONSENSUS_EVALUATE),
+        )
+
+    def test_technical_user_decision_block_is_routed_back_to_master_first(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            preflight = self._master_preflight(root)
+            controller, _ = _initialize(
+                preflight,
+                self._provision_client(),  # type: ignore[arg-type]
+                master_invoke=lambda _options, _prompt: (
+                    '{"action":"dispatch","role":"implementer",'
+                    '"permissionProfile":"workspace_write",'
+                    '"reason":"implement directly"}'
+                ),
+            )
+            controller.state = replace(controller.state, state=LoopState.IMPLEMENT)
+            controller.commit(
+                stage=StepStage.TRANSITION_COMMITTED,
+                active=None,
+                reason="technical execution retry limit reached",
+                signal=SignalKind.OPERATIONAL_RETRY,
+                state_value=LoopState.USER_DECISION_REQUIRED,
+                status=RunStatus.BLOCKED,
+                blocked_from_state=LoopState.IMPLEMENT,
+            )
+            observed_prompt: list[str] = []
+
+            handled = _route_blocked_before_user_gate(
+                controller,
+                preflight,
+                master_invoke=lambda _options, prompt: (
+                    observed_prompt.append(prompt)
+                    or '{"action":"dispatch","role":"implementer",'
+                    '"permissionProfile":"workspace_write",'
+                    '"reason":"retry the bounded technical work without changing scope"}'
+                ),
+            )
+
+            self.assertTrue(handled)
+            self.assertEqual(LoopState.FIX, controller.state.state)
+            self.assertEqual(RunStatus.IN_PROGRESS, controller.state.status)
+            self.assertIsNone(controller.state.gate_binding)
+            self.assertIsNone(controller.state.blocked_from_state)
+            self.assertEqual(1, len(observed_prompt))
+            self.assertIn('"stage":"blocked_before_user_gate"', observed_prompt[0])
+            self.assertIn("recommendation is advisory", observed_prompt[0])
+
+    def test_explicit_master_user_authority_request_is_not_rehandled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            preflight = self._master_preflight(root)
+            controller, _ = _initialize(
+                preflight,
+                self._provision_client(),  # type: ignore[arg-type]
+                master_invoke=lambda _options, _prompt: (
+                    '{"action":"dispatch","role":"implementer",'
+                    '"permissionProfile":"workspace_write",'
+                    '"reason":"implement directly"}'
+                ),
+            )
+            controller.state = replace(controller.state, state=LoopState.IMPLEMENT)
+            controller.commit(
+                stage=StepStage.TRANSITION_COMMITTED,
+                active=None,
+                reason="external production authority belongs to the user",
+                signal=SignalKind.ESCALATE,
+                requires_user_decision=True,
+                state_value=LoopState.USER_DECISION_REQUIRED,
+                status=RunStatus.BLOCKED,
+                blocked_from_state=LoopState.IMPLEMENT,
+            )
+            called: list[bool] = []
+
+            handled = _route_blocked_before_user_gate(
+                controller,
+                preflight,
+                master_invoke=lambda _options, _prompt: called.append(True) or "",
+            )
+
+            self.assertFalse(handled)
+            self.assertEqual([], called)
+            self.assertEqual(LoopState.USER_DECISION_REQUIRED, controller.state.state)
+
+    def test_final_master_policy_finishes_autonomously_or_escalates(self) -> None:
+        self.assertEqual(
+            LoopState.READY_FOR_MERGE,
             _validate_final_master_decision(
                 MasterDecision(
                     MasterAction.FINISH,
                     None,
                     None,
-                    "evidence is sufficient for final human disposition",
+                    "verified evidence is sufficient to finish",
                 )
-            )
+            ),
         )
         self.assertEqual(
             SignalKind.ESCALATE,
@@ -2096,7 +2219,7 @@ class RunEntryPointTest(unittest.TestCase):
     def test_final_master_rejects_state_machine_jump(self) -> None:
         with self.assertRaisesRegex(
             OrcaLoopError,
-            "must finish through the human gate or escalate",
+            "must finish autonomously or escalate",
         ):
             _validate_final_master_decision(
                 MasterDecision(
@@ -2108,7 +2231,7 @@ class RunEntryPointTest(unittest.TestCase):
             )
         with self.assertRaisesRegex(
             OrcaLoopError,
-            "must finish through the human gate or escalate",
+            "must finish autonomously or escalate",
         ):
             _validate_final_master_decision(
                 MasterDecision(
@@ -2159,6 +2282,9 @@ class RunEntryPointTest(unittest.TestCase):
                 ),
             )
             self.assertIs(routed, result)
+            self.assertEqual(LoopState.READY_FOR_MERGE, controller.state.state)
+            self.assertEqual(RunStatus.READY, controller.state.status)
+            self.assertIsNone(controller.state.gate_binding)
             self.assertEqual(1, len(observed_prompt))
             self.assertIn('"stage":"final_decision"', observed_prompt[0])
             self.assertIn(

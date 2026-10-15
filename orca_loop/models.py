@@ -528,6 +528,7 @@ class TransitionSignal:
     kind: SignalKind
     reason: str
     finding_ids: tuple[str, ...]
+    requires_user_decision: bool = False
 
 
 @dataclass(frozen=True)
@@ -829,6 +830,7 @@ class StateHistoryEntry:
     step_stage: StepStage
     signal: SignalKind
     reason: str
+    requires_user_decision: bool = False
 
 
 @dataclass(frozen=True)

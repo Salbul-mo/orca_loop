@@ -623,10 +623,7 @@ def _worker_completion_master_context(
         "role": None,
         "permissionProfile": None,
     }
-    if supervision_requested and "E-03" in escalation_codes:
-        # E-03 is a policy-level contract/schema/external approval boundary.
-        allowed = [escalate]
-    elif state in {LoopState.PLAN, LoopState.PLAN_REVISE}:
+    if state in {LoopState.PLAN, LoopState.PLAN_REVISE}:
         allowed = [
             {
                 "action": MasterAction.DISPATCH.value,
@@ -843,7 +840,7 @@ def _validate_worker_completion_master_decision(
         ):
             return None
         if allow_code_review_finish and decision.action is MasterAction.FINISH:
-            return LoopState.HUMAN_GATE
+            return LoopState.READY_FOR_MERGE
         if not allow_code_review_finish:
             raise OrcaLoopError(
                 "Master decision after code review must dispatch cross_confirmer or escalate"
@@ -866,10 +863,6 @@ def _validate_worker_supervision_master_decision(
     codes = {item.code.value for item in result.escalations}
     if decision.action is MasterAction.ESCALATE:
         return SignalKind.ESCALATE
-    if "E-03" in codes:
-        raise OrcaLoopError(
-            "E-03 supervision is policy-bound and requires human escalation"
-        )
     if state in {LoopState.PLAN, LoopState.PLAN_REVISE}:
         if decision.action is MasterAction.DISPATCH:
             if decision.role is Role.PLANNER:
@@ -1037,6 +1030,7 @@ def _route_worker_completion(
                         f"{decision.reason}"
                     ),
                     result.signal.finding_ids,
+                    requires_user_decision=True,
                 ),
                 result.ledger,
                 result.test_gate_status,
@@ -1082,20 +1076,22 @@ def _route_worker_completion(
             test_gate_status=result.test_gate_status,
         )
         return result
-    if override is LoopState.HUMAN_GATE:
+    if override is LoopState.READY_FOR_MERGE:
         controller.commit(
             stage=StepStage.TRANSITION_COMMITTED,
             active=None,
             reason=(
-                "Master skipped cross-confirm for clean low-risk code review "
-                f"and requested final human disposition: {decision.reason}"
+                "Master autonomously completed the clean low-risk code review: "
+                f"{decision.reason}"
             ),
             signal=result.signal.kind,
-            state_value=LoopState.HUMAN_GATE,
-            status=RunStatus.IN_PROGRESS,
+            state_value=LoopState.READY_FOR_MERGE,
+            status=RunStatus.READY,
             ledger=result.ledger,
             counters=controller.state.counters,
             test_gate_status=result.test_gate_status,
+            pending_escalations=(),
+            clear_blocked_context=True,
         )
         return result
     return StepExecutionResult(
@@ -1204,7 +1200,7 @@ def _validate_test_result_master_decision(
             and signal is SignalKind.PASS
             and decision.action is MasterAction.FINISH
         ):
-            return LoopState.HUMAN_GATE
+            return LoopState.READY_FOR_MERGE
         if not allow_finish:
             raise OrcaLoopError(
                 "Master decision after successful test gate must dispatch "
@@ -1276,23 +1272,25 @@ def _route_test_result(
     )
     if override is None:
         return result
-    if override is LoopState.HUMAN_GATE:
+    if override is LoopState.READY_FOR_MERGE:
         controller.commit(
             stage=StepStage.TRANSITION_COMMITTED,
             active=None,
             reason=(
-                "Master skipped code review for safe passing change and "
-                f"requested final human disposition: {decision.reason}"
+                "Master autonomously completed the safe verified change: "
+                f"{decision.reason}"
             ),
             signal=result.signal.kind,
-            state_value=LoopState.HUMAN_GATE,
-            status=RunStatus.IN_PROGRESS,
+            state_value=LoopState.READY_FOR_MERGE,
+            status=RunStatus.READY,
             ledger=result.ledger,
             counters=LoopCounters(
                 0,
                 controller.state.counters.operational_retries,
             ),
             test_gate_status=result.test_gate_status,
+            pending_escalations=(),
+            clear_blocked_context=True,
         )
         return result
     return StepExecutionResult(
@@ -1300,6 +1298,7 @@ def _route_test_result(
             override,
             f"Master escalated after test gate: {decision.reason}",
             result.signal.finding_ids,
+            requires_user_decision=True,
         ),
         result.ledger,
         result.test_gate_status,
@@ -1343,14 +1342,14 @@ def _final_master_context(
     }
 
 
-def _validate_final_master_decision(decision) -> SignalKind | None:
+def _validate_final_master_decision(decision) -> SignalKind | LoopState:
     decision = validate_master_decision(decision)
     if decision.action is MasterAction.FINISH:
-        return None
+        return LoopState.READY_FOR_MERGE
     if decision.action is MasterAction.ESCALATE:
         return SignalKind.ESCALATE
     raise OrcaLoopError(
-        "Master final decision must finish through the human gate or escalate"
+        "Master final decision must finish autonomously or escalate"
     )
 
 
@@ -1394,13 +1393,27 @@ def _route_final_decision(
             resume_action="resume_state",
         ) from exc
     override = _validate_final_master_decision(decision)
-    if override is None:
+    if override is LoopState.READY_FOR_MERGE:
+        controller.commit(
+            stage=StepStage.TRANSITION_COMMITTED,
+            active=None,
+            reason=f"Master autonomously completed the verified run: {decision.reason}",
+            signal=result.signal.kind,
+            state_value=LoopState.READY_FOR_MERGE,
+            status=RunStatus.READY,
+            ledger=result.ledger,
+            counters=controller.state.counters,
+            test_gate_status=controller.state.test_gate_status,
+            pending_escalations=(),
+            clear_blocked_context=True,
+        )
         return result
     return StepExecutionResult(
         TransitionSignal(
             override,
-            f"Master escalated before final human gate: {decision.reason}",
+            f"Master requires user authority before completion: {decision.reason}",
             result.signal.finding_ids,
+            requires_user_decision=True,
         ),
         result.ledger,
         result.test_gate_status,
@@ -1790,6 +1803,212 @@ def _gate_options(
     return ("revise_code", "revise_design", "reject")
 
 
+def _decision_support_text(value: object, *, limit: int = 700) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
+
+
+def _gate_decision_support(
+    controller: GenerationController,
+    kind: GateKind,
+    options: tuple[str, ...],
+    plan: PlanDocument | None,
+) -> dict[str, object]:
+    triggers = controller.state.pending_escalations
+    primary = triggers[0] if triggers else None
+    blocked = controller.state.blocked_from_state
+    evidence: list[str] = []
+
+    if primary is not None:
+        evidence.extend(
+            _decision_support_text(item, limit=360)
+            for item in primary.evidence_refs
+            if str(item).strip()
+        )
+    if plan is not None:
+        evidence.extend(
+            _decision_support_text(item, limit=360)
+            for item in plan.current_state_evidence
+            if str(item).strip()
+        )
+
+    destructive_items: list[str] = []
+    if plan is not None:
+        destructive_items = [
+            f"{item.operation.value}: {item.path}"
+            for item in plan.affected_files
+            if item.operation.value in {"delete", "rename"}
+        ]
+        if kind is GateKind.DESTRUCTIVE:
+            evidence.extend(destructive_items)
+
+    deduped_evidence: list[str] = []
+    for item in evidence:
+        if item and item not in deduped_evidence:
+            deduped_evidence.append(item)
+        if len(deduped_evidence) >= 8:
+            break
+
+    if kind is GateKind.FINAL:
+        problem = (
+            "자동 검토 단계는 끝났지만, 최종 결과를 실제 결과물로 확정할지 "
+            "사용자 승인이 남아 있습니다."
+        )
+        why = (
+            "최종 승인 여부는 결과물 수용에 관한 제품/업무 결정이므로 "
+            "ORCA가 대신 확정할 수 없습니다."
+        )
+    elif kind is GateKind.DESTRUCTIVE:
+        targets = ", ".join(destructive_items[:6]) or "삭제/이름 변경 대상"
+        problem = (
+            "현재 계획에 되돌리기 어려운 파일 삭제 또는 이름 변경이 포함되어 "
+            f"있습니다. 대상: {targets}"
+        )
+        why = (
+            "파괴적 변경은 계획에 포함되어 있어도 실행 직전에 사용자가 범위를 "
+            "확인하고 별도로 승인해야 합니다."
+        )
+    elif primary is not None:
+        problem = _decision_support_text(primary.reason, limit=1000)
+        why = (
+            f"{primary.code.value} 판단은 자동 확정이 금지된 경계입니다. "
+            "현재 실행은 사용자의 명시적 결정 전까지 중단됩니다."
+        )
+    else:
+        history_reason = (
+            controller.state.history[-1].reason
+            if controller.state.history
+            else "자동으로 확정할 수 없는 판단이 남아 있습니다."
+        )
+        problem = _decision_support_text(history_reason, limit=1000)
+        why = (
+            "현재 상태에서 ORCA가 임의로 선택하면 계획 또는 구현 범위를 "
+            "넘을 수 있어 사람의 판단이 필요합니다."
+        )
+
+    option_details: list[dict[str, str]] = []
+    for decision in options:
+        if decision == "merge":
+            if kind is GateKind.FINAL:
+                title = "승인하고 완료"
+                description = "현재 결과를 최종 승인합니다."
+                consequence = "ORCA가 최종 승인 상태로 진행합니다."
+            elif kind is GateKind.DESTRUCTIVE:
+                title = "파괴적 변경 승인"
+                description = "표시된 삭제/이름 변경을 허용합니다."
+                consequence = "승인된 대상에 한해 구현 단계가 계속됩니다."
+            else:
+                title = "현재 방향 승인"
+                description = "현재 판단 또는 계약 방향을 승인합니다."
+                consequence = "중단 지점부터 현재 방향으로 작업을 계속합니다."
+        elif decision == "reject":
+            title = "승인하지 않음"
+            description = "현재 변경 또는 실행 방향을 승인하지 않습니다."
+            consequence = "현재 run을 종료하고 자동 진행을 중단합니다."
+        elif decision == "revise_design":
+            title = "설계 수정 요청"
+            description = "구현 전에 계획·계약 해석·구조를 다시 조정합니다."
+            consequence = "Planner 단계로 돌아가 새 설계를 검토합니다."
+        elif decision == "revise_code":
+            title = "코드 수정 요청"
+            description = "설계는 유지하되 구현 결과를 수정합니다."
+            consequence = "구현 수정 단계로 돌아간 뒤 다시 검토합니다."
+        else:
+            title = decision
+            description = "이 선택지를 적용합니다."
+            consequence = "ORCA가 해당 결정에 따라 다음 상태를 계산합니다."
+        option_details.append(
+            {
+                "decision": decision,
+                "title": title,
+                "description": description,
+                "consequence": consequence,
+            }
+        )
+
+    recommended: str | None = None
+    if (
+        kind is GateKind.ESCALATION
+        and primary is not None
+        and primary.code.value == "E-03"
+        and "revise_design" in options
+    ):
+        recommended = "revise_design"
+        recommendation = (
+            "외부 API·스키마·계약의 변경 권한이 불명확한 상태에서는 현재 방향을 "
+            "바로 승인하지 말고 설계 수정 요청을 선택하는 것을 권장합니다. "
+            "외부 기준을 유지하거나, 변경 권한을 명시적으로 확인한 뒤 다시 승인하는 "
+            "편이 후속 재작업과 계약 불일치 위험이 가장 낮습니다."
+        )
+    elif kind is GateKind.FINAL:
+        test_status = (
+            None
+            if controller.state.test_gate_status is None
+            else controller.state.test_gate_status.value
+        )
+        if test_status == "PASS" and "merge" in options:
+            recommended = "merge"
+            recommendation = (
+                "테스트가 통과했고 추가 escalation이 없으므로 현재 결과 승인에 "
+                "무리가 없다는 판단입니다. 결과 범위가 요청과 일치하는지만 확인한 "
+                "뒤 승인하는 것을 권장합니다."
+            )
+        else:
+            recommended = "revise_code" if "revise_code" in options else None
+            recommendation = (
+                "최종 승인 전에 남은 검증 상태를 다시 확인하는 것을 권장합니다. "
+                "구현상 문제가 있다면 코드 수정 요청을 선택하세요."
+            )
+    elif kind is GateKind.DESTRUCTIVE:
+        recommendation = (
+            "표시된 삭제/이름 변경 대상이 의도한 범위와 정확히 일치하는 경우에만 "
+            "승인하는 것을 권장합니다. 하나라도 불명확하거나 불필요하면 설계 수정 "
+            "요청으로 되돌리는 편이 안전합니다."
+        )
+    elif blocked is LoopState.PLAN_CONSENSUS_EVALUATE and "revise_design" in options:
+        recommended = "revise_design"
+        recommendation = (
+            "계획 단계의 불확실성이므로 구현을 진행하기 전에 설계를 수정해 "
+            "판단 근거를 명확히 하는 것을 권장합니다."
+        )
+    elif "revise_code" in options:
+        recommended = "revise_code"
+        recommendation = (
+            "구현 또는 검증 단계의 문제이므로 현재 결과를 승인하기보다 코드 수정 후 "
+            "재검토하는 것을 권장합니다."
+        )
+    else:
+        recommendation = (
+            "근거를 확인한 뒤 현재 범위를 명시적으로 수용할 수 있을 때만 승인하세요. "
+            "확신이 없으면 승인하지 않고 보완 정보를 먼저 확보하는 편이 안전합니다."
+        )
+
+    approval_effect = next(
+        (
+            item["consequence"]
+            for item in option_details
+            if item["decision"] == "merge"
+        ),
+        "승인 선택지가 없는 gate입니다.",
+    )
+
+    return {
+        "problem": problem,
+        "whyDecisionNeeded": why,
+        "evidence": deduped_evidence,
+        "options": option_details,
+        "recommendedDecision": recommended,
+        "recommendation": recommendation,
+        "approvalEffect": approval_effect,
+        "noDecisionEffect": (
+            "결정하지 않으면 현재 run은 USER_DECISION_REQUIRED 상태로 유지되며 "
+            "ORCA는 해당 경계를 넘어 자동 진행하지 않습니다."
+        ),
+    }
+
+
 def _gate_question(
     controller: GenerationController,
     kind: GateKind,
@@ -1860,6 +2079,323 @@ def _gate_question(
     )
 
 
+def _master_explicitly_requested_user_authority(
+    controller: GenerationController,
+) -> bool:
+    if not controller.state.history:
+        return False
+    latest = controller.state.history[-1]
+    return (
+        latest.signal is SignalKind.ESCALATE
+        and latest.requires_user_decision
+    )
+
+
+def _destructive_user_authority_required(
+    controller: GenerationController,
+) -> bool:
+    if controller.state.blocked_from_state is not LoopState.PLAN_CONSENSUS_EVALUATE:
+        return False
+    if controller.state.pending_escalations:
+        return False
+    if controller.state.destructive_approval is not None:
+        return False
+    plan = _load_plan(controller.workspace.root)
+    return plan is not None and any(
+        item.operation.value in {"delete", "rename"}
+        for item in plan.affected_files
+    )
+
+
+def _blocked_master_allowed_decisions(
+    controller: GenerationController,
+    preflight: PreflightResult,
+) -> list[dict[str, object]]:
+    blocked = controller.state.blocked_from_state
+    latest_signal = (
+        None
+        if not controller.state.history
+        else controller.state.history[-1].signal
+    )
+    view = ledger_view(controller.ledger)
+    config = preflight.arguments.config
+
+    dispatches: list[tuple[Role, str]] = []
+    round_limit_exhausted = (
+        latest_signal is SignalKind.UNRESOLVED_REMAIN
+        and (
+            (
+                blocked is LoopState.PLAN_CONSENSUS_EVALUATE
+                and view.plan_round >= config.plan_consensus_round_limit
+            )
+            or (
+                blocked is LoopState.CONSENSUS_EVALUATE
+                and view.code_round >= config.code_consensus_round_limit
+            )
+        )
+    )
+
+    if not round_limit_exhausted:
+        if blocked in {LoopState.PLAN, LoopState.PLAN_REVISE}:
+            dispatches = [(Role.PLANNER, "read_only")]
+        elif blocked is LoopState.PLAN_REVIEW:
+            dispatches = [
+                (Role.PLANNER, "read_only"),
+                (Role.PLAN_REVIEWER, "read_only"),
+            ]
+        elif blocked is LoopState.PLAN_CONSENSUS_EVALUATE:
+            dispatches = [(Role.PLANNER, "read_only")]
+        elif blocked in {LoopState.IMPLEMENT, LoopState.FIX}:
+            dispatches = [
+                (Role.PLANNER, "read_only"),
+                (Role.IMPLEMENTER, "workspace_write"),
+            ]
+        elif blocked is LoopState.TEST_GATE:
+            dispatches = [
+                (Role.PLANNER, "read_only"),
+                (Role.IMPLEMENTER, "workspace_write"),
+            ]
+        elif blocked is LoopState.CODE_REVIEW:
+            dispatches = [
+                (Role.IMPLEMENTER, "workspace_write"),
+                (Role.CODE_REVIEWER, "read_only"),
+            ]
+        elif blocked is LoopState.CROSS_CONFIRM:
+            dispatches = [
+                (Role.IMPLEMENTER, "workspace_write"),
+                (Role.CROSS_CONFIRMER, "read_only"),
+            ]
+        elif blocked is LoopState.CONSENSUS_EVALUATE:
+            dispatches = [(Role.IMPLEMENTER, "workspace_write")]
+
+    allowed = [
+        {
+            "action": MasterAction.DISPATCH.value,
+            "role": role.value,
+            "permissionProfile": permission,
+        }
+        for role, permission in dispatches
+    ]
+    allowed.extend(
+        [
+            {
+                "action": MasterAction.ABORT.value,
+                "role": None,
+                "permissionProfile": None,
+            },
+            {
+                "action": MasterAction.ESCALATE.value,
+                "role": None,
+                "permissionProfile": None,
+            },
+        ]
+    )
+    return allowed
+
+
+def _blocked_master_context(
+    controller: GenerationController,
+    preflight: PreflightResult,
+) -> dict[str, object]:
+    latest = None if not controller.state.history else controller.state.history[-1]
+    view = ledger_view(controller.ledger)
+    return {
+        "stage": "blocked_before_user_gate",
+        "runId": controller.state.run_id,
+        "currentState": controller.state.state.value,
+        "blockedFromState": (
+            None
+            if controller.state.blocked_from_state is None
+            else controller.state.blocked_from_state.value
+        ),
+        "request": preflight.arguments.config.request_path.read_text(encoding="utf-8"),
+        "blockingSignal": None if latest is None else latest.signal.value,
+        "blockingReason": None if latest is None else latest.reason,
+        "workerSupervisionRequests": [
+            to_wire_value(item) for item in controller.state.pending_escalations
+        ],
+        "counters": to_wire_value(controller.state.counters),
+        "consensus": {
+            "planRound": view.plan_round,
+            "planRoundLimit": preflight.arguments.config.plan_consensus_round_limit,
+            "codeRound": view.code_round,
+            "codeRoundLimit": preflight.arguments.config.code_consensus_round_limit,
+            "unresolvedCount": view.unresolved_count,
+            "testFixAttemptLimit": preflight.arguments.config.test_fix_attempt_limit,
+            "operationalRetryLimit": preflight.arguments.config.operational_retry_limit,
+        },
+        "authorityRule": (
+            "Resolve technical/operational/rework decisions autonomously. "
+            "Escalate only when the remaining decision is genuinely user-owned. "
+            "A recommendation is advisory and never counts as user approval. "
+            "If no safe authorized technical recovery remains, abort rather than "
+            "asking the user to approve an unsafe shortcut."
+        ),
+        "allowedDecisions": _blocked_master_allowed_decisions(controller, preflight),
+    }
+
+
+def _decision_key(decision: MasterDecision) -> tuple[str, str | None, str | None]:
+    return (
+        decision.action.value,
+        None if decision.role is None else decision.role.value,
+        (
+            None
+            if decision.permission_profile is None
+            else decision.permission_profile.value
+        ),
+    )
+
+
+def _allowed_decision_keys(
+    allowed: Sequence[dict[str, object]],
+) -> set[tuple[str, str | None, str | None]]:
+    return {
+        (
+            str(item["action"]),
+            None if item.get("role") is None else str(item["role"]),
+            (
+                None
+                if item.get("permissionProfile") is None
+                else str(item["permissionProfile"])
+            ),
+        )
+        for item in allowed
+    }
+
+
+def _persist_blocked_master_guidance(
+    controller: GenerationController,
+    *,
+    source_state: LoopState | None,
+    target_state: LoopState,
+    decision: MasterDecision,
+) -> None:
+    payload = {
+        "schemaVersion": 1,
+        "runId": controller.state.run_id,
+        "generation": controller.state.generation,
+        "sourceState": None if source_state is None else source_state.value,
+        "sourceRole": None,
+        "targetState": target_state.value,
+        "targetRole": role_for_state(target_state).value,
+        "decision": to_wire_value(decision),
+        "workerSupervisionRequests": [],
+        "authority": (
+            "Master recovery guidance after a technical block. It cannot expand "
+            "user scope, permissions, or coordinator policy."
+        ),
+    }
+    output = _master_guidance_path(controller)
+    temporary = output.with_name(output.name + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\
+",
+        encoding="utf-8",
+    )
+    temporary.replace(output)
+
+
+def _route_blocked_before_user_gate(
+    controller: GenerationController,
+    preflight: PreflightResult,
+    *,
+    master_invoke: MasterInvoker | None = None,
+) -> bool:
+    if controller.state.state is not LoopState.USER_DECISION_REQUIRED:
+        return False
+    if preflight.master_runtime is None:
+        return False
+    if _destructive_user_authority_required(controller):
+        return False
+    if _master_explicitly_requested_user_authority(controller):
+        return False
+
+    context = _blocked_master_context(controller, preflight)
+    invoke = master_invoke
+    if invoke is None:
+        invoke = lambda options, prompt: invoke_master_provider(
+            options,
+            prompt,
+            timeout_ms=preflight.arguments.config.step_timeout_ms,
+        )
+    try:
+        decision = invoke_master(
+            preflight.master_runtime,
+            preflight.arguments.harness_root / "prompts" / "master.md",
+            context,
+            invoke,
+        )
+    except MasterRuntimeAdapterError as exc:
+        raise RecoverableMasterProviderError(
+            "blocked-recovery",
+            str(exc),
+            resume_action="retry_master_before_user_gate",
+        ) from exc
+
+    decision = validate_master_decision(decision)
+    allowed = context["allowedDecisions"]
+    assert isinstance(allowed, list)
+    if _decision_key(decision) not in _allowed_decision_keys(allowed):
+        raise OrcaLoopError(
+            "Master blocked-recovery decision is not allowed by Coordinator policy"
+        )
+
+    blocked = controller.state.blocked_from_state
+    if decision.action is MasterAction.ESCALATE:
+        controller.commit(
+            stage=StepStage.TRANSITION_COMMITTED,
+            active=None,
+            reason=f"Master requires user authority before user gate: {decision.reason}",
+            signal=SignalKind.ESCALATE,
+            requires_user_decision=True,
+            state_value=LoopState.USER_DECISION_REQUIRED,
+            status=RunStatus.BLOCKED,
+        )
+        return False
+    if decision.action is MasterAction.ABORT:
+        controller.commit(
+            stage=StepStage.TRANSITION_COMMITTED,
+            active=None,
+            reason=f"Master aborted exhausted technical recovery: {decision.reason}",
+            signal=SignalKind.ABORT,
+            state_value=LoopState.FAILED,
+            status=RunStatus.FAILED,
+            clear_blocked_context=True,
+        )
+        return True
+    if decision.action is not MasterAction.DISPATCH or decision.role is None:
+        raise OrcaLoopError("blocked-recovery Master decision must dispatch, abort, or escalate")
+
+    target_by_role = {
+        Role.PLANNER: LoopState.PLAN_REVISE,
+        Role.PLAN_REVIEWER: LoopState.PLAN_REVIEW,
+        Role.IMPLEMENTER: LoopState.FIX,
+        Role.CODE_REVIEWER: LoopState.CODE_REVIEW,
+        Role.CROSS_CONFIRMER: LoopState.CROSS_CONFIRM,
+    }
+    target = target_by_role.get(decision.role)
+    if target is None:
+        raise OrcaLoopError("blocked-recovery Master dispatch role is unsupported")
+    controller.commit(
+        stage=StepStage.STEP_PENDING,
+        active=None,
+        reason=f"Master recovered technical block autonomously: {decision.reason}",
+        signal=SignalKind.OK,
+        state_value=target,
+        status=RunStatus.IN_PROGRESS,
+        clear_gate=True,
+        clear_blocked_context=True,
+    )
+    _persist_blocked_master_guidance(
+        controller,
+        source_state=blocked,
+        target_state=target,
+        decision=decision,
+    )
+    return True
+
+
 def _ensure_gate(
     controller: GenerationController,
     preflight: PreflightResult,
@@ -1926,6 +2462,12 @@ def _ensure_gate(
             options,
         ),
         options=options,
+        decision_support=_gate_decision_support(
+            controller,
+            kind,
+            options,
+            plan,
+        ),
         timeout_ms=30_000,
     )
     controller.commit(
@@ -1949,7 +2491,10 @@ def _resume_target_after_approval(
         LoopState.FIX: LoopState.TEST_GATE,
         LoopState.CODE_REVIEW: LoopState.CROSS_CONFIRM,
         LoopState.CROSS_CONFIRM: LoopState.CONSENSUS_EVALUATE,
-        LoopState.CONSENSUS_EVALUATE: LoopState.HUMAN_GATE,
+        # After a user-owned escalation is approved at final consensus, return
+        # to final evaluation so the Master can finish autonomously. Do not
+        # manufacture a second routine final-approval gate.
+        LoopState.CONSENSUS_EVALUATE: LoopState.CONSENSUS_EVALUATE,
     }
     target = mapping.get(blocked)
     if target is None:
@@ -2146,6 +2691,16 @@ def _run_loop(
                     transitions += 1
                     continue
                 return controller.state
+            if (
+                state is LoopState.USER_DECISION_REQUIRED
+                and _route_blocked_before_user_gate(
+                    controller,
+                    preflight,
+                    master_invoke=master_invoke,
+                )
+            ):
+                transitions += 1
+                continue
             _ensure_gate(controller, preflight, client)
             return controller.state
         if state in TERMINAL_STATES:

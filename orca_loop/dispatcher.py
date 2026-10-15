@@ -451,18 +451,28 @@ def dispatch_and_wait(
     if isinstance(completion_dir, Path):
         job["completion_dir"] = str(completion_dir.resolve())
     command = _runner_command(job, runner_path)
-    client.call(
-        (
-            "terminal",
-            "send",
-            "--terminal",
-            prepared.worker.terminal_handle,
-            "--text",
-            command,
-            "--enter",
-        ),
-        timeout_ms=30_000,
-    )
+    finish_worker = getattr(client, "finish_worker_process", None)
+
+    def terminate_local_worker() -> None:
+        if callable(finish_worker):
+            finish_worker(prepared.worker.terminal_handle, terminate=True)
+
+    try:
+        client.call(
+            (
+                "terminal",
+                "send",
+                "--terminal",
+                prepared.worker.terminal_handle,
+                "--text",
+                command,
+                "--enter",
+            ),
+            timeout_ms=30_000,
+        )
+    except Exception:
+        terminate_local_worker()
+        raise
 
     deadline = time.monotonic() + step_timeout_ms / 1000
     while time.monotonic() < deadline:
@@ -471,20 +481,24 @@ def dispatch_and_wait(
             int((deadline - time.monotonic()) * 1000),
         )
         window = min(60_000, remaining_ms)
-        checked = client.call(
-            (
-                "orchestration",
-                "check",
-                "--terminal",
-                coordinator_handle,
-                "--types",
-                "worker_done,escalation,decision_gate",
-                "--wait",
-                "--timeout-ms",
-                str(window),
-            ),
-            timeout_ms=min(65_000, window + 5_000),
-        )
+        try:
+            checked = client.call(
+                (
+                    "orchestration",
+                    "check",
+                    "--terminal",
+                    coordinator_handle,
+                    "--types",
+                    "worker_done,escalation,decision_gate",
+                    "--wait",
+                    "--timeout-ms",
+                    str(window),
+                ),
+                timeout_ms=min(65_000, window + 5_000),
+            )
+        except Exception:
+            terminate_local_worker()
+            raise
         for raw_message in _messages(_result(checked)):
             value = _message_value(raw_message)
             message_type = _field(value, "type", "message_type")
@@ -549,6 +563,7 @@ def dispatch_and_wait(
                         ),
                     ),
                 )
+    terminate_local_worker()
     return (
         handle,
         Completion(

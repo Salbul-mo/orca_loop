@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 import types
-from dataclasses import fields, is_dataclass
+from dataclasses import MISSING, fields, is_dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, TypeVar, Union, get_args, get_origin, get_type_hints
@@ -151,11 +151,38 @@ def _decode(expected_type: Any, value: object, context: str) -> object:
         if not isinstance(value, dict):
             raise AtomicWriteError(f"{context} must be an object")
         hints = get_type_hints(expected_type)
-        expected_fields = {field.name for field in fields(expected_type)}
-        if set(value) != expected_fields:
+        if (
+            expected_type.__name__ == "StateHistoryEntry"
+            and "requires_user_decision" not in value
+        ):
+            # One-time compatibility migration for state written before the
+            # structured authority marker existed. New control flow never
+            # inspects reason text.
+            legacy_prefixes = (
+                "Master requires human supervision after ",
+                "Master escalated after test gate: ",
+                "Master requires user authority before completion: ",
+                "Master requires user authority before user gate: ",
+            )
+            reason = value.get("reason")
+            migrated = dict(value)
+            migrated["requires_user_decision"] = (
+                isinstance(reason, str) and reason.startswith(legacy_prefixes)
+            )
+            value = migrated
+        field_defs = {field.name: field for field in fields(expected_type)}
+        unknown_fields = set(value) - set(field_defs)
+        missing_required = {
+            name
+            for name, field in field_defs.items()
+            if name not in value
+            and field.default is MISSING
+            and field.default_factory is MISSING
+        }
+        if unknown_fields or missing_required:
             raise AtomicWriteError(
-                f"{context} fields mismatch: expected "
-                f"{sorted(expected_fields)}, got {sorted(value)}"
+                f"{context} fields mismatch: unknown "
+                f"{sorted(unknown_fields)}, missing {sorted(missing_required)}"
             )
         kwargs = {
             field.name: _decode(
@@ -164,6 +191,7 @@ def _decode(expected_type: Any, value: object, context: str) -> object:
                 f"{context}.{field.name}",
             )
             for field in fields(expected_type)
+            if field.name in value
         }
         return expected_type(**kwargs)
     if expected_type is bool:

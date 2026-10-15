@@ -328,6 +328,7 @@ class GenerationController:
         active: ActiveStep | None,
         reason: str,
         signal: SignalKind = SignalKind.OK,
+        requires_user_decision: bool = False,
         state_value: LoopState | None = None,
         status: RunStatus | None = None,
         plan_version: int | None = None,
@@ -358,6 +359,7 @@ class GenerationController:
                 step_stage=stage,
                 signal=signal,
                 reason=reason,
+                requires_user_decision=requires_user_decision,
             ),
         )
         next_state = replace(
@@ -929,6 +931,7 @@ def commit_step_transition(
         active=None,
         reason=outcome.reason,
         signal=result.signal.kind,
+        requires_user_decision=result.signal.requires_user_decision,
         state_value=outcome.next_state,
         status=status,
         ledger=result.ledger,

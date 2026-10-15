@@ -179,6 +179,7 @@ def resolve_supervision(options: argparse.Namespace) -> dict[str, object]:
     resolved = client.resolve_gate(
         gate_id=binding.gate_id,
         resolution=resolution,
+        expected_report_digest=binding.report_digest,
     )
     return {
         "status": "RESOLVED",
